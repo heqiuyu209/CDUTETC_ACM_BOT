@@ -24,6 +24,7 @@ import database as db
 import fetcher
 import llm
 from config import AUTO_FETCH_ENABLED, FETCH_MIN_INTERVAL_MINUTES, TZ_NAME
+from contest_fields import map_competition_info
 
 logger = logging.getLogger(__name__)
 
@@ -71,15 +72,8 @@ def detect_change(source: dict, text: str, etag: str, last_modified: str) -> boo
 
 
 def _map_competition_info(info: dict) -> dict:
-    """把模型提取的字段映射为公共比赛字段（官方信息）。"""
-    return {
-        "name": info.get("name", ""),
-        "official_reg_deadline": info.get("reg_deadline", ""),
-        "official_time": info.get("contest_time", ""),
-        "official_rules": info.get("raw_note", ""),
-        "official_site": info.get("source_link", ""),
-        "summary": "",
-    }
+    """保留兼容入口，统一使用公共比赛字段映射。"""
+    return map_competition_info(info)
 
 
 async def run_fetch(now: datetime | None = None,
@@ -170,10 +164,10 @@ async def run_fetch(now: datetime | None = None,
             })
             continue
 
-        comp_info = _map_competition_info(info)
-        # 来源地址取自已登记的抓取任务，模型可能漏提或生成错误链接。
-        comp_info["official_site"] = source["url"]
         try:
+            comp_info = _map_competition_info(info)
+            # 来源地址取自已登记的抓取任务，模型可能漏提或生成错误链接。
+            comp_info["official_site"] = source["url"]
             existing = db.get_competition(source["competition_id"])
             if existing is None:
                 # v2 免审发布：首次抓取直接确认（不再生成审核草稿）

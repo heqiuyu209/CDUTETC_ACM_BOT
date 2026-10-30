@@ -32,7 +32,8 @@ import commands
 import config
 import crawler
 import database as db
-from database import create_competition, create_published_competition, init_db
+from contest_fields import map_competition_info
+from database import create_published_competition_once, init_db
 from fetcher import FetchError, fetch_text
 from llm import extract_contest
 from reminder import check_general_reminders, check_reminders
@@ -239,15 +240,9 @@ class ACMBot(botpy.Client):
         info["source_link"] = url
         try:
             # 正式比赛、来源和已抓取正文基线一并提交，供后台检测后续变化。
-            create_published_competition(
-                {
-                    "name": info.get("name", ""),
-                    "official_reg_deadline": info.get("reg_deadline", ""),
-                    "official_time": info.get("contest_time", ""),
-                    "official_rules": info.get("raw_note", ""),
-                    "official_site": info.get("source_link", ""),
-                    "summary": "",
-                },
+            competition_info = map_competition_info(info)
+            cid, created = create_published_competition_once(
+                competition_info,
                 source_url=url,
                 source_text=page,
                 operator=f"publish:{member_id}",
@@ -256,13 +251,22 @@ class ACMBot(botpy.Client):
             await self._safe_reply(message, f"信息校验失败：{e}")
             return
 
+        if not created:
+            await self._safe_reply(message, f"该比赛已存档（编号 {cid}），本次未重复发布或发送群通知。")
+            return
+
         logger.info("已免审发布比赛: %s（群 %s）", info.get("name"), group_id)
         # 被动回复有有效期，先告知已提交存档，再等待各群通知结果。
-        await self._safe_reply(message, _build_confirm(info) + "\n已免审发布为正式比赛。")
+        display_info = {
+            **info,
+            "reg_deadline": competition_info.get("official_reg_deadline", ""),
+            "contest_time": competition_info.get("official_time", ""),
+        }
+        await self._safe_reply(message, _build_confirm(display_info) + "\n已免审发布为正式比赛。")
         notice = (
             f"【新比赛发布】{info.get('name') or '未知'}\n"
-            f"报名截止：{info.get('reg_deadline') or '待定'}\n"
-            f"比赛时间：{info.get('contest_time') or '待定'}\n"
+            f"报名截止：{display_info.get('reg_deadline') or '待定'}\n"
+            f"比赛时间：{display_info.get('contest_time') or '待定'}\n"
             f"来源：{url}\n请及时查看并准备报名~"
         )
         targets = sorted(config.ALLOWED_GROUPS)

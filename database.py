@@ -23,6 +23,7 @@ import hashlib
 import json
 import sqlite3
 from datetime import datetime
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from config import DB_PATH
@@ -81,6 +82,14 @@ CREATE TABLE IF NOT EXISTS competitions (
 _WEEKLY_CONTEST_RUNS_DDL = """
 CREATE TABLE IF NOT EXISTS weekly_contest_runs (
     week_start      TEXT PRIMARY KEY,
+    competition_id  INTEGER NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT ''
+)
+"""
+
+_PUBLICATION_CLAIMS_DDL = """
+CREATE TABLE IF NOT EXISTS publication_claims (
+    identity_key    TEXT PRIMARY KEY,
     competition_id  INTEGER NOT NULL,
     created_at      TEXT NOT NULL DEFAULT ''
 )
@@ -274,7 +283,7 @@ _INDEX_DDL = (
 
 _ALL_DDL = (
     _MAIN_DDL, _REMIND_DDL,
-    _COMPETITIONS_DDL, _WEEKLY_CONTEST_RUNS_DDL,
+    _COMPETITIONS_DDL, _WEEKLY_CONTEST_RUNS_DDL, _PUBLICATION_CLAIMS_DDL,
     _COMPETITION_SOURCES_DDL, _COMPETITION_VERSIONS_DDL,
     _PENDING_UPDATES_DDL,
     _ORG_EVENTS_DDL,
@@ -805,25 +814,136 @@ def list_sources(competition_id: int | None = None) -> list[dict]:
     return [_row_to_source(r) for r in rows]
 
 
-def create_published_competition(info: dict, source_url: str, source_text: str,
-                                operator: str = "") -> int:
-    """同事务发布正式比赛、登记来源并保存已抓取正文的变化检测基线。"""
+def _canonical_publication_url(url: str) -> str:
+    """仅归一化协议、主机、默认端口和 fragment，保留 path/query 原义。"""
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    host = parts.hostname
+    if scheme not in ("http", "https") or not host:
+        raise ValueError("来源 URL 必须是有效 HTTP(S) 地址")
+    host = host.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    port = parts.port
+    if port is not None and port != {"http": 80, "https": 443}[scheme]:
+        host += f":{port}"
+    # 若地址含 userinfo，其大小写保留；只归一化主机。
+    if "@" in parts.netloc:
+        host = parts.netloc.rsplit("@", 1)[0] + "@" + host
+    result = f"{scheme}://{host}{parts.path}"
+    if "?" in url.split("#", 1)[0]:
+        result += "?" + parts.query
+    return result
+
+
+def _publication_identity(info: dict, canonical_url: str) -> str:
+    """精确身份：URL、名称、届次；无届次时再加入三个目标时间。
+
+    不做名称模糊匹配，也不把缺失时间猜成某个已知场次。
+    """
+    parts = [canonical_url, info["name"], info["edition"]]
+    if not info["edition"]:
+        for field in ("official_reg_start", "official_reg_deadline", "official_time"):
+            value = info[field]
+            parts.append(datetime.strptime(value, "%Y-%m-%d %H:%M").strftime(
+                "%Y-%m-%d %H:%M"
+            ) if value else "")
+    return json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
+
+
+def _find_legacy_publication(conn: sqlite3.Connection, identity: str,
+                             canonical_url: str) -> int | None:
+    """给旧库补发布身份；当前资料或初始正式创建版本必须精确匹配。"""
+    claimed_ids = {row[0] for row in conn.execute("SELECT competition_id FROM publication_claims")}
+    sources: dict[int, list[str]] = {}
+    for cid, url in conn.execute("SELECT competition_id, url FROM competition_sources"):
+        sources.setdefault(cid, []).append(url)
+    original_versions: dict[int, list[dict]] = {}
+    for cid, raw in conn.execute(
+        "SELECT competition_id, fields_json FROM competition_versions"
+        " WHERE kind = 'confirmed' AND change_note = '创建'"
+    ):
+        try:
+            fields = json.loads(raw)
+        except (ValueError, TypeError, RecursionError):
+            continue
+        if isinstance(fields, dict):
+            original_versions.setdefault(cid, []).append(fields)
+    for row in conn.execute(f"SELECT {_COMPETITION_COLS} FROM competitions ORDER BY id"):
+        competition = _row_to_competition(row)
+        cid = competition["id"]
+        if cid in claimed_ids:
+            # 已有持久身份的记录不再从可编辑字段推导额外身份。
+            continue
+        candidates = list(original_versions.get(cid, []))
+        if competition["status"] == "confirmed":
+            candidates.append(competition)
+        for candidate in candidates:
+            try:
+                cleaned = _clean_competition_info(candidate)
+                if _publication_identity(cleaned, canonical_url) != identity:
+                    continue
+            except ValueError:
+                continue
+            urls = sources.get(cid, []) + [cleaned["official_site"]]
+            for url in urls:
+                try:
+                    if _canonical_publication_url(url) == canonical_url:
+                        return cid
+                except ValueError:
+                    continue
+    return None
+
+
+def create_published_competition_once(info: dict, source_url: str, source_text: str,
+                                     operator: str = "") -> tuple[int, bool]:
+    """原子发布，返回（比赛 id，是否新建）；重复不改资料或成功正文基线。
+
+    持久发布身份独立于后续手工修正；写事务内完成查重、来源和版本创建。
+    """
     source_url = _as_str(source_url)
     if not source_url:
         raise ValueError("来源 URL 不能为空")
     if not isinstance(source_text, str):
         raise ValueError("来源正文必须是字符串")
+    if not isinstance(info, dict):
+        raise ValueError("比赛信息必须是对象")
+    cleaned = _clean_competition_info({**info, "official_site": source_url})
+    canonical_url = _canonical_publication_url(source_url)
+    identity = _publication_identity(cleaned, canonical_url)
     body_hash = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
     with _connect() as conn:
-        cid = create_competition(
-            {**info, "official_site": source_url}, status="confirmed",
-            operator=operator, conn=conn,
-        )
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT competition_id FROM publication_claims WHERE identity_key = ?",
+            (identity,),
+        ).fetchone()
+        if existing is not None:
+            return existing[0], False
+        cid = _find_legacy_publication(conn, identity, canonical_url)
+        if cid is not None:
+            conn.execute(
+                "INSERT INTO publication_claims (identity_key, competition_id, created_at)"
+                " VALUES (?, ?, ?)", (identity, cid, now_str()),
+            )
+            return cid, False
+        cid = _create_competition_on(conn, cleaned, "confirmed", operator)
         sid = add_competition_source(cid, source_url, conn=conn)
         update_source_fetch(
             sid, body_hash=body_hash, last_status="confirmed", conn=conn,
         )
-        return cid
+        conn.execute(
+            "INSERT INTO publication_claims (identity_key, competition_id, created_at)"
+            " VALUES (?, ?, ?)", (identity, cid, now_str()),
+        )
+        return cid, True
+
+
+def create_published_competition(info: dict, source_url: str, source_text: str,
+                                operator: str = "") -> int:
+    """兼容原返回值的发布入口，重复发布仍返回同一个比赛 id。"""
+    cid, _ = create_published_competition_once(info, source_url, source_text, operator)
+    return cid
 
 
 # =====================================================================
