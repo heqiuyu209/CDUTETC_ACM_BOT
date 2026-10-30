@@ -19,14 +19,15 @@
   - 新增定时任务：on_ready 里 self.sched.add_job(...)
 """
 
+import asyncio
 import contextvars
 import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-import botpy
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from botpy.message import GroupMessage
+
+from onebot_client import OneBotClient, OneBotMessage
 
 import commands
 import config
@@ -87,17 +88,20 @@ def _build_confirm(info: dict) -> str:
     )
 
 
-class ACMBot(botpy.Client):
-    """QQ 官方机器人客户端。"""
+class ACMBot:
+    """CDUTETC ACM 机器人：OneBot 协议接入普通 QQ 账号。"""
 
-    def __init__(self, intents=None):
-        super().__init__(intents=intents or botpy.Intents(public_messages=True))
+    def __init__(self, client: OneBotClient):
+        self.client = client
         self.sched: AsyncIOScheduler | None = None
+        client.group_msg_handler = self.on_group_at_message_create
+        client.private_msg_handler = self.on_private_message_create
+        client.on_ready = self._on_ready
 
     # ---------- 生命周期 ----------
 
-    async def on_ready(self):
-        """登录成功后：初始化数据库、启动定时提醒与公共抓取（幂等）。"""
+    async def _on_ready(self):
+        """连接成功后：初始化数据库、启动定时提醒与公共抓取（幂等）。"""
         if self.sched is not None:
             logger.info("机器人已上线（调度器已存在，跳过重复创建）")
             return
@@ -137,14 +141,30 @@ class ACMBot(botpy.Client):
             ) if config.WEEKLY_CONTEST_ENABLED else "，自动周赛关闭",
         )
 
+    # ---------- 私聊消息路由 ----------
+
+    async def on_private_message_create(self, message: OneBotMessage):
+        """私聊消息：采集 QQ 号并回复，验证链路。"""
+        try:
+            uid = message.user_id
+            content = message.content or ""
+            logger.info("[私聊] user_id=%s content=%s", uid, content[:50])
+            await self.client.send_private_msg(uid, f"收到（{uid}）")
+        except Exception:
+            logger.exception("私聊处理失败")
+
     # ---------- 群消息路由 ----------
 
-    async def on_group_at_message_create(self, message: GroupMessage):
+    async def on_group_at_message_create(self, message: OneBotMessage):
         reply_token = _reply_sequence.set(0)
         try:
-            group_id = (
-                getattr(message, "group_openid", None)
-                or getattr(message, "group_id", None)
+            group_id = message.group_id
+            # 调试：采集 QQ 号用于配置白名单，确认后可删除本行
+            logger.info(
+                "[身份采集] group_id=%s user_id=%s content=%s",
+                group_id,
+                message.user_id,
+                (message.content or "")[:50],
             )
             if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
                 logger.info("非授权群消息已忽略: %s", group_id)
@@ -181,30 +201,11 @@ class ACMBot(botpy.Client):
 
     # ---------- 内部处理 ----------
 
-    def _extract_member_id(self, message: GroupMessage) -> str:
-        """提取消息成员标识，恒为字符串。
+    def _extract_member_id(self, message: OneBotMessage) -> str:
+        """提取消息成员标识：OneBot 群消息直接取 user_id（QQ 号）。"""
+        return message.user_id
 
-        qq-botpy 1.2.1 真实消息结构中成员标识位于 message.author.member_openid
-        （嵌套字段）；旧版/测试消息可能在顶层 member_openid / author_id / author。
-        优先读嵌套字段，兼容旧字段兜底，最后统一转字符串。
-        """
-        author = getattr(message, "author", None)
-        if author is not None:
-            nested = getattr(author, "member_openid", None)
-            if nested is None and isinstance(author, dict):
-                nested = author.get("member_openid")
-            if nested is not None:
-                return str(nested)
-        for attr in ("member_openid", "author_id"):
-            val = getattr(message, attr, None)
-            if val is not None:
-                return str(val)
-        author_val = getattr(message, "author", None)
-        if author_val is not None:
-            return str(author_val)
-        return ""
-
-    async def _handle_publish(self, message: GroupMessage, text: str,
+    async def _handle_publish(self, message: OneBotMessage, text: str,
                               group_id: str, member_id: str):
         """发布命令：老师权限校验 → 抓取 → 提取 → 校验 → confirmed → 群通知。"""
         if not is_teacher(member_id):
@@ -272,46 +273,23 @@ class ACMBot(botpy.Client):
                 sent += 1
         await self._safe_reply(message, _notification_summary(sent, len(targets)))
 
-    async def _safe_reply(self, message: GroupMessage, content: str) -> bool:
-        """被动回复：每个事件内递增 msg_seq，失败不影响其他消息。"""
-        group_id = getattr(message, "group_openid", None) or getattr(message, "group_id", None)
-        if not is_allowed_group(group_id, config.ALLOWED_GROUPS) or not getattr(message, "id", None):
+    async def _safe_reply(self, message: OneBotMessage, content: str) -> bool:
+        """群内被动回复：普通 QQ 无平台 5 次上限，直接发回原群。"""
+        group_id = message.group_id
+        if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
             return False
-        sequence = _reply_sequence.get() + 1
-        if sequence > 5:
-            logger.warning("源群消息的被动回复次数已达到平台上限（群 %s）", group_id)
-            return False
-        _reply_sequence.set(sequence)
-        try:
-            result = await message.reply(content=content, msg_type=0, msg_seq=sequence)
-        except Exception as e:
-            logger.warning("回复消息失败（群 %s）：%s", group_id, type(e).__name__)
-            return False
-        if not _message_sent(result):
-            logger.warning("回复消息未收到有效发送回执（群 %s）", group_id)
-            return False
-        return True
+        return await self.client.send_group_msg(group_id, content)
 
     # ---------- 定时任务回调 ----------
 
     async def _send_group(self, group_id: str, text: str) -> bool:
-        """向允许群发送主动文本消息，仅有效 QQ 消息回执确认成功。"""
+        """向允许群发送主动文本消息。"""
         if not is_allowed_group(group_id, config.ALLOWED_GROUPS) or not text:
             return False
         if not config.GROUP_ACTIVE_MESSAGES_ENABLED:
             logger.info("主动群消息未启用，跳过群 %s 的通知", group_id)
             return False
-        try:
-            result = await self.api.post_group_message(
-                group_openid=group_id, msg_type=0, content=text,
-            )
-        except Exception as e:
-            logger.warning("群通知发送失败（群 %s）：%s", group_id, type(e).__name__)
-            return False
-        if not _message_sent(result):
-            logger.warning("群通知未收到有效发送回执（群 %s）", group_id)
-            return False
-        return True
+        return await self.client.send_group_msg(group_id, text)
 
     async def _send_group_log_only(self, group_id: str, text: str) -> bool:
         """兼容旧回调名；发送行为由主动消息开关控制。"""
@@ -384,11 +362,17 @@ class ACMBot(botpy.Client):
 
 
 def run_bot() -> None:
-    """启动入口：配置检查 → 构造客户端（Intents）→ run(appid=, secret=)。"""
+    """启动入口：配置检查 → 创建 OneBot 客户端 → 常驻连接。"""
     config.check_config()
-    intents = botpy.Intents(public_messages=True)
-    bot = ACMBot(intents=intents)
-    bot.run(appid=config.APPID, secret=config.APP_SECRET)
+    client = OneBotClient(
+        ws_url=config.ONEBOT_WS_URL,
+        token=config.ONEBOT_TOKEN,
+    )
+    ACMBot(client)
+    try:
+        asyncio.run(client.start())
+    except KeyboardInterrupt:
+        logger.info("收到中断信号，机器人退出")
 
 
 if __name__ == "__main__":
