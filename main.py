@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 import botpy
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from botpy.message import GroupMessage
+from botpy.api import BotAPI
 
 import commands
 import config
@@ -36,6 +37,7 @@ from database import create_competition, create_published_competition, init_db
 from fetcher import FetchError, fetch_text
 from llm import extract_contest
 from reminder import check_general_reminders, check_reminders
+from sdk_compat import ReceiptBotHttp
 from utils import (
     extract_url,
     is_allowed_group,
@@ -92,6 +94,8 @@ class ACMBot(botpy.Client):
 
     def __init__(self, intents=None):
         super().__init__(intents=intents or botpy.Intents(public_messages=True))
+        self.http = ReceiptBotHttp(timeout=self.http.timeout, is_sandbox=self.http.is_sandbox)
+        self.api = BotAPI(http=self.http)
         self.sched: AsyncIOScheduler | None = None
 
     # ---------- 生命周期 ----------
