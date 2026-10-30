@@ -50,9 +50,11 @@ class OneBotClient:
     """正向 WebSocket 客户端：接收事件 + 调用 OneBot API。"""
 
     def __init__(self, ws_url: str, token: str = "", reconnect_delay: float = 5.0,
-                 event_queue_size: int = 256):
+                 event_queue_size: int = 256, api_timeout: float = 10.0):
         if event_queue_size < 1:
             raise ValueError("event_queue_size must be positive")
+        if api_timeout <= 0:
+            raise ValueError("api_timeout must be positive")
         self.ws_url = ws_url
         self.token = token
         self.reconnect_delay = reconnect_delay
@@ -60,6 +62,7 @@ class OneBotClient:
         self._pending: dict[str, asyncio.Future] = {}
         self._echo_seq = 0
         self._event_queue_size = event_queue_size
+        self._api_timeout = api_timeout
         self._event_queue: asyncio.Queue | None = None
         # 事件分发：由上层（main.py）注册
         self.group_msg_handler: MessageHandler | None = None
@@ -164,10 +167,10 @@ class OneBotClient:
         fut = asyncio.get_running_loop().create_future()
         self._pending[echo] = fut
         try:
-            await ws.send(
-                json.dumps({"action": action, "params": params, "echo": echo})
-            )
-            return await asyncio.wait_for(fut, timeout=10)
+            async def send_and_wait():
+                await ws.send(json.dumps({"action": action, "params": params, "echo": echo}))
+                return await fut
+            return await asyncio.wait_for(send_and_wait(), timeout=self._api_timeout)
         except Exception:
             return None
         finally:
@@ -184,8 +187,8 @@ class OneBotClient:
             group_id=int(group_id) if group_id.isdigit() else group_id,
             message=text,
         )
-        if resp is None or resp.get("status") != "ok" or resp.get("retcode") not in (0, None):
-            logger.warning("群消息发送失败: %s", resp)
+        if not self._message_sent(resp):
+            logger.warning("群消息未收到有效发送回执")
             return False
         return True
 
@@ -198,7 +201,21 @@ class OneBotClient:
             user_id=int(user_id) if user_id.isdigit() else user_id,
             message=text,
         )
-        if resp is None or resp.get("status") != "ok" or resp.get("retcode") not in (0, None):
-            logger.warning("私聊消息发送失败: %s", resp)
+        if not self._message_sent(resp):
+            logger.warning("私聊消息未收到有效发送回执")
             return False
         return True
+
+    @staticmethod
+    def _message_sent(resp) -> bool:
+        if not isinstance(resp, dict) or resp.get("status") != "ok" or resp.get("retcode") != 0:
+            return False
+        data = resp.get("data")
+        if not isinstance(data, dict):
+            return False
+        message_id = data.get("message_id")
+        if isinstance(message_id, bool):
+            return False
+        if isinstance(message_id, int):
+            return message_id != 0
+        return isinstance(message_id, str) and message_id.strip() not in ("", "0")

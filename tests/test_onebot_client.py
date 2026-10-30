@@ -3,6 +3,7 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import pytest
 import websockets
@@ -181,3 +182,47 @@ async def test_queue_is_bounded_and_overflow_does_not_wait_for_space():
     with pytest.raises(RuntimeError, match="event queue is full"):
         await asyncio.wait_for(client._dispatch(event(message_id=2)), 0.5)
     assert client._event_queue.qsize() == 1
+
+
+@pytest.mark.parametrize("response", [
+    {"status": "ok", "retcode": 0},
+    {"status": "ok", "retcode": 0, "data": {}},
+    {"status": "ok", "retcode": 0, "data": {"message_id": 0}},
+    {"status": "ok", "retcode": 0, "data": {"message_id": True}},
+    {"status": "ok", "retcode": 0, "data": {"message_id": " "}},
+    {"status": "ok", "retcode": 0, "data": {"message_id": "0"}},
+    {"status": "failed", "retcode": 0, "data": {"message_id": 99}},
+    {"status": "ok", "data": {"message_id": 99}},
+])
+async def test_incomplete_receipts_are_not_successful_messages(response):
+    ready = asyncio.Event()
+
+    async def server(ws):
+        async for raw in ws:
+            action = json.loads(raw)
+            await ws.send(json.dumps({**response, "echo": action["echo"]}))
+
+    def configure(client):
+        async def on_ready():
+            ready.set()
+        client.on_ready = on_ready
+
+    async with running_client(server, configure) as (client, task):
+        await asyncio.wait_for(ready.wait(), 2)
+        assert await client.send_group_msg("123", "失败回执") is False
+        assert await client.send_private_msg("456", "失败回执") is False
+
+
+async def test_api_timeout_includes_blocked_socket_send():
+    cancelled = asyncio.Event()
+    async def blocked_send(raw):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    client = OneBotClient("ws://127.0.0.1:1", api_timeout=0.02)
+    client._ws = SimpleNamespace(send=blocked_send)
+    assert await asyncio.wait_for(client.call_api("send_group_msg"), 0.5) is None
+    assert cancelled.is_set()
+    assert client._pending == {}
