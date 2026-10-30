@@ -13,6 +13,7 @@ import logging
 from typing import Awaitable, Callable
 
 import websockets
+from websockets.legacy.client import connect
 
 logger = logging.getLogger("onebot")
 
@@ -72,8 +73,8 @@ class OneBotClient:
 
     async def _run_once(self) -> None:
         headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
-        async with websockets.connect(
-            self.ws_url, additional_headers=headers, max_size=4 * 1024 * 1024
+        async with connect(
+            self.ws_url, extra_headers=headers, max_size=4 * 1024 * 1024
         ) as ws:
             self._ws = ws
             logger.info("OneBot 已连接: %s", self.ws_url)
