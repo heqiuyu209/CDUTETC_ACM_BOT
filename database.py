@@ -1701,7 +1701,8 @@ def _delivery_invalid_status(conn: sqlite3.Connection, delivery: dict,
         if field is None or not delivery["group_id"]:
             return "cancelled"
         row = conn.execute(f"SELECT group_id, {field} FROM contests WHERE id = ?", (delivery["obj_id"],)).fetchone()
-        if row is None or row[0] != delivery["group_id"] or row[1] != delivery["target_time"]:
+        if (row is None or row[0] != delivery["group_id"]
+                or _delivery_parse_time(row[1]) != _delivery_parse_time(delivery["target_time"])):
             return "cancelled"
     else:
         return "cancelled"

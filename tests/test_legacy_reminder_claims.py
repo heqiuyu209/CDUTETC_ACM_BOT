@@ -176,3 +176,29 @@ async def test_reschedule_before_send_invalidates_claim(db, monkeypatch):
     assert await reminder.check_reminders(sender, now=NOW) == 0
     sender.assert_not_awaited()
     assert database.get_delivery_by_key(key)["status"] == "cancelled"
+
+
+@pytest.mark.parametrize("stored, claimed", [
+    ("2026-11-01 9:00", "2026-11-01 09:00"),
+    ("2026-11-01 09:00", "2026-11-1 9:0"),
+    ("2026/11/1 9:0", "2026-11-01 09:00"),
+    ("2026-11-01 09:00:00", "2026-11-01 09:00"),
+])
+def test_legacy_claim_and_presend_check_compare_actual_time(db, stored, claimed):
+    now = datetime(2026, 11, 1, 8, tzinfo=ZoneInfo("Asia/Shanghai"))
+    cid = database.save_contest("123456", {"name": "等价时刻", "contest_time": "2026-11-01 09:00"})
+    # 模拟旧格式业务行；不能只依赖启动时迁移或新写入时补零。
+    with database._connect() as conn:
+        conn.execute("UPDATE contests SET contest_time = ? WHERE id = ?", (stored, cid))
+    token = database.claim_delivery("123456", "legacy_contest", cid, "contest_time", claimed,
+                                    now=now, allowed_groups={"123456"})
+    assert token is not None
+    key = database.delivery_dedup_key("123456", "legacy_contest", cid, "contest_time", claimed)
+    assert database.validate_delivery_claim(key, token, now=now, allowed_groups={"123456"})
+    with database._connect() as conn:
+        conn.execute("UPDATE contests SET contest_time = '2026-11-01 09:00' WHERE id = ?", (cid,))
+    assert database.validate_delivery_claim(key, token, now=now, allowed_groups={"123456"})
+    with database._connect() as conn:
+        conn.execute("UPDATE contests SET contest_time = '2026-11-01 09:00:01' WHERE id = ?", (cid,))
+    assert not database.validate_delivery_claim(key, token, now=now, allowed_groups={"123456"})
+    assert database.get_delivery_by_key(key)["status"] == "cancelled"
