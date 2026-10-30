@@ -333,6 +333,10 @@ def _migrate_v1(conn: sqlite3.Connection) -> None:
 def init_db() -> None:
     """初始化数据库：建表 + 旧库迁移 + 索引。程序启动时调用一次。"""
     with _connect() as conn:
+        # 查列与 ALTER 必须位于同一写事务，避免两个启动进程同时补列。
+        # 调用方已有事务时保留它；普通新连接先取得数据库写锁再读 schema。
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
         for ddl in _ALL_DDL:
             conn.execute(ddl)
         _migrate_v1(conn)
