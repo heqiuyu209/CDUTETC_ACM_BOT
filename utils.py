@@ -4,8 +4,8 @@ import re
 
 import config
 
-# QQ 群消息中的 @ 机器人片段，形如 <@!openid>
-_AT_PATTERN = re.compile(r"<@!?[^>]*>")
+# QQ 群消息中的 @ 片段：OneBot CQ 码 [CQ:at,qq=...] 与旧格式 <@!...>
+_AT_PATTERN = re.compile(r"\[CQ:at,qq=[^\]]*\]|<@!?[^>]*>")
 # 链接匹配
 _LINK_PATTERN = re.compile(r"https?://\S+")
 
