@@ -73,7 +73,7 @@ REMIND_BEFORE_HOURS = int(os.getenv("ACM_REMIND_BEFORE_HOURS", "24"))
 REMIND_TYPES = ("reg_deadline", "contest_time")
 
 # ================= 自动周赛（v2） =================
-# 每周日按模板自动生成周赛记录并提醒；生成记录默认不通知全员，
+# 在提前提醒窗口前按模板生成周赛，启动时补最近未来场次；默认不通知全员，
 # 超管确认后才通知全员或 /修正 调整/删除。地点不纳入管理。
 WEEKLY_CONTEST_ENABLED = os.getenv("ACM_WEEKLY_CONTEST_ENABLED", "1") != "0"
 WEEKLY_CONTEST_WEEKDAY = int(os.getenv("ACM_WEEKLY_CONTEST_WEEKDAY", "6"))   # 0=周一 ... 6=周日

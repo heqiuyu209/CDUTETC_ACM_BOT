@@ -88,6 +88,29 @@ def _build_confirm(info: dict) -> str:
     )
 
 
+def _weekly_contest_window(now: datetime):
+    """返回下一场尚未开赛的周赛及其所属周；跨周生成不误建过去场次。"""
+    tz = ZoneInfo(config.TZ_NAME)
+    now = now.replace(tzinfo=tz) if now.tzinfo is None else now.astimezone(tz)
+    if not 0 <= config.WEEKLY_CONTEST_WEEKDAY <= 6:
+        raise ValueError("周赛星期必须在 0（周一）到 6（周日）之间")
+    week_start = now.date() - timedelta(days=now.weekday())
+    contest_date = week_start + timedelta(days=config.WEEKLY_CONTEST_WEEKDAY)
+    start = datetime.combine(
+        contest_date, datetime.strptime(config.WEEKLY_CONTEST_START, "%H:%M").time(), tzinfo=tz,
+    )
+    end = datetime.combine(
+        contest_date, datetime.strptime(config.WEEKLY_CONTEST_END, "%H:%M").time(), tzinfo=tz,
+    )
+    if end <= start:
+        raise ValueError("周赛结束时间必须晚于开始时间")
+    if start <= now:
+        week_start += timedelta(days=7)
+        start += timedelta(days=7)
+        end += timedelta(days=7)
+    return week_start, start, end
+
+
 class ACMBot:
     """CDUTETC ACM 机器人：OneBot 协议接入普通 QQ 账号。"""
 
@@ -100,36 +123,47 @@ class ACMBot:
 
     # ---------- 生命周期 ----------
 
-    async def _on_ready(self):
-        """连接成功后：初始化数据库、启动定时提醒与公共抓取（幂等）。"""
+    async def _on_ready(self, now: datetime | None = None):
+        """连接成功后补未来周赛并立即检查提醒，再开始周期任务（幂等）。"""
         if self.sched is not None:
             logger.info("机器人已上线（调度器已存在，跳过重复创建）")
             return
         init_db()
-        self.sched = AsyncIOScheduler(timezone=config.TZ_NAME)
-        self.sched.add_job(
+        tz = ZoneInfo(config.TZ_NAME)
+        now = now or datetime.now(tz)
+        now = now.replace(tzinfo=tz) if now.tzinfo is None else now.astimezone(tz)
+        sched = AsyncIOScheduler(timezone=config.TZ_NAME)
+        sched.add_job(
             self._remind_job,
             "interval",
             minutes=config.REMIND_CHECK_INTERVAL_MINUTES,
             id="remind-check",
+            next_run_time=now,
         )
-        self.sched.add_job(
+        sched.add_job(
             self._crawl_job,
             "interval",
             minutes=config.FETCH_MIN_INTERVAL_MINUTES,
             id="source-crawl",
         )
         if config.WEEKLY_CONTEST_ENABLED:
-            start_hh, start_mm = config.WEEKLY_CONTEST_START.split(":")
-            self.sched.add_job(
+            _, start, _ = _weekly_contest_window(now)
+            # 提醒窗口打开前一个扫描周期预生成，避免开赛时才生成及同刻调度竞争。
+            generation_at = start - timedelta(
+                hours=config.REMIND_BEFORE_HOURS,
+                minutes=config.REMIND_CHECK_INTERVAL_MINUTES,
+            )
+            sched.add_job(
                 self._weekly_contest_job,
                 "cron",
-                day_of_week=config.WEEKLY_CONTEST_WEEKDAY,
-                hour=int(start_hh),
-                minute=int(start_mm),
+                day_of_week=generation_at.weekday(),
+                hour=generation_at.hour,
+                minute=generation_at.minute,
                 id="weekly-contest",
             )
-        self.sched.start()
+            await self._weekly_contest_job(now=now)
+        sched.start()
+        self.sched = sched
         logger.info(
             "机器人已上线：每 %d 分钟检查提醒，每 %d 分钟抓取公共来源%s",
             config.REMIND_CHECK_INTERVAL_MINUTES,
@@ -304,7 +338,7 @@ class ACMBot:
         await check_general_reminders(self._send_group)
 
     async def _weekly_contest_job(self, now: datetime | None = None):
-        """按北京时间本周的配置日期生成周赛（默认不通知全员）。
+        """提前生成下一场未来周赛（默认不通知全员）。
 
         数据库按周持久化去重，避免重启、重复调度或改名造成重复记录。
         now 供离线验证注入；无时区的注入时间按北京时间处理。
@@ -313,25 +347,8 @@ class ACMBot:
             return
         template = config.WEEKLY_CONTEST_TEMPLATE
         try:
-            tz = ZoneInfo(config.TZ_NAME)
-            now = now or datetime.now(tz)
-            now = now.replace(tzinfo=tz) if now.tzinfo is None else now.astimezone(tz)
-            if not 0 <= config.WEEKLY_CONTEST_WEEKDAY <= 6:
-                raise ValueError("周赛星期必须在 0（周一）到 6（周日）之间")
-            week_start = now.date() - timedelta(days=now.weekday())
-            contest_date = week_start + timedelta(days=config.WEEKLY_CONTEST_WEEKDAY)
-            start = datetime.combine(
-                contest_date,
-                datetime.strptime(config.WEEKLY_CONTEST_START, "%H:%M").time(),
-                tzinfo=tz,
-            )
-            end = datetime.combine(
-                contest_date,
-                datetime.strptime(config.WEEKLY_CONTEST_END, "%H:%M").time(),
-                tzinfo=tz,
-            )
-            if end <= start:
-                raise ValueError("周赛结束时间必须晚于开始时间")
+            now = now or datetime.now(ZoneInfo(config.TZ_NAME))
+            week_start, start, end = _weekly_contest_window(now)
             start_str = start.strftime("%Y-%m-%d %H:%M")
             end_str = end.strftime("%Y-%m-%d %H:%M")
             cid, created = db.create_weekly_competition(
@@ -352,7 +369,7 @@ class ACMBot:
             logger.warning("自动周赛生成失败: %s", e)
             return
         if not created:
-            logger.info("本周周赛记录已存在，跳过自动生成（比赛 id=%s）", cid)
+            logger.info("该周周赛记录已存在，跳过自动生成（比赛 id=%s）", cid)
             return
         logger.info("已自动生成周赛记录: %s（id=%s），未通知全员", template, cid)
 
