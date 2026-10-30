@@ -582,7 +582,7 @@ async def handle_non_command_message(text: str, group_id: str, sender: str) -> l
         answer = await llm.answer_question(text, db.list_question_contests(group_id))
     except Exception:  # noqa: BLE001
         answer = "模型暂时不可用，请稍后再试~"
-    if answer.startswith("模型暂时不可用"):
+    if not isinstance(answer, str) or not answer.strip() or answer.startswith("模型暂时不可用"):
         qid = db.add_unanswered_question(group_id, text, sender)
         return [{"group_id": group_id, "text": f"收到，已记录为问题 #{qid}，老师看到后会回答"}]
     return [{"group_id": group_id, "text": answer}]

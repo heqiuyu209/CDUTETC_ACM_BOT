@@ -54,6 +54,7 @@ FETCH_TEXT_LIMIT = int(os.getenv("ACM_FETCH_TEXT_LIMIT", "3000"))         # 送�
 # ================= 大模型资源限制 =================
 LLM_MAX_INPUT_CHARS = int(os.getenv("ACM_LLM_MAX_INPUT_CHARS", "6000"))   # 单次请求输入长度上限
 LLM_MAX_OUTPUT_TOKENS = int(os.getenv("ACM_LLM_MAX_OUTPUT_TOKENS", "2000"))  # 单次请求输出长度上限
+LLM_MAX_RESPONSE_BYTES = int(os.getenv("ACM_LLM_MAX_RESPONSE_BYTES", "262144"))  # 实际响应/解压后字节上限
 LLM_CONCURRENCY = int(os.getenv("ACM_LLM_CONCURRENCY", "2"))              # 模型并发请求上限
 
 # ================= 定时提醒 =================
