@@ -52,6 +52,17 @@
 
 完整帮助运行 `/帮助` 获取；所有命令为斜杠开头（`/`），避免与普通提问混淆。
 
+`/征集汇总 <id>` 对本群成员开放，只回复人数、取消人数和剩余名额。老师或超管发起查询时也不在群中展示成员标识、姓名、学号等报名明细。
+
+明细由具有本机数据库访问权限的部署管理员导出并单独交付老师。导出命令只读取指定群的征集，只包含仍报名的成员，输出到新的本地 CSV 文件；不会发送到 QQ，也不会覆盖已有文件：
+
+```powershell
+New-Item -ItemType Directory -Force private-exports
+python scripts/export_collection.py --group-id '群openid' --collection-id 1 --output private-exports/collection-1.csv
+```
+
+默认读取 `ACM_DB_PATH` 指定的数据库，也可传入 `--db '数据库路径'`。`private-exports/` 已加入 Git 忽略规则。
+
 超管修正比赛可直接使用完整日期时间和带空格的文本，例如：
 
 ```text

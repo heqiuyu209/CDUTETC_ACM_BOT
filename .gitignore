@@ -37,6 +37,7 @@ secrets.*
 *.sqlite3
 *.bak
 *.tmp
+private-exports/
 
 # 日志
 *.log
