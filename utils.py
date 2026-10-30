@@ -6,6 +6,7 @@ import config
 
 # QQ 群消息中的 @ 片段：OneBot CQ 码 [CQ:at,qq=...] 与旧格式 <@!...>
 _AT_PATTERN = re.compile(r"\[CQ:at,qq=[^\]]*\]|<@!?[^>]*>")
+_AT_TARGET_PATTERN = re.compile(r"\[CQ:at,qq=([^,\]]+)(?:,[^\]]*)?\]|<@!?([^>]*)>")
 # 链接匹配
 _LINK_PATTERN = re.compile(r"https?://\S+")
 
@@ -13,6 +14,14 @@ _LINK_PATTERN = re.compile(r"https?://\S+")
 def strip_at(content: str) -> str:
     """去掉消息中的 @ 片段，返回纯文本。"""
     return _AT_PATTERN.sub("", content).strip()
+
+
+def mentioned_user_ids(content: str) -> set[str]:
+    """读取 CQ / 旧格式的 @ 目标，按完整账号标识匹配。"""
+    return {
+        match.group(1) or match.group(2)
+        for match in _AT_TARGET_PATTERN.finditer(content)
+    }
 
 
 def extract_url(content: str) -> str | None:

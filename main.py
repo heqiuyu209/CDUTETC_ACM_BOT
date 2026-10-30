@@ -3,7 +3,7 @@
 职责：连接 QQ 官方机器人，路由群消息：
   - 命令式操作（/修正、/征集、/报名、/征集汇总、/征集关闭 等）→ commands 模块分发
   - 「发布 <链接/信息>」命令（老师白名单）→ 抓取 → 提取 → 免审 confirmed → 群通知
-  - 非命令消息 → FAQ 自动回复；未命中则收集为未答问题
+  - @ 本机器人的自然语言提问 → FAQ / 模型问答，闲聊和 @ 他人不触发
   - 周期提醒：比赛临近 + 征集登记截止 + 训练开始
   - 周期抓取：公共来源低频抓取（默认关闭）+ 变化检测 + 免审记录（不通知全员）
   - 自动周赛：每周日按模板生成记录并提醒（默认不通知全员，超管确认后处理）
@@ -42,6 +42,7 @@ from utils import (
     is_allowed_group,
     is_publish_command,
     is_teacher,
+    mentioned_user_ids,
     strip_at,
 )
 
@@ -144,11 +145,9 @@ class ACMBot:
     # ---------- 私聊消息路由 ----------
 
     async def on_private_message_create(self, message: OneBotMessage):
-        """私聊消息：采集 QQ 号并回复，验证链路。"""
+        """私聊消息：回复确认收到，不记录原文。"""
         try:
             uid = message.user_id
-            content = message.content or ""
-            logger.info("[私聊] user_id=%s content=%s", uid, content[:50])
             await self.client.send_private_msg(uid, f"收到（{uid}）")
         except Exception:
             logger.exception("私聊处理失败")
@@ -159,18 +158,20 @@ class ACMBot:
         reply_token = _reply_sequence.set(0)
         try:
             group_id = message.group_id
-            # 调试：采集 QQ 号用于配置白名单，确认后可删除本行
-            logger.info(
-                "[身份采集] group_id=%s user_id=%s content=%s",
-                group_id,
-                message.user_id,
-                (message.content or "")[:50],
-            )
             if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
                 logger.info("非授权群消息已忽略: %s", group_id)
                 return
+            targets = mentioned_user_ids(message.content)
+            bot_qq = config.BOT_QQ or str(message.raw.get("self_id") or "")
+            addressed = bool(bot_qq) and bot_qq in targets
+            # 带 @ 的消息只有指向本机器人时才受理，包括发给他人的命令。
+            if targets and not addressed:
+                return
             text = strip_at(message.content)
             if not text:
+                return
+            # 无 @ 时只受理显式操作；自然语言问答必须 @ 本机器人。
+            if not addressed and not (text.startswith("/") or is_publish_command(text, config.PUBLISH_CMD)):
                 return
             member_id = self._extract_member_id(message)
             if is_publish_command(text, config.PUBLISH_CMD):
