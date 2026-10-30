@@ -57,7 +57,8 @@ with closing(sqlite3.connect(path)) as conn:
     row = conn.execute('SELECT id, name, raw_note, group_id FROM contests').fetchall()
     print(json.dumps({'ok': True, 'rows': row}))
 """
-    env = dict(os.environ, PYTHONPATH=str(root), PYTHONIOENCODING="utf-8")
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join((str(root), os.environ.get("PYTHONPATH", ""))),
+               PYTHONIOENCODING="utf-8")
     processes = []
     try:
         ready_files = [tmp_path / f"ready-{index}" for index in range(2)]
