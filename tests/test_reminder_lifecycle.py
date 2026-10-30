@@ -223,18 +223,17 @@ async def test_main_job_continues_after_legacy_send_failure(file_db, monkeypatch
     monkeypatch.setattr(reminder, "datetime", Clock)
     legacy_calls = []
 
-    async def api_send(**kwargs):
-        if "旧比赛" in kwargs["content"]:
-            legacy_calls.append(kwargs["group_openid"])
+    async def api_send(group_id, content):
+        if "旧比赛" in content:
+            legacy_calls.append(group_id)
             if legacy_result == "timeout":
                 await asyncio.Event().wait()
             if legacy_result == "exception":
                 raise RuntimeError("legacy SDK rejected")
-            return None
-        return {"id": "general-sent-id"}
+            return False
+        return True
 
-    client = main.ACMBot()
-    monkeypatch.setattr(client, "api", SimpleNamespace(post_group_message=AsyncMock(side_effect=api_send)))
+    client = main.ACMBot(SimpleNamespace(send_group_msg=AsyncMock(side_effect=api_send)))
     await asyncio.wait_for(client._remind_job(), timeout=2)
     row = database.get_delivery_by_key(key)
     assert (row["status"], row["attempts"]) == ("sent", 1)

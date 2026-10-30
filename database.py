@@ -498,7 +498,12 @@ def has_reminded(group_id: str, contest_id: int, remind_type: str, target_time: 
             "SELECT 1 FROM reminders WHERE group_id=? AND contest_id=? AND remind_type=? AND target_time=?",
             (group_id, contest_id, remind_type, target_time),
         ).fetchone()
-        return row is not None
+        if row is not None:
+            return True
+        return conn.execute(
+            "SELECT 1 FROM reminder_success_receipts WHERE dedup_key = ?",
+            (delivery_dedup_key(group_id, "legacy_contest", contest_id, remind_type, target_time),),
+        ).fetchone() is not None
 
 
 def mark_reminded(group_id: str, contest_id: int, remind_type: str, target_time: str) -> bool:
@@ -1691,6 +1696,13 @@ def _delivery_invalid_status(conn: sqlite3.Connection, delivery: dict,
         row = conn.execute(f"SELECT status, {field} FROM competitions WHERE id = ?", (delivery["obj_id"],)).fetchone()
         if row is None or row[0] != "confirmed" or row[1] != delivery["target_time"]:
             return "cancelled"
+    elif delivery["obj_type"] == "legacy_contest":
+        field = {"reg_deadline": "reg_deadline", "contest_time": "contest_time"}.get(delivery["remind_type"])
+        if field is None or not delivery["group_id"]:
+            return "cancelled"
+        row = conn.execute(f"SELECT group_id, {field} FROM contests WHERE id = ?", (delivery["obj_id"],)).fetchone()
+        if row is None or row[0] != delivery["group_id"] or row[1] != delivery["target_time"]:
+            return "cancelled"
     else:
         return "cancelled"
     target = _delivery_parse_time(delivery["target_time"])
@@ -1725,10 +1737,13 @@ def reconcile_deliveries(now: datetime | None = None, *, max_attempts: int = 3,
                 elif delivery["status"] in ("sending", "cancelled"):
                     status = "pending"
             if status is not None:
-                conn.execute(
-                    "UPDATE reminder_deliveries SET status = ?, lease_token = '', lease_until = '' WHERE id = ?",
-                    (status, delivery["id"]),
-                )
+                try:
+                    conn.execute(
+                        "UPDATE reminder_deliveries SET status = ?, lease_token = '', lease_until = '' WHERE id = ?",
+                        (status, delivery["id"]),
+                    )
+                except sqlite3.Error:
+                    logger.exception("提醒计划状态更新失败: %s", delivery["dedup_key"])
 
 
 def claim_delivery(group_id: str, obj_type: str, obj_id: int, remind_type: str,
@@ -1750,6 +1765,19 @@ def claim_delivery(group_id: str, obj_type: str, obj_id: int, remind_type: str,
         )
         row = conn.execute(f"SELECT {_DELIVERY_COLS} FROM reminder_deliveries WHERE dedup_key = ?", (key,)).fetchone()
         delivery = _row_to_delivery(row)
+        if obj_type == "legacy_contest":
+            # 旧成功历史优先于队列状态；同一领取事务中迁入成功事实，不消耗尝试。
+            history = conn.execute(
+                "SELECT sent_at FROM reminders WHERE group_id = ? AND contest_id = ?"
+                " AND remind_type = ? AND target_time = ?",
+                (group_id, obj_id, remind_type, target_time),
+            ).fetchone()
+            if history is not None:
+                conn.execute(
+                    "INSERT OR IGNORE INTO reminder_success_receipts (dedup_key, lease_token, sent_at) VALUES (?, ?, ?)",
+                    (key, "legacy-history", history[0]),
+                )
+                return None
         if delivery["status"] == "sent" or conn.execute(
             "SELECT 1 FROM reminder_success_receipts WHERE dedup_key = ?", (key,)
         ).fetchone():

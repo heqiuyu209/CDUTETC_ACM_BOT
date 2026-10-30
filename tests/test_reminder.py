@@ -2,10 +2,13 @@
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+import sqlite3
 
 import pytest
 
 import reminder
+import config
+import database
 from config import REMIND_BEFORE_HOURS, TZ_NAME
 
 TZ = ZoneInfo(TZ_NAME)
@@ -79,39 +82,44 @@ def _soon_deadline(hours: int = 10) -> str:
     return (datetime.now(TZ) + timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M")
 
 
-async def test_check_reminders_marks_only_on_success(monkeypatch):
-    contests = [_contest(1, "g1", deadline=_soon_deadline(10))]
-    monkeypatch.setattr(reminder, "list_contests", lambda: contests)
-    monkeypatch.setattr(reminder, "has_reminded", lambda *k: False)
-    marked = []
-    monkeypatch.setattr(reminder, "mark_reminded", lambda *k: marked.append(k) or True)
+@pytest.fixture
+def legacy_db(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    monkeypatch.setattr(database, "_connect", lambda: conn)
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
+    database.init_db()
+    yield conn
+    conn.close()
+
+
+async def test_check_reminders_marks_only_on_success(legacy_db):
+    deadline = _soon_deadline(10)
+    cid = database.save_contest("g1", {"name": "校赛", "reg_deadline": deadline})
 
     async def fail_send(group_id, text):
         return False
 
     sent = await reminder.check_reminders(fail_send)
     assert sent == 0
-    assert marked == []  # 发送失败不标记，留待下次重试
+    assert not database.has_reminded("g1", cid, "reg_deadline", deadline)
+    assert database.list_pending_deliveries()[0]["attempts"] == 1
 
 
-async def test_check_reminders_success_path(monkeypatch):
-    contests = [_contest(1, "g1", deadline=_soon_deadline(10))]
-    monkeypatch.setattr(reminder, "list_contests", lambda: contests)
-    monkeypatch.setattr(reminder, "has_reminded", lambda *k: False)
-    marked = []
-    monkeypatch.setattr(reminder, "mark_reminded", lambda *k: marked.append(k) or True)
+async def test_check_reminders_success_path(legacy_db):
+    deadline = _soon_deadline(10)
+    cid = database.save_contest("g1", {"name": "校赛", "reg_deadline": deadline})
 
     async def ok_send(group_id, text):
         return True
 
     sent = await reminder.check_reminders(ok_send)
     assert sent == 1
-    assert len(marked) == 1
+    assert database.has_reminded("g1", cid, "reg_deadline", deadline)
+    assert database.list_deliveries("g1")[0]["status"] == "sent"
 
 
-async def test_check_reminders_skips_old_groupless(monkeypatch):
-    contests = [_contest(1, "", deadline=_soon_deadline(10))]
-    monkeypatch.setattr(reminder, "list_contests", lambda: contests)
+async def test_check_reminders_skips_old_groupless(legacy_db):
+    database.save_contest("", {"name": "未归属", "reg_deadline": _soon_deadline(10)})
 
     async def ok_send(group_id, text):
         raise AssertionError("不应发送未归属群记录")
@@ -120,16 +128,14 @@ async def test_check_reminders_skips_old_groupless(monkeypatch):
     assert sent == 0
 
 
-async def test_check_reminders_skips_reminded(monkeypatch):
-    contests = [_contest(1, "g1", deadline=_soon_deadline(10))]
-    monkeypatch.setattr(reminder, "list_contests", lambda: contests)
-    monkeypatch.setattr(reminder, "has_reminded", lambda *k: True)
-    marked = []
-    monkeypatch.setattr(reminder, "mark_reminded", lambda *k: marked.append(k) or True)
+async def test_check_reminders_skips_reminded(legacy_db):
+    deadline = _soon_deadline(10)
+    cid = database.save_contest("g1", {"name": "校赛", "reg_deadline": deadline})
+    database.mark_reminded("g1", cid, "reg_deadline", deadline)
 
     async def ok_send(group_id, text):
         raise AssertionError("已提醒过的不应再次发送")
 
     sent = await reminder.check_reminders(ok_send)
     assert sent == 0
-    assert marked == []
+    assert database.has_reminded("g1", cid, "reg_deadline", deadline)

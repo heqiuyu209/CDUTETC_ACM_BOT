@@ -1,8 +1,8 @@
 """定时提醒模块：周期检查临近比赛/活动，发送提醒并持久化去重。
 
 - 业务时间统一为北京时间 Asia/Shanghai（zoneinfo）。
-- 阶段一比赛提醒（contests/reminders 表，兼容保留）：
-  去重键 = (群, 比赛, 提醒类型, 目标时间)；比赛时间被修改后键变化，可重新提醒。
+- 阶段一比赛通过通用队列投递；reminders 保留成功历史与兼容投影，
+  成功事实持久保存，投影失败不重发；目标修改后按新身份计划。
 - v2 征集提醒（reminder_deliveries 表）：
   覆盖「征集报名截止」「公共比赛报名截止/开赛」，
   去重键含群、对象、提醒类型和目标时间，兼容旧冒号键；
@@ -22,7 +22,6 @@ from database import (
     claim_delivery,
     delivery_dedup_key,
     finish_delivery,
-    has_reminded,
     list_competitions,
     list_contests,
     mark_reminded,
@@ -103,8 +102,9 @@ async def _send_reminder(send_group, group_id: str, text: str) -> tuple[bool, st
         return False, str(error)
 
 
-async def check_reminders(send_group) -> int:
-    """扫描一次全部群记录并发送提醒。
+async def check_reminders(send_group, now: datetime | None = None,
+                          max_attempts: int = _DELIVERY_MAX_ATTEMPTS) -> int:
+    """旧比赛使用通用队列原子领取、租约与成功回执；旧表仅为兼容投影。
 
     Args:
         send_group: 异步回调 async (group_id, text) -> bool，返回是否发送成功。
@@ -112,23 +112,25 @@ async def check_reminders(send_group) -> int:
     Returns:
         本次成功发送并标记去重的条数。
     """
-    now = datetime.now(TZ)
-    sent = 0
+    if max_attempts < 1:
+        raise ValueError("提醒尝试次数必须大于零")
+
+    def current_time():
+        current = now if now is not None else datetime.now(TZ)
+        return current.replace(tzinfo=TZ) if current.tzinfo is None else current.astimezone(TZ)
+
+    reconcile_deliveries(current_time(), max_attempts=max_attempts,
+                         allowed_groups=set(config.ALLOWED_GROUPS))
+    items = []
     for contest in list_contests():
         group_id = contest.get("group_id") or ""
-        if not group_id:
-            # 旧记录未归属任何群：隔离保留，不发送提醒
+        if not group_id or group_id not in config.ALLOWED_GROUPS:
+            # 未归属或已移出白名单的记录保留，不发送、不消耗尝试。
             continue
-        for item in build_reminders([contest], now):
-            key = (group_id, item["contest_id"], item["remind_type"], item["target_str"])
-            if has_reminded(*key):
-                continue
-            ok, error = await _send_reminder(send_group, group_id, format_remind(item))
-            if ok:
-                mark_reminded(*key)
-                sent += 1
-            else:
-                logger.warning("提醒发送失败，留待下次重试: %s（%s）", item["name"], error)
+        for item in build_reminders([contest], current_time()):
+            items.append({**item, "obj_type": "legacy_contest", "obj_id": item["contest_id"],
+                          "text": format_remind(item)})
+    sent = await _deliver_items(send_group, items, current_time, max_attempts)
     if sent:
         logger.info("本次检查成功发送 %d 条提醒", sent)
     return sent
@@ -205,6 +207,48 @@ def _delivery_key(item: dict) -> str:
                               item["remind_type"], item["target_str"])
 
 
+async def _deliver_items(send_group, items: list[dict], current_time,
+                         max_attempts: int) -> int:
+    """两代扫描共用领取、发送和回执处理；单条存储故障不阻断后续对象。"""
+    sent = 0
+    for item in items:
+        key = _delivery_key(item)
+        try:
+            token = claim_delivery(
+                item["group_id"], item["obj_type"], item["obj_id"], item["remind_type"], item["target_str"],
+                now=current_time(), max_attempts=max_attempts, lease_seconds=_DELIVERY_LEASE_SECONDS,
+                allowed_groups=set(config.ALLOWED_GROUPS),
+            )
+            if token is None or not validate_delivery_claim(
+                key, token, now=current_time(), allowed_groups=set(config.ALLOWED_GROUPS),
+            ):
+                continue
+        except sqlite3.Error:
+            logger.exception("提醒领取或复核失败: %s", key)
+            continue
+        ok, error = await _send_reminder(send_group, item["group_id"], item["text"])
+        try:
+            receipt_saved = ok and record_delivery_success(key, token, now=current_time())
+        except sqlite3.Error:
+            logger.exception("消息已发送但成功事实写入失败，保留 sending 等待恢复: %s", key)
+            continue
+        try:
+            finish_delivery(key, token, ok, error=error,
+                            now=current_time(), max_attempts=max_attempts)
+        except sqlite3.Error:
+            logger.exception("提醒回执写入异常: %s", key)
+        if ok and receipt_saved:
+            sent += 1
+            if item["obj_type"] == "legacy_contest":
+                try:
+                    mark_reminded(item["group_id"], item["obj_id"], item["remind_type"], item["target_str"])
+                except sqlite3.Error:
+                    logger.exception("旧提醒标记写入失败，已保留成功事实: %s", key)
+        elif not ok:
+            logger.warning("提醒发送失败: %s", key)
+    return sent
+
+
 async def check_general_reminders(send_group, now: datetime | None = None,
                                   max_attempts: int = _DELIVERY_MAX_ATTEMPTS) -> int:
     """复核计划、原子领取并发送；成功回执 sent，失败有界重试。
@@ -228,37 +272,7 @@ async def check_general_reminders(send_group, now: datetime | None = None,
     reconcile_deliveries(current_time(), max_attempts=max_attempts,
                          allowed_groups=set(config.ALLOWED_GROUPS))
     items = build_general_reminders(_list_collections_all(), list_competitions(status="confirmed"), current_time())
-    sent = 0
-    for item in items:
-        key = _delivery_key(item)
-        token = claim_delivery(
-            item["group_id"], item["obj_type"], item["obj_id"], item["remind_type"], item["target_str"],
-            now=current_time(), max_attempts=max_attempts, lease_seconds=_DELIVERY_LEASE_SECONDS,
-            allowed_groups=set(config.ALLOWED_GROUPS),
-        )
-        if token is None or not validate_delivery_claim(
-            key, token, now=current_time(), allowed_groups=set(config.ALLOWED_GROUPS),
-        ):
-            continue
-        ok, error = await _send_reminder(send_group, item["group_id"], item["text"])
-        # 接收到成功回执即先持久化事实，后续状态收尾抛错也不重复发送。
-        try:
-            receipt_saved = ok and record_delivery_success(key, token, now=current_time())
-        except sqlite3.Error:
-            logger.exception("消息已发送但成功事实写入失败，保留 sending 等待恢复: %s", key)
-            continue
-        try:
-            finish_delivery(key, token, ok, error=error,
-                            now=current_time(), max_attempts=max_attempts)
-        except sqlite3.Error:
-            logger.exception("提醒回执写入异常: %s", key)
-            if receipt_saved:
-                sent += 1
-            continue
-        if ok and receipt_saved:
-            sent += 1
-        elif not ok:
-            logger.warning("通用提醒发送失败: %s", key)
+    sent = await _deliver_items(send_group, items, current_time, max_attempts)
     if sent:
         logger.info("本次通用提醒成功发送 %d 条", sent)
     return sent
