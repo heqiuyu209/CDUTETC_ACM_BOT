@@ -1,9 +1,14 @@
 """提醒状态、跨连接领取、租约恢复及旧去重键迁移的离线回归测试。"""
 
 import asyncio
+import json
+import re
 import sqlite3
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from pathlib import Path
 from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -404,3 +409,237 @@ def test_reminder_status_filters_group_before_limiting_and_shows_terminal_counts
     text = commands.cmd_reminder_status("g1", "teacher", "")[0]["text"]
     assert f"collection#{pending_id}" in text and "待发送 1" in text
     assert "重试耗尽 1" in text
+
+
+async def test_unsent_collection_resumes_after_reopening_but_sent_history_does_not(file_db):
+    cid, key = collection()
+    failing = AsyncMock(return_value=False)
+    assert await reminder.check_general_reminders(failing, now=NOW) == 0
+    database.set_collection_status(cid, "closed")
+    database.reconcile_deliveries(NOW, allowed_groups={"g1"})
+    assert database.get_delivery_by_key(key)["status"] == "cancelled"
+    database.set_collection_status(cid, "open")
+    sender = AsyncMock(return_value=True)
+    assert await reminder.check_general_reminders(sender, now=NOW) == 1
+    row = database.get_delivery_by_key(key)
+    assert (row["status"], row["attempts"]) == ("sent", 2)
+    database.set_collection_status(cid, "closed")
+    database.reconcile_deliveries(NOW, allowed_groups={"g1"})
+    database.set_collection_status(cid, "open")
+    assert await reminder.check_general_reminders(sender, now=NOW) == 0
+    sender.assert_awaited_once()
+    assert database.get_delivery_by_key(key) == row
+
+
+async def test_amend_command_reschedule_then_revert_resumes_unsent_target(file_db, monkeypatch):
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
+    monkeypatch.setattr(config, "SUPER_ADMIN", {"admin"})
+    cid = database.create_competition({"name": "校赛", "official_time": TARGET}, status="confirmed")
+    key = database.delivery_dedup_key("g1", "competition", cid, "contest_time", TARGET)
+    assert await reminder.check_general_reminders(AsyncMock(return_value=False), now=NOW) == 0
+    await commands.handle_command(f"/修正 {cid} time=2026-11-05 10:00", "g1", "admin")
+    sender = AsyncMock(return_value=True)
+    assert await reminder.check_general_reminders(sender, now=NOW) == 0
+    assert database.get_delivery_by_key(key)["status"] == "cancelled"
+    await commands.handle_command(f"/修正 {cid} time={TARGET}", "g1", "admin")
+    assert database.get_competition(cid)["official_time"] == TARGET
+    assert await reminder.check_general_reminders(sender, now=NOW) == 1
+    assert await reminder.check_general_reminders(sender, now=NOW) == 0
+    sender.assert_awaited_once()
+    assert database.get_delivery_by_key(key)["attempts"] == 2
+
+
+async def test_reconfirm_competition_restores_cancelled_unsent_target(file_db, monkeypatch):
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
+    cid = database.create_competition({"name": "校赛", "official_time": TARGET}, status="confirmed")
+    key = database.delivery_dedup_key("g1", "competition", cid, "contest_time", TARGET)
+    database.ensure_delivery("g1", "competition", cid, "contest_time", TARGET)
+    database.set_competition_status(cid, "draft")
+    database.reconcile_deliveries(NOW, allowed_groups={"g1"})
+    database.set_competition_status(cid, "confirmed")
+    sender = AsyncMock(return_value=True)
+    assert await reminder.check_general_reminders(sender, now=NOW) == 1
+    assert database.get_delivery_by_key(key)["status"] == "sent"
+    sender.assert_awaited_once()
+
+
+def test_cancelled_restore_preserves_exhausted_retry_budget(file_db):
+    cid, key = collection()
+    token = claim(cid, max_attempts=1)
+    database.set_collection_status(cid, "closed")
+    database.reconcile_deliveries(NOW + timedelta(seconds=121), max_attempts=1)
+    assert database.get_delivery_by_key(key)["status"] == "cancelled"
+    database.set_collection_status(cid, "open")
+    assert claim(cid, now=NOW + timedelta(seconds=122), max_attempts=1) is None
+    assert database.get_delivery_by_key(key)["attempts"] == 1
+    assert not database.finish_delivery(key, token, True, now=NOW)
+
+
+@pytest.mark.parametrize("change", ["closed", "rescheduled", "expired"])
+async def test_active_sender_keeps_receipt_right_when_object_becomes_invalid(file_db, change):
+    cid, key = collection()
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def sender(*args):
+        started.set()
+        await release.wait()
+        return True
+
+    worker = asyncio.create_task(reminder.check_general_reminders(sender, now=NOW))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        before = database.get_delivery_by_key(key)
+        current = NOW + timedelta(seconds=1)
+        if change == "closed":
+            database.set_collection_status(cid, "closed")
+        elif change == "rescheduled":
+            with database._connect() as conn:
+                conn.execute("UPDATE collections SET deadline = '2026-11-05 10:00' WHERE id = ?", (cid,))
+        else:
+            current = datetime(2026, 11, 2, tzinfo=NOW.tzinfo)
+            # 目标已过期但发送租约仍有效，构造该合法边界。
+            with database._connect() as conn:
+                conn.execute("UPDATE reminder_deliveries SET lease_until = '2026-11-02 00:01:00' WHERE dedup_key = ?", (key,))
+            before = database.get_delivery_by_key(key)
+        database.reconcile_deliveries(current, allowed_groups={"g1", "g2"})
+        assert database.get_delivery_by_key(key) == before
+        assert claim(cid, now=current, allowed_groups={"g1"}) is None
+    finally:
+        release.set()
+    assert await asyncio.wait_for(worker, timeout=2) == 1
+    row = database.get_delivery_by_key(key)
+    assert row["status"] == "sent" and row["sent_at"]
+
+
+async def test_receipt_projection_error_keeps_durable_success_and_continues_scan(file_db):
+    _, key = collection()
+    second_id = database.create_collection("g1", "后续提醒", deadline=TARGET)
+    with database._connect() as conn:
+        conn.execute("""CREATE TRIGGER reject_sent_projection BEFORE UPDATE OF status ON reminder_deliveries
+            WHEN NEW.status = 'sent' AND NEW.dedup_key = '%s'
+            BEGIN SELECT RAISE(ABORT, 'receipt storage rejected'); END""" % key)
+    sender = AsyncMock(return_value=True)
+    assert await reminder.check_general_reminders(sender, now=NOW) == 2
+    assert sender.await_count == 2
+    assert all(row["status"] == "sent" and row["sent_at"] for row in database.list_deliveries("g1"))
+    assert database.list_pending_deliveries() == []
+    assert database.delivery_status_counts("g1") == {"sent": 2}
+    with database._connect() as conn:
+        assert conn.execute("SELECT status FROM reminder_deliveries WHERE dedup_key = ?", (key,)).fetchone() == ("sending",)
+        assert conn.execute("SELECT COUNT(*) FROM reminder_success_receipts").fetchone() == (2,)
+        # 即使旧状态投影留在 pending，持久化成功事实仍优先。
+        conn.execute("UPDATE reminder_deliveries SET status = 'pending' WHERE dedup_key = ?", (key,))
+    assert database.list_pending_deliveries() == []
+    assert await reminder.check_general_reminders(sender, now=NOW + timedelta(seconds=121)) == 0
+    assert sender.await_count == 2
+    assert database.claim_delivery("g1", "collection", second_id, "deadline", TARGET, now=NOW) is None
+    # 新进程重建数据库连接，原 UPDATE trigger 仍在，成功事实不依赖内存。
+    restart = subprocess.run([
+        sys.executable, "-c",
+        "import asyncio,json,sys; from datetime import datetime; from zoneinfo import ZoneInfo; "
+        "import database,config,reminder; database.DB_PATH=sys.argv[1]; "
+        "config.ALLOWED_GROUPS={'g1'}; database.init_db(); "
+        "sender=__import__('unittest.mock',fromlist=['AsyncMock']).AsyncMock(return_value=True); "
+        "sent=asyncio.run(reminder.check_general_reminders(sender,now=datetime(2026,11,1,12,3,tzinfo=ZoneInfo('Asia/Shanghai')))); "
+        "print(json.dumps({'sent':sent,'calls':sender.await_count,'rows':database.list_deliveries('g1')}))",
+        str(file_db),
+    ], cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=10, check=True)
+    result = json.loads(restart.stdout)
+    assert result["sent"] == result["calls"] == 0
+    assert all(row["status"] == "sent" and row["attempts"] == 1 for row in result["rows"])
+
+
+async def test_failed_receipt_database_error_does_not_skip_healthy_later_item(file_db):
+    _, key = collection()
+    database.create_collection("g1", "后续提醒", deadline=TARGET)
+    with database._connect() as conn:
+        conn.execute("""CREATE TRIGGER reject_failed_receipt BEFORE UPDATE OF status ON reminder_deliveries
+            WHEN NEW.status = 'pending' AND NEW.dedup_key = '%s'
+            BEGIN SELECT RAISE(ABORT, 'failed receipt rejected'); END""" % key)
+    sender = AsyncMock(side_effect=[False, True])
+    assert await reminder.check_general_reminders(sender, now=NOW) == 1
+    assert sender.await_count == 2
+    assert database.get_delivery_by_key(key)["status"] == "sending"
+    assert database.delivery_status_counts("g1") == {"sending": 1, "sent": 1}
+
+
+async def test_success_fact_insert_error_preserves_inflight_state_and_continues_scan(file_db, caplog):
+    _, key = collection()
+    database.create_collection("g1", "后续提醒", deadline=TARGET)
+    with database._connect() as conn:
+        conn.execute("""CREATE TRIGGER reject_success_fact BEFORE INSERT ON reminder_success_receipts
+            WHEN NEW.dedup_key = '%s'
+            BEGIN SELECT RAISE(ABORT, 'success fact rejected'); END""" % key)
+    sender = AsyncMock(return_value=True)
+    assert await reminder.check_general_reminders(sender, now=NOW) == 1
+    assert sender.await_count == 2
+    row = database.get_delivery_by_key(key)
+    assert row["status"] == "sending" and row["attempts"] == 1
+    assert row["lease_token"] and row["lease_until"] and not row["last_error"]
+    assert database.delivery_status_counts("g1") == {"sending": 1, "sent": 1}
+    assert "消息已发送但成功事实写入失败" in caplog.text
+    with database._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM reminder_success_receipts WHERE dedup_key = ?", (key,)).fetchone() == (0,)
+
+
+async def test_success_fact_is_saved_before_finish_function_can_fail(file_db, monkeypatch):
+    _, key = collection()
+    database.create_collection("g1", "后续提醒", deadline=TARGET)
+    original = reminder.finish_delivery
+    calls = 0
+
+    def first_finish_fails(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("finish unavailable")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(reminder, "finish_delivery", first_finish_fails)
+    sender = AsyncMock(return_value=True)
+    assert await reminder.check_general_reminders(sender, now=NOW) == 2
+    assert await reminder.check_general_reminders(sender, now=NOW + timedelta(seconds=121)) == 0
+    assert sender.await_count == 2
+    assert database.get_delivery_by_key(key)["status"] == "sent"
+
+
+@pytest.mark.parametrize("obj_type", ["collection", "competition"])
+@pytest.mark.parametrize("existing_plan", ["none", "queued", "failed_once"])
+async def test_group_removal_does_not_spend_attempts_and_return_resumes(file_db, monkeypatch, existing_plan, obj_type):
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
+    if obj_type == "collection":
+        cid, key = collection()
+        kind = "deadline"
+    else:
+        cid = database.create_competition({"name": "校赛", "official_time": TARGET}, status="confirmed")
+        kind = "contest_time"
+        key = database.delivery_dedup_key("g1", obj_type, cid, kind, TARGET)
+    attempts = int(existing_plan == "failed_once")
+    if existing_plan == "queued":
+        database.ensure_delivery("g1", obj_type, cid, kind, TARGET)
+    elif existing_plan == "failed_once":
+        assert await reminder.check_general_reminders(AsyncMock(return_value=False), now=NOW) == 0
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", set())
+    sender = AsyncMock(return_value=True)
+    for minutes in range(4):
+        assert await reminder.check_general_reminders(sender, now=NOW + timedelta(minutes=minutes)) == 0
+        assert database.claim_delivery("g1", obj_type, cid, kind, TARGET, now=NOW, allowed_groups=set()) is None
+    sender.assert_not_awaited()
+    row = database.get_delivery_by_key(key)
+    if existing_plan != "none":
+        assert (row["status"], row["attempts"]) == ("cancelled", attempts)
+    else:
+        assert row is None
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
+    assert await reminder.check_general_reminders(sender, now=NOW + timedelta(minutes=4)) == 1
+    sender.assert_awaited_once()
+    assert database.get_delivery_by_key(key)["attempts"] == attempts + 1
+
+
+async def test_registration_example_from_actual_reminder_is_accepted(file_db):
+    cid, _ = collection()
+    item = reminder.build_general_reminders([database.get_collection(cid)], [], NOW)[0]
+    example = re.search(r"（(/报名 \d+)）", item["text"]).group(1)
+    result = await commands.handle_command(example, "g1", "member")
+    assert "报名成功" in result[0]["text"]
+    assert database.summarize_collection(cid)["registered"] == 1

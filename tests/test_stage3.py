@@ -19,6 +19,7 @@ TZ = ZoneInfo("Asia/Shanghai")
 def db(monkeypatch):
     conn = sqlite3.connect(":memory:")
     monkeypatch.setattr(database, "_connect", lambda: conn)
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2"})
     database.init_db()
     yield conn
     conn.close()

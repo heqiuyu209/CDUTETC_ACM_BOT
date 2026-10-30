@@ -12,6 +12,7 @@
 
 import asyncio
 import logging
+import sqlite3
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -25,6 +26,7 @@ from database import (
     list_competitions,
     list_contests,
     mark_reminded,
+    record_delivery_success,
     reconcile_deliveries,
     validate_delivery_claim,
 )
@@ -152,7 +154,7 @@ def build_general_reminders(collections: list[dict], competitions: list[dict],
     """
     out: list[dict] = []
     for a in collections:
-        if a.get("status") != "open" or not a.get("group_id"):
+        if a.get("status") != "open" or a.get("group_id") not in config.ALLOWED_GROUPS:
             continue
         target = _parse_time(a.get("deadline") or "")
         if target is None:
@@ -167,7 +169,7 @@ def build_general_reminders(collections: list[dict], competitions: list[dict],
                 "target_str": a["deadline"],
                 "text": (
                     f"【提醒】征集「{a['title']}」报名截止：{a['deadline']}\n"
-                    f"已报名同学请确认，未报名同学请抓紧（/报名 {a['id']} 报名）"
+                    f"已报名同学请确认，未报名同学请抓紧（/报名 {a['id']}）"
                 ),
             })
     # 公共比赛：字段是 official_ 前缀，映射到通用提醒类型
@@ -239,9 +241,21 @@ async def check_general_reminders(send_group, now: datetime | None = None,
         ):
             continue
         ok, error = await _send_reminder(send_group, item["group_id"], item["text"])
-        recorded = finish_delivery(key, token, ok, error=error,
-                                   now=current_time(), max_attempts=max_attempts)
-        if ok and recorded:
+        # 接收到成功回执即先持久化事实，后续状态收尾抛错也不重复发送。
+        try:
+            receipt_saved = ok and record_delivery_success(key, token, now=current_time())
+        except sqlite3.Error:
+            logger.exception("消息已发送但成功事实写入失败，保留 sending 等待恢复: %s", key)
+            continue
+        try:
+            finish_delivery(key, token, ok, error=error,
+                            now=current_time(), max_attempts=max_attempts)
+        except sqlite3.Error:
+            logger.exception("提醒回执写入异常: %s", key)
+            if receipt_saved:
+                sent += 1
+            continue
+        if ok and receipt_saved:
             sent += 1
         elif not ok:
             logger.warning("通用提醒发送失败: %s", key)
