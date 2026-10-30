@@ -27,8 +27,11 @@ def contains_link(content: str) -> bool:
 
 
 def is_publish_command(text: str, cmd: str = "发布") -> bool:
-    """是否为显式发布命令（如“发布 <链接>”）。仅此命令可触发存档。"""
-    return text.startswith(cmd)
+    """完整命令词后须为空或空白，避免把“发布的比赛……”当成操作。"""
+    if not cmd or not text.startswith(cmd):
+        return False
+    rest = text[len(cmd):]
+    return not rest or rest[0].isspace()
 
 
 def is_allowed_group(group_id: str | None, allowed_groups: set[str]) -> bool:

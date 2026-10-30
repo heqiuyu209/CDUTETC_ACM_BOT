@@ -1,0 +1,60 @@
+"""真实 SDK 入口的发布边界与持久化回归。"""
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+import sqlite3
+
+import pytest
+from botpy.message import GroupMessage
+
+import commands
+import config
+import database as db
+import main
+from utils import is_publish_command
+
+
+@pytest.mark.parametrize("text", [
+    "发布的这个校赛为什么报名时间不同？ https://contest.example.com",
+    "发布会什么时候开始？ https://contest.example.com",
+    "发布失败怎么办？ https://contest.example.com",
+    "发布https://contest.example.com",
+])
+async def test_question_does_not_publish_or_fetch(monkeypatch, text):
+    conn = sqlite3.connect(":memory:")
+    monkeypatch.setattr(db, "_connect", lambda: conn)
+    db.init_db()
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
+    monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
+    monkeypatch.setattr(config, "PUBLISH_CMD", "发布")
+    fetch = AsyncMock()
+    extract = AsyncMock()
+    monkeypatch.setattr(main, "fetch_text", fetch)
+    monkeypatch.setattr(main, "extract_contest", extract)
+    monkeypatch.setattr(commands, "handle_non_command_message", AsyncMock(return_value=[]))
+    client = main.ACMBot()
+    api = SimpleNamespace(post_group_message=AsyncMock(return_value={"id": "reply"}))
+    client.api = api
+    message = GroupMessage(api=api, event_id="event", data={
+        "id": "incoming", "content": text, "group_openid": "g1",
+        "author": {"member_openid": "teacher"},
+    })
+    try:
+        await client.on_group_at_message_create(message)
+        fetch.assert_not_awaited()
+        extract.assert_not_awaited()
+        assert db.list_competitions() == []
+        assert db.list_sources() == []
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("text", ["发布", "发布 https://contest.example.com", "发布\nhttps://contest.example.com", "发布\u3000https://contest.example.com"])
+def test_explicit_publish_command_keeps_supported_whitespace(text):
+    assert is_publish_command(text)
+
+
+def test_custom_command_requires_its_own_boundary():
+    assert is_publish_command("/发布 https://contest.example.com", "/发布")
+    assert not is_publish_command("/发布的比赛？", "/发布")
+    assert not is_publish_command("普通问题", "")
