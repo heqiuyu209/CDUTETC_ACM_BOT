@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 TZ = ZoneInfo(TZ_NAME)
 
 _TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M")
+_SOURCE_STATE_FIELDS = (
+    "etag", "last_modified", "body_hash", "last_fetched_at", "last_status", "last_error",
+)
 
 
 def _parse_db_time(text: str) -> datetime | None:
@@ -102,27 +105,47 @@ def _source_is_active(source: dict) -> bool:
 
 
 def _source_still_active(source: dict) -> bool:
-    """等待网络/模型期间来源可能被停用，写库前重新核对关联。"""
+    """等待后核对关联及抓取快照，旧任务不能覆盖后来成功的基线。"""
     comp = db.get_competition(source["competition_id"])
     if comp is None or comp.get("status") not in ("draft", "confirmed"):
         return False
+    if hasattr(db, "source_snapshot_matches"):
+        return db.source_snapshot_matches(source)
     return any(
         current["id"] == source["id"] and current["url"] == source["url"]
         and _source_is_active(current)
+        and all(current.get(field) == source.get(field) for field in _SOURCE_STATE_FIELDS)
         for current in db.list_sources(source["competition_id"])
     )
+
+
+def _update_source_state(source: dict, **state) -> bool:
+    """来源同步接口可用时用条件写入；旧数据库只支持同步快照复查。"""
+    if hasattr(db, "source_snapshot_matches"):
+        return db.update_source_fetch(source["id"], expected_source=source, **state)
+    if not _source_still_active(source):
+        return False
+    db.update_source_fetch(source["id"], **state)
+    return True
+
+
+def _source_superseded(source: dict) -> dict:
+    return {"kind": "skip", "source_id": source["id"], "reason": "来源已停用、关联或抓取基线已更新"}
 
 
 def _source_error(source: dict, name: str, now: datetime, error: Exception) -> dict:
     err = str(error) or type(error).__name__
     try:
-        db.update_source_fetch(
-            source["id"], etag=source.get("etag") or "",
+        updated = _update_source_state(
+            source, etag=source.get("etag") or "",
             last_modified=source.get("last_modified") or "",
             body_hash=source.get("body_hash") or "",
             last_fetched_at=now.strftime("%Y-%m-%d %H:%M:%S"),
             last_status="error", last_error=err[:500],
         )
+        if not updated:
+            logger.info("忽略过期来源任务的失败: %s（%s）", source["id"], err)
+            return _source_superseded(source)
     except Exception as status_error:
         logger.warning("来源错误状态写入失败: %s（%s）", source["id"], status_error)
     logger.warning("来源处理失败: %s（%s）", source["url"], err)
@@ -154,14 +177,16 @@ async def _process_source(source: dict, comp: dict | None, now: datetime, fetch,
         validators.append((value or "").strip()[:500])
     etag, last_modified = validators
     if not _source_still_active(source):
-        return {"kind": "skip", "source_id": sid, "reason": "来源已停用或关联已变更"}
+        return _source_superseded(source)
     if not detect_change(source, text, etag, last_modified):
-        db.update_source_fetch(
-            sid, etag=etag, last_modified=last_modified,
+        updated = _update_source_state(
+            source, etag=etag, last_modified=last_modified,
             body_hash=source.get("body_hash") or "",
             last_fetched_at=now.strftime("%Y-%m-%d %H:%M:%S"),
             last_status="nochange", last_error="",
         )
+        if not updated:
+            return _source_superseded(source)
         return {"kind": "nochange", "source_id": sid, "competition_id": cid, "name": name}
 
     info, err = await extract(text)
@@ -177,8 +202,20 @@ async def _process_source(source: dict, comp: dict | None, now: datetime, fetch,
     if existing is None or existing.get("status") not in ("draft", "confirmed"):
         return {"kind": "skip", "source_id": sid, "reason": "来源关联比赛无效"}
     if not _source_still_active(source):
-        return {"kind": "skip", "source_id": sid, "reason": "来源已停用或关联已变更"}
-    if existing["status"] == "confirmed":
+        return _source_superseded(source)
+    new_source_state = {
+        "etag": etag, "last_modified": last_modified, "body_hash": _body_hash(text),
+        "last_fetched_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if hasattr(db, "store_crawled_competition"):
+        # 同事务核对快照并保存内容/基线，覆盖最终复查到写入的并发窗口。
+        stored = db.store_crawled_competition(source, comp_info, new_source_state)
+        if stored is None:
+            return _source_superseded(source)
+        action = stored["action"]
+        if action == "pending":
+            update_id = stored["update_id"]
+    elif existing["status"] == "confirmed":
         update_id = db.add_pending_update(
             cid, comp_info, source_id=sid,
             change_note="公共来源实质变化（免审版不自动替换），待超管确认",
@@ -190,11 +227,12 @@ async def _process_source(source: dict, comp: dict | None, now: datetime, fetch,
                                      note="公共来源实质变化，更新草稿"):
             raise ValueError("来源关联比赛更新失败")
         action = "updated"
-    db.update_source_fetch(
-        sid, etag=etag, last_modified=last_modified, body_hash=_body_hash(text),
-        last_fetched_at=now.strftime("%Y-%m-%d %H:%M:%S"),
-        last_status="pending" if action == "pending" else "draft", last_error="",
-    )
+    if not hasattr(db, "store_crawled_competition"):
+        if not _update_source_state(
+            source, **new_source_state,
+            last_status="pending" if action == "pending" else "draft", last_error="",
+        ):
+            return _source_superseded(source)
     item = {
         "kind": "pending_auto" if action == "pending" else "updated_auto",
         "source_id": sid, "competition_id": cid, "name": comp_info["name"],

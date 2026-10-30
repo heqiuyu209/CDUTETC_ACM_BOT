@@ -1,5 +1,6 @@
 """监控单来源失败隔离、最后成功基线和模型输出结构回归。"""
 
+import asyncio
 import json
 import sqlite3
 from datetime import datetime
@@ -90,10 +91,13 @@ async def test_each_source_failure_preserves_baseline_and_continues(monitored, m
         monkeypatch.setattr(database, "get_competition", get)
     if stage in ("pending", "draft"):
         operation = "add_pending_update" if stage == "pending" else "update_competition"
+        if hasattr(database, "store_crawled_competition"):
+            operation = "store_crawled_competition"
         real_store = getattr(database, operation)
 
         def store(cid, *args, **kwargs):
-            if cid == bad_cid:
+            target_cid = cid.get("competition_id") if isinstance(cid, dict) else cid
+            if target_cid == bad_cid:
                 raise sqlite3.OperationalError("injected storage failure")
             return real_store(cid, *args, **kwargs)
 
@@ -170,6 +174,11 @@ async def test_source_disabled_during_extraction_is_not_written(monitored, monke
         nonlocal disabled
         if text == "bad":
             disabled = True
+            if hasattr(database, "source_snapshot_matches"):
+                monitored["conn"].execute(
+                    "UPDATE competition_sources SET active = 0 WHERE id = ?", (monitored["bad_source"],),
+                )
+                monitored["conn"].commit()
         return await extract_ok(text)
 
     monkeypatch.setattr(database, "list_sources", sources)
@@ -198,6 +207,158 @@ async def test_competition_deleted_during_unchanged_fetch_is_not_recorded(monito
     assert results[0]["kind"] == "skip"
     assert results[1]["kind"] == "updated_auto"
     assert database.list_sources(monitored["bad"])[0]["etag"] == "last-good-etag"
+
+
+@pytest.mark.parametrize("stage,outcome", [
+    ("fetch", "changed"), ("fetch", "nochange"), ("fetch", "raises"), ("fetch", "malformed"),
+    ("extract", "changed"), ("extract", "raises"),
+    ("extract", "reported-error"), ("extract", "malformed"),
+])
+async def test_same_url_admin_baseline_wins_over_inflight_scan(monitored, stage, outcome):
+    entered = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def wait_for_admin():
+        entered.set()
+        await resume.wait()
+        if outcome == "raises":
+            raise RuntimeError("old scan failed after admin update")
+
+    async def fetch(url):
+        if "bad." in url and stage == "fetch":
+            await wait_for_admin()
+            if outcome == "malformed":
+                return None
+            if outcome == "nochange":
+                return "old successful body", {"etag": "stale-etag"}
+        return await fetch_ok(url)
+
+    async def extract(text):
+        if text == "bad" and stage == "extract":
+            await wait_for_admin()
+            if outcome == "reported-error":
+                return None, "old extraction failed"
+            if outcome == "malformed":
+                return None
+        return await extract_ok(text)
+
+    scan = asyncio.create_task(crawler.run_fetch(now=NOW, fetch=fetch, extract=extract))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        url = "https://bad.example.com"
+        admin_patch = {"name": "ADMIN current", "official_site": url}
+        admin_text = "ADMIN latest body"
+        if hasattr(database, "source_snapshot_matches"):
+            # 来源同步修复合入后，走真正的同 URL 重新提取事务。
+            assert database.amend_competition(monitored["bad"], admin_patch, source_text=admin_text)
+        else:
+            assert database.amend_competition(monitored["bad"], admin_patch)
+            database.update_source_fetch(
+                monitored["bad_source"], body_hash=crawler._body_hash(admin_text),
+                last_status="confirmed",
+            )
+        admin_source = database.list_sources(monitored["bad"])[0]
+        resume.set()
+        results = await asyncio.wait_for(scan, timeout=1)
+    finally:
+        resume.set()
+        if not scan.done():
+            scan.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await scan
+
+    assert results[0]["kind"] == "skip"
+    assert results[1]["kind"] == "updated_auto"
+    assert database.get_competition(monitored["bad"])["name"] == "ADMIN current"
+    assert database.get_pending_update(monitored["bad"]) is None
+    assert database.list_sources(monitored["bad"])[0] == admin_source
+
+
+@pytest.mark.skipif(not hasattr(database, "store_crawled_competition"), reason="依赖来源同步的事务写入接口")
+@pytest.mark.parametrize("status", ["draft", "confirmed"])
+@pytest.mark.parametrize("change", ["baseline", "url"])
+async def test_atomic_store_rechecks_after_last_snapshot_read(monitored, monkeypatch, status, change):
+    cid = monitored["bad"]
+    if status == "draft":
+        database.set_competition_status(cid, "draft")
+    real_check = crawler._source_still_active
+    checks = 0
+    admin_sources = None
+
+    def check(source):
+        nonlocal checks, admin_sources
+        valid = real_check(source)
+        if source["id"] == monitored["bad_source"]:
+            checks += 1
+            if checks == 2:
+                # 精确注入最终读快照之后、写事务开始之前的另一个写入。
+                url = "https://new.example.com" if change == "url" else source["url"]
+                assert database.amend_competition(
+                    cid, {"name": "ADMIN current", "official_site": url}, source_text="ADMIN latest body",
+                )
+                admin_sources = database.list_sources(cid, active_only=False)
+        return valid
+
+    monkeypatch.setattr(crawler, "_source_still_active", check)
+    results = await crawler.run_fetch(now=NOW, fetch=fetch_ok, extract=extract_ok)
+    assert results[0]["kind"] == "skip"
+    assert results[1]["kind"] == "updated_auto"
+    assert database.get_competition(cid)["name"] == "ADMIN current"
+    assert database.get_pending_update(cid) is None
+    assert database.list_sources(cid, active_only=False) == admin_sources
+
+
+@pytest.mark.skipif(not hasattr(database, "store_crawled_competition"), reason="依赖来源同步的版本和事务接口")
+@pytest.mark.parametrize("stage", ["fetch", "extract"])
+@pytest.mark.parametrize("fail", [False, True])
+async def test_same_metadata_reextract_still_invalidates_scan(monitored, monkeypatch, stage, fail):
+    monkeypatch.setattr(database, "now_str", lambda: "2026-10-30 08:00:00")
+    cid, sid = monitored["bad"], monitored["bad_source"]
+    body = "old successful body"
+    database.update_source_fetch(sid, body_hash=crawler._body_hash(body), last_status="confirmed")
+    before = database.list_sources(cid)[0]
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def pause():
+        entered.set()
+        await resume.wait()
+        if fail:
+            raise RuntimeError("old task failed")
+
+    async def fetch(url):
+        if "bad." in url and stage == "fetch":
+            await pause()
+        return await fetch_ok(url)
+
+    async def extract(text):
+        if text == "bad" and stage == "extract":
+            await pause()
+        return await extract_ok(text)
+
+    scan = asyncio.create_task(crawler.run_fetch(now=NOW, fetch=fetch, extract=extract))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert database.amend_competition(
+            cid, {"name": "ADMIN current", "official_site": before["url"]}, source_text=body,
+        )
+        after = database.list_sources(cid)[0]
+        assert after["revision"] > before["revision"]
+        assert {k: v for k, v in after.items() if k != "revision"} == {
+            k: v for k, v in before.items() if k != "revision"
+        }
+        resume.set()
+        results = await asyncio.wait_for(scan, timeout=1)
+    finally:
+        resume.set()
+        if not scan.done():
+            scan.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await scan
+    assert results[0]["kind"] == "skip"
+    assert results[1]["kind"] == "updated_auto"
+    assert database.get_competition(cid)["name"] == "ADMIN current"
+    assert database.get_pending_update(cid) is None
+    assert database.list_sources(cid)[0] == after
 
 
 @pytest.mark.parametrize("content", [None, False, 1, {}, [], [{"type": "text", "text": "hello"}]])
