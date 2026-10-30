@@ -49,13 +49,18 @@ class OneBotMessage:
 class OneBotClient:
     """正向 WebSocket 客户端：接收事件 + 调用 OneBot API。"""
 
-    def __init__(self, ws_url: str, token: str = "", reconnect_delay: float = 5.0):
+    def __init__(self, ws_url: str, token: str = "", reconnect_delay: float = 5.0,
+                 event_queue_size: int = 256):
+        if event_queue_size < 1:
+            raise ValueError("event_queue_size must be positive")
         self.ws_url = ws_url
         self.token = token
         self.reconnect_delay = reconnect_delay
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._pending: dict[str, asyncio.Future] = {}
         self._echo_seq = 0
+        self._event_queue_size = event_queue_size
+        self._event_queue: asyncio.Queue | None = None
         # 事件分发：由上层（main.py）注册
         self.group_msg_handler: MessageHandler | None = None
         self.private_msg_handler: MessageHandler | None = None
@@ -76,11 +81,47 @@ class OneBotClient:
             self.ws_url, additional_headers=headers, max_size=4 * 1024 * 1024
         ) as ws:
             self._ws = ws
-            logger.info("OneBot 已连接: %s", self.ws_url)
-            if self.on_ready is not None:
-                await self.on_ready()
-            async for raw in ws:
-                await self._dispatch(raw)
+            queue = asyncio.Queue(maxsize=self._event_queue_size)
+            self._event_queue = queue
+            worker = asyncio.create_task(self._handle_events(queue))
+            try:
+                logger.info("OneBot 已连接: %s", self.ws_url)
+                if self.on_ready is not None:
+                    queue.put_nowait((self.on_ready, ()))
+                # 只解析事件和完成回执，不能在此等待会调用 API 的业务处理。
+                async for raw in ws:
+                    await self._dispatch(raw)
+            finally:
+                if self._ws is ws:
+                    self._ws = None
+                    self._event_queue = None
+                for future in self._pending.values():
+                    if not future.done():
+                        future.set_result(None)
+                self._pending.clear()
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+
+    async def _handle_events(self, queue: asyncio.Queue) -> None:
+        """保持业务事件顺序，接收循环同时可继续处理 API 回执。"""
+        while True:
+            handler, args = await queue.get()
+            try:
+                await handler(*args)
+            except Exception:
+                logger.exception("OneBot 事件处理失败")
+            finally:
+                queue.task_done()
+
+    def _enqueue_event(self, handler, *args) -> None:
+        queue = self._event_queue
+        if queue is None:
+            return
+        try:
+            queue.put_nowait((handler, args))
+        except asyncio.QueueFull:
+            # 等待队列空位同样会阻塞回执。显式断开并记录过载，不无限建任务。
+            raise RuntimeError("OneBot event queue is full") from None
 
     async def _dispatch(self, raw: str) -> None:
         try:
@@ -89,9 +130,14 @@ class OneBotClient:
             logger.warning("收到非 JSON 数据，忽略")
             return
 
+        if not isinstance(data, dict):
+            logger.warning("收到非对象 JSON，忽略")
+            return
+
         if "echo" in data:
             # API 动作回执
-            fut = self._pending.pop(data.get("echo"), None)
+            echo = data.get("echo")
+            fut = self._pending.pop(echo, None) if isinstance(echo, str) else None
             if fut is not None and not fut.done():
                 fut.set_result(data)
             return
@@ -104,26 +150,30 @@ class OneBotClient:
 
         msg = OneBotMessage(data)
         if msg.message_type == "group" and self.group_msg_handler is not None:
-            await self.group_msg_handler(msg)
+            self._enqueue_event(self.group_msg_handler, msg)
         elif msg.message_type == "private" and self.private_msg_handler is not None:
-            await self.private_msg_handler(msg)
+            self._enqueue_event(self.private_msg_handler, msg)
 
     async def call_api(self, action: str, **params) -> dict | None:
         """调用 OneBot API，返回响应 dict；连接断开或超时返回 None。"""
-        if self._ws is None:
+        ws = self._ws
+        if ws is None:
             return None
         self._echo_seq += 1
         echo = f"m{self._echo_seq}"
         fut = asyncio.get_running_loop().create_future()
         self._pending[echo] = fut
         try:
-            await self._ws.send(
+            await ws.send(
                 json.dumps({"action": action, "params": params, "echo": echo})
             )
             return await asyncio.wait_for(fut, timeout=10)
         except Exception:
-            self._pending.pop(echo, None)
             return None
+        finally:
+            self._pending.pop(echo, None)
+            if not fut.done():
+                fut.cancel()
 
     async def send_group_msg(self, group_id: str, text: str) -> bool:
         """向群发送文本消息；仅 OneBot 返回成功才确认。"""
