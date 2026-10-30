@@ -57,9 +57,9 @@ FETCH_ALLOWED_DOMAINS = {
 }
 FETCH_MAX_BYTES = int(os.getenv("ACM_FETCH_MAX_BYTES", "1000000"))        # 解压后响应体上限（字节）
 FETCH_MAX_REDIRECTS = int(os.getenv("ACM_FETCH_MAX_REDIRECTS", "3"))      # 重定向跳数上限
-FETCH_TIMEOUT = float(os.getenv("ACM_FETCH_TIMEOUT", "10"))               # 连接/读取超时（秒）
+FETCH_TIMEOUT = float(os.getenv("ACM_FETCH_TIMEOUT", "10"))               # 每跳 DNS/连接/读取/解析总超时（秒）
 FETCH_CONCURRENCY = int(os.getenv("ACM_FETCH_CONCURRENCY", "2"))          # 同时抓取上限
-FETCH_TEXT_LIMIT = int(os.getenv("ACM_FETCH_TEXT_LIMIT", "3000"))         # 送入模型的正文长度上限（字符）
+FETCH_TEXT_LIMIT = int(os.getenv("ACM_FETCH_TEXT_LIMIT", "3000"))         # 旧配置兼容保留；模型输入使用 LLM_MAX_INPUT_CHARS
 
 # ================= 大模型资源限制 =================
 LLM_MAX_INPUT_CHARS = int(os.getenv("ACM_LLM_MAX_INPUT_CHARS", "6000"))   # 单次请求输入长度上限
