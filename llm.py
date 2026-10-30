@@ -218,6 +218,53 @@ async def extract_contest(raw_text: str) -> tuple[dict | None, str | None]:
     return parse_contest_result(content)
 
 
+def _normalize_answer(answer: str) -> str:
+    """解包完整 JSON 回答；保留确实为普通文字的代码围栏。"""
+    if not isinstance(answer, str) or not answer.strip():
+        raise ValueError("模型未返回有效回答")
+    answer = answer.strip()
+    candidate, fenced, language = answer, False, ""
+    if answer.startswith(("```", "~~~")):
+        marker = answer[0]
+        opening = len(answer) - len(answer.lstrip(marker))
+        closing = len(answer) - len(answer.rstrip(marker))
+        first_line, newline, _ = answer.partition("\n")
+        last_newline = answer.rfind("\n")
+        last_line = answer[last_newline + 1:].strip()
+        if newline and last_line and not last_line.strip(marker) and len(last_line) >= opening:
+            candidate = answer[len(first_line) + 1:last_newline].strip()
+            language = first_line[opening:].strip().lower()
+            fenced = True
+        elif closing >= opening:
+            # 只用线性切片识别围栏；长串反引号不会触发正则回溯。
+            candidate = answer[opening:len(answer) - closing].strip()
+            if candidate[:4].lower() == "json" and (len(candidate) == 4 or candidate[4].isspace() or candidate[4] in '{["'):
+                candidate = candidate[4:].strip()
+                language = "json"
+            fenced = True
+    if not candidate:
+        raise ValueError("模型未返回有效回答")
+    try:
+        structured = json.loads(candidate)
+    except json.JSONDecodeError:
+        # 围栏里的普通文字/代码不需要符合 JSON，保留其原有排版。
+        if not fenced and candidate.startswith("{"):
+            raise ValueError("模型返回的回答 JSON 非法") from None
+        return answer
+    if isinstance(structured, dict):
+        answer = structured.get("answer")
+    elif isinstance(structured, str):
+        answer = structured
+    elif structured is None or isinstance(structured, list):
+        raise ValueError("模型未返回有效回答")
+    elif fenced and language in ("", "json"):
+        raise ValueError("模型未返回有效回答")
+    # 纯文本数字（如比赛年份/名额）仍可作为普通回答。
+    if not isinstance(answer, str) or not answer.strip():
+        raise ValueError("模型未返回有效回答")
+    return answer.strip()
+
+
 async def answer_question(question: str, contests: list[dict]) -> str:
     """按可见存档回答提问。contests 须为调用方筛选、限量的结果。"""
     question = (question or "")[: config.LLM_MAX_INPUT_CHARS]
@@ -232,14 +279,8 @@ async def answer_question(question: str, contests: list[dict]) -> str:
         f"【存档数据】\n{json.dumps(limited, ensure_ascii=False, indent=2)}"
     )
     try:
-        answer = (await _chat_once(system, question, json_mode=False)).strip()
-        # 兼容提供方仍返回 {"answer": "..."}，只取实际回答。
-        if answer.startswith("{"):
-            structured = json.loads(answer)
-            answer = structured.get("answer") if isinstance(structured, dict) else None
-        if not isinstance(answer, str) or not answer.strip():
-            raise ValueError("模型未返回有效回答")
-        return answer.strip()[:1500]
+        answer = _normalize_answer(await _chat_once(system, question, json_mode=False))
+        return answer[:1500]
     except Exception as e:
         logger.warning("问答模型调用失败: %s", type(e).__name__)
         return "模型暂时不可用，请稍后再试~"

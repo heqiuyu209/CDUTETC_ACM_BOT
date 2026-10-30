@@ -21,6 +21,20 @@ def transport(monkeypatch, handler):
 @pytest.mark.parametrize("content,expected", [
     ("报名截止是 11 月 10 日。", "报名截止是 11 月 10 日。"),
     ('{"answer":"报名截止是 11 月 10 日。"}', "报名截止是 11 月 10 日。"),
+    ('```json\n{"answer":"报名截止是 11 月 10 日。"}\n```', "报名截止是 11 月 10 日。"),
+    ('```JSON\r\n{"answer":"报名截止是 11 月 10 日。"}\r\n```', "报名截止是 11 月 10 日。"),
+    ('```\n{"answer":"报名截止是 11 月 10 日。"}\n```', "报名截止是 11 月 10 日。"),
+    ('```json {"answer":"报名截止是 11 月 10 日。"}```', "报名截止是 11 月 10 日。"),
+    ('~~~json\n{"answer":"报名截止是 11 月 10 日。"}\n~~~', "报名截止是 11 月 10 日。"),
+    ('````json\n{"answer":"报名截止是 11 月 10 日。"}\n`````', "报名截止是 11 月 10 日。"),
+    ('"报名截止是 11 月 10 日。"', "报名截止是 11 月 10 日。"),
+    ('```text\n报名截止是 11 月 10 日。\n```', '```text\n报名截止是 11 月 10 日。\n```'),
+    ('```json\n报名截止是 11 月 10 日。\n```', '```json\n报名截止是 11 月 10 日。\n```'),
+    ('```python\nfor i in range(3):\n    print(i)\n```', '```python\nfor i in range(3):\n    print(i)\n```'),
+    ('```text\n{这是普通说明，不是 JSON}\n```', '```text\n{这是普通说明，不是 JSON}\n```'),
+    ("2026", "2026"),
+    ("50", "50"),
+    ('```text\n50\n```', '```text\n50\n```'),
 ])
 async def test_qa_uses_text_mode_and_unwraps_valid_answer(monkeypatch, content, expected):
     requests = []
@@ -34,7 +48,17 @@ async def test_qa_uses_text_mode_and_unwraps_valid_answer(monkeypatch, content, 
     assert len(requests) == 1
 
 
-@pytest.mark.parametrize("content", ["", "  ", None, '{"answer":""}', '{"unexpected":"value"}'])
+@pytest.mark.parametrize("content", [
+    "", "  ", None, '{"answer":""}', '{"unexpected":"value"}',
+    "{}", "[]", "null", '""', '[{"answer":"不应把数组当成回答"}]',
+    '```json\n{}\n```', '```json\n{"answer":""}\n```',
+    '```json\n{"answer":"  "}\n```', '```json\n{"answer":null}\n```',
+    '```json\n{"answer":123}\n```', '```json\n{"unexpected":"value"}\n```',
+    '```json\n[]\n```', '```json\nnull\n```', '```json\n""\n```',
+    '```\n[]\n```', '~~~json\nnull\n~~~', '```json {} ```',
+    '```json\n\n```', '```text\n\n```', '```\n\n```',
+    '```json\n{}\n````', '`' * 8192,
+])
 async def test_invalid_answer_is_recorded_and_replied(monkeypatch, content):
     conn = sqlite3.connect(":memory:")
     monkeypatch.setattr(db, "_connect", lambda: conn)
