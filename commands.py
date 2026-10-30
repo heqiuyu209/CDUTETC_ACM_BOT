@@ -83,7 +83,7 @@ _AMEND_NEXT_FIELD = re.compile(r"(?:\s+|[,，]\s*)(?=[^\s=,，]+\s*=)")
 _AMEND_QUOTES = {'"': '"', "'": "'", "“": "”", "‘": "’"}
 
 
-def _parse_amend_fields(text: str) -> dict[str, str]:
+def _parse_field_values(text: str, field_map: dict[str, str] | None = None) -> dict[str, str]:
     """读取完整字段值；引号内的赋值片段、逗号和空格均属于正文。"""
     fields: dict[str, str] = {}
     pos = 0
@@ -96,7 +96,7 @@ def _parse_amend_fields(text: str) -> dict[str, str]:
         if assignment is None:
             raise ValueError("参数应为 字段=值；带赋值片段的文本请用引号包裹")
         key = assignment[1]
-        field = _AMEND_FIELD_MAP.get(key)
+        field = field_map.get(key) if field_map is not None else key
         if field is None:
             raise ValueError(f"不支持的字段：{key}")
         if field in fields:
@@ -130,6 +130,10 @@ def _parse_amend_fields(text: str) -> dict[str, str]:
             pos = separator.start() if separator else len(text)
             fields[field] = text[value_start:pos].strip()
     return fields
+
+
+def _parse_amend_fields(text: str) -> dict[str, str]:
+    return _parse_field_values(text, _AMEND_FIELD_MAP)
 
 
 def _broadcast_to_groups(competition_name: str, cid: int, text: str, exclude: str = "") -> list[dict]:
@@ -272,13 +276,15 @@ def cmd_collection_register(group_id: str, sender: str, args: str) -> list[dict]
         cid = int(parts[0])
     except ValueError:
         return [{"group_id": group_id, "text": "征集 id 应为数字"}]
-    data: dict[str, str] = {}
+    data = None
     if len(parts) > 1:
-        for token in parts[1].replace("，", " ").replace(",", " ").split():
-            if "=" in token:
-                k, v = token.split("=", 1)
-                data[k.strip()] = v.strip()
-    ok, msg = db.register_collection(cid, group_id, sender, data or None)
+        try:
+            data = _parse_field_values(parts[1])
+        except ValueError as e:
+            return [{"group_id": group_id, "text": f"报名参数错误：{e}"}]
+        if not data:
+            return [{"group_id": group_id, "text": "请使用 字段=值 填写报名资料"}]
+    ok, msg = db.register_collection(cid, group_id, sender, data)
     return [{"group_id": group_id, "text": msg}]
 
 

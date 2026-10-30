@@ -1274,38 +1274,56 @@ def register_collection(cid: int, group_id: str, member_id: str,
     - data 只能包含征集声明的字段（fields_json）
     - 已取消的登记重新登记 = 恢复；已登记的再次登记 = 更新字段（不重复计数）
     """
-    coll = get_collection(cid)
-    if coll is None:
-        return False, "征集不存在"
-    if coll["group_id"] != group_id:
-        return False, "征集不属于本群"
-    if coll["status"] != "open":
-        return False, "征集已结束或取消，无法报名"
-    if coll["deadline"] and coll["deadline"] < now_str()[:16]:
-        return False, "已超过征集截止时间"
-
-    declared: list[str] = []
-    try:
-        declared = json.loads(coll["fields_json"] or "[]")
-    except (ValueError, TypeError):
-        declared = []
-    data = data or {}
-    if not isinstance(data, dict):
+    if data is not None and not isinstance(data, dict):
         return False, "报名内容格式错误"
     cleaned: dict[str, str] = {}
-    for key, value in data.items():
-        if declared and key not in declared:
-            return False, f"该征集不支持字段：{key}"
+    for key, value in (data or {}).items():
+        if not isinstance(key, str) or not key.strip():
+            return False, "报名字段名称应为非空文本"
         if not isinstance(value, str):
             return False, f"字段 {key} 应为文本"
-        cleaned[key] = value.strip()
+        cleaned[key.strip()] = value.strip()
 
     with _connect() as conn:
+        # 状态、截止、名额和个人登记均在同一写事务中检查，避免并发超额。
+        conn.execute("BEGIN IMMEDIATE")
+        coll_row = conn.execute(
+            f"SELECT {_COLLECTION_COLS} FROM collections WHERE id = ?", (cid,),
+        ).fetchone()
+        if coll_row is None:
+            return False, "征集不存在"
+        coll = _row_to_collection(coll_row)
+        if coll["group_id"] != group_id:
+            return False, "征集不属于本群"
+        if coll["status"] != "open":
+            return False, "征集已结束或取消，无法报名"
+        if coll["deadline"] and coll["deadline"] <= now_str()[:16]:
+            return False, "已超过征集截止时间"
+        try:
+            declared = json.loads(coll["fields_json"] or "[]")
+        except (ValueError, TypeError):
+            return False, "征集登记字段配置错误，请联系老师"
+        if not isinstance(declared, list) or not all(isinstance(field, str) for field in declared):
+            return False, "征集登记字段配置错误，请联系老师"
+        for key in cleaned:
+            if declared and key not in declared:
+                return False, f"该征集不支持字段：{key}"
         row = conn.execute(
-            "SELECT id, status FROM collection_responses WHERE collection_id = ? AND member_id = ?",
+            "SELECT id, status, data_json FROM collection_responses WHERE collection_id = ? AND member_id = ?",
             (cid, member_id),
         ).fetchone()
-        if row is None:
+        merged = {}
+        if row is not None:
+            try:
+                merged = json.loads(row[2] or "{}")
+            except (ValueError, TypeError):
+                return False, "原报名资料格式错误，请联系老师"
+            if not isinstance(merged, dict):
+                return False, "原报名资料格式错误，请联系老师"
+            if row[1] == "registered" and not cleaned:
+                return True, "你已报名，原登记资料已保留"
+        merged.update(cleaned)
+        if row is None or row[1] != "registered":
             if coll["capacity"] is not None:
                 cnt = conn.execute(
                     "SELECT COUNT(*) FROM collection_responses WHERE collection_id = ? AND status = 'registered'",
@@ -1313,32 +1331,20 @@ def register_collection(cid: int, group_id: str, member_id: str,
                 ).fetchone()[0]
                 if cnt >= coll["capacity"]:
                     return False, "名额已满，无法报名"
+        timestamp = now_str()
+        if row is None:
             conn.execute(
                 "INSERT INTO collection_responses (collection_id, group_id, member_id, data_json, status, created_at, updated_at)"
                 " VALUES (?, ?, ?, ?, 'registered', ?, ?)",
-                (cid, group_id, member_id, json.dumps(cleaned, ensure_ascii=False), now_str(), now_str()),
+                (cid, group_id, member_id, json.dumps(merged, ensure_ascii=False), timestamp, timestamp),
             )
             return True, "报名成功"
-        if row[1] == "registered":
-            conn.execute(
-                "UPDATE collection_responses SET data_json = ?, status = 'registered', updated_at = ?"
-                " WHERE id = ?",
-                (json.dumps(cleaned, ensure_ascii=False), now_str(), row[0]),
-            )
-            return True, "已更新你的报名"
-        if coll["capacity"] is not None:
-            cnt = conn.execute(
-                "SELECT COUNT(*) FROM collection_responses WHERE collection_id = ? AND status = 'registered'",
-                (cid,),
-            ).fetchone()[0]
-            if cnt >= coll["capacity"]:
-                return False, "名额已满，无法恢复报名"
         conn.execute(
             "UPDATE collection_responses SET data_json = ?, status = 'registered', updated_at = ?"
             " WHERE id = ?",
-            (json.dumps(cleaned, ensure_ascii=False), now_str(), row[0]),
+            (json.dumps(merged, ensure_ascii=False), timestamp, row[0]),
         )
-        return True, "报名成功（重新报名）"
+        return True, "已更新你的报名" if row[1] == "registered" else "报名成功（重新报名）"
 
 
 def cancel_collection_registration(cid: int, group_id: str, member_id: str) -> tuple[bool, str]:
