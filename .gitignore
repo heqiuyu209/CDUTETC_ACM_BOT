@@ -24,6 +24,7 @@ htmlcov/
 # 密钥与本地配置（真实密钥请走环境变量）
 .env
 .env.*
+!.env.example
 config_local.py
 *.local.py
 secrets.*
