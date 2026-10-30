@@ -7,12 +7,22 @@
 """
 
 import os
+from pathlib import Path
 
-# ================= QQ 机器人（必填） =================
-APPID = os.getenv("ACM_APPID", "")
-APP_SECRET = os.getenv("ACM_APP_SECRET", "")
-# 确认 QQ 平台和接收群允许主动消息后设为 1；关闭时暂停提醒投递。
-GROUP_ACTIVE_MESSAGES_ENABLED = os.getenv("ACM_GROUP_ACTIVE_MESSAGES_ENABLED", "0") == "1"
+from dotenv import load_dotenv
+
+# 加载项目根目录下的 .env（若存在）。系统环境变量优先，.env 不覆盖已注入的值。
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+# ================= QQ 机器人接入（OneBot/NapCat，必填） =================
+# NapCatQQ 正向 WebSocket 地址，例如 ws://127.0.0.1:3001
+ONEBOT_WS_URL = os.getenv("ACM_ONEBOT_WS_URL", "")
+# 可选鉴权 token（与 NapCat 配置一致；未开启留空）
+ONEBOT_TOKEN = os.getenv("ACM_ONEBOT_TOKEN", "")
+# 机器人自身 QQ 号（用于识别群内 @ 目标；可选）
+BOT_QQ = os.getenv("ACM_BOT_QQ", "")
+# 普通 QQ 无平台主动消息限制；保留开关以便在需要时暂停提醒投递。
+GROUP_ACTIVE_MESSAGES_ENABLED = os.getenv("ACM_GROUP_ACTIVE_MESSAGES_ENABLED", "1") == "1"
 
 # ================= 大模型（OpenAI 兼容接口，必填） =================
 LLM_API_KEY = os.getenv("ACM_LLM_API_KEY", "")
@@ -20,16 +30,16 @@ LLM_BASE_URL = os.getenv("ACM_LLM_BASE_URL", "https://api.deepseek.com/v1")
 LLM_MODEL = os.getenv("ACM_LLM_MODEL", "deepseek-chat")
 
 # ================= 群与角色权限（默认全拒绝） =================
-# 允许机器人服务的群 openid 列表（逗号分隔）。未配置 = 不服务任何群。
+# 允许机器人服务的 QQ 群号列表（逗号分隔）。未配置 = 不服务任何群。
 ALLOWED_GROUPS = {
     g.strip() for g in os.getenv("ACM_ALLOWED_GROUPS", "").split(",") if g.strip()
 }
-# 超级管理员 openid 白名单（逗号分隔，可多人）：/修正 纠正比赛、维护全局信息、
+# 超级管理员 QQ 号白名单（逗号分隔，可多人）：/修正 纠正比赛、维护全局信息、
 # 管理征集与查看全部明细；未配置 = 超管命令全部拒绝。
 SUPER_ADMIN = {
     m.strip() for m in os.getenv("ACM_SUPER_ADMIN", "").split(",") if m.strip()
 }
-# 老师 openid 白名单（逗号分隔，发布权并入此白名单，原发布者白名单已移除）：
+# 老师 QQ 号白名单（逗号分隔，发布权并入此白名单，原发布者白名单已移除）：
 # 可免审发布比赛、维护校安排/课程/FAQ、发起征集、查看征集汇总。
 # 未配置 = 老师管理命令全部拒绝。
 TEACHER_WHITELIST = {
@@ -88,8 +98,7 @@ DB_PATH = os.getenv("ACM_DB_PATH", os.path.join(BASE_DIR, "contests.db"))
 # ================= 启动前配置检查 =================
 
 REQUIRED_CONFIG = {
-    "ACM_APPID": APPID,
-    "ACM_APP_SECRET": APP_SECRET,
+    "ACM_ONEBOT_WS_URL": ONEBOT_WS_URL,
     "ACM_LLM_API_KEY": LLM_API_KEY,
 }
 
