@@ -475,13 +475,19 @@ def cmd_fetch_status(group_id: str, sender: str, args: str) -> list[dict]:
 def cmd_reminder_status(group_id: str, sender: str, args: str) -> list[dict]:
     if not is_teacher(sender):
         return [{"group_id": group_id, "text": "仅老师可查看提醒状态"}]
-    pending = [d for d in db.list_pending_deliveries() if d["group_id"] == group_id]
+    db.reconcile_deliveries(allowed_groups=set(config.ALLOWED_GROUPS))
+    pending = db.list_deliveries(group_id, statuses=("pending", "sending"), limit=20)
+    counts = db.delivery_status_counts(group_id)
     state = "主动群消息：已启用" if config.GROUP_ACTIVE_MESSAGES_ENABLED else "主动群消息：未启用（定时提醒暂停）"
+    labels = {"pending": "待发送", "sending": "发送中", "sent": "已发送",
+              "failed": "重试耗尽", "cancelled": "已取消", "expired": "已过期"}
+    lines = [state, "投递统计：" + "｜".join(f"{label} {counts.get(status, 0)}" for status, label in labels.items())]
     if not pending:
-        return [{"group_id": group_id, "text": state + "\n本群当前无待发送提醒"}]
-    lines = [state, "待发送提醒："]
-    for d in pending[:20]:
-        lines.append(f"{d['obj_type']}#{d['obj_id']}｜{d['remind_type']}｜目标 {d['target_time']}｜已尝试 {d['attempts']} 次")
+        lines.append("本群当前无待发送提醒")
+    else:
+        lines.append("待发送/发送中提醒：")
+        for d in pending:
+            lines.append(f"{d['obj_type']}#{d['obj_id']}｜{labels[d['status']]}｜{d['remind_type']}｜目标 {d['target_time']}｜已尝试 {d['attempts']} 次")
     return [{"group_id": group_id, "text": "\n".join(lines)}]
 
 

@@ -195,8 +195,9 @@ def test_general_reminder_gives_up_after_max_attempts(db):
     for _ in range(3):
         asyncio.run(reminder.check_general_reminders(send_fail, now=_now(), max_attempts=2))
     # 第 3 轮不再尝试（attempts 已达上限）
-    d = database.list_pending_deliveries()
-    assert len(d) == 1 and d[0]["attempts"] >= 2
+    assert database.list_pending_deliveries() == []
+    d = database.list_deliveries("g1")
+    assert len(d) == 1 and d[0]["status"] == "failed" and d[0]["attempts"] == 2
 
 
 def test_competition_reminder_all_groups(db, monkeypatch):
