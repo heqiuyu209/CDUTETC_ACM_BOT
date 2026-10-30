@@ -1,10 +1,12 @@
 """真实 BotHttp/BotAPI 重试路径，受控 session 不发送外部请求。"""
 
 import asyncio
+import json
 import sqlite3
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+import pytest
 
 import config
 import database as db
@@ -17,10 +19,11 @@ from sdk_compat import ReceiptBotHttp
 class Session:
     closed = True
 
-    def __init__(self, outcomes):
+    def __init__(self, outcomes, content_type="application/json"):
         self.outcomes = list(outcomes)
         self.requests = 0
         self.deliveries = 0
+        self.content_type = content_type
 
     def request(self, **kwargs):
         self.requests += 1
@@ -33,9 +36,10 @@ class Session:
                     raise outcome
                 session.deliveries += 1
                 return SimpleNamespace(
-                    status=200, headers={"content-type": "application/json"},
+                    status=200, headers={"content-type": session.content_type},
                     request_info=SimpleNamespace(url="https://example.invalid/mock"),
                     json=AsyncMock(return_value=outcome),
+                    text=AsyncMock(return_value=json.dumps(outcome)),
                 )
 
             async def __aexit__(self, *args):
@@ -44,8 +48,8 @@ class Session:
         return ResponseContext()
 
 
-def prepare(http, outcomes):
-    session = Session(outcomes)
+def prepare(http, outcomes, content_type="application/json"):
+    session = Session(outcomes, content_type)
     http._session = session
     http._headers = {}
     http.check_session = AsyncMock()
@@ -83,7 +87,8 @@ async def test_success_of_other_request_cannot_supply_missing_receipt():
     assert result == [{"id": "concurrent"}, None]
 
 
-async def test_reset_success_persists_and_next_scan_does_not_repeat(monkeypatch):
+@pytest.mark.parametrize("content_type", ["application/json", "application/json; charset=utf-8", "Application/JSON; Charset=UTF-8"])
+async def test_reset_success_persists_and_next_scan_does_not_repeat(monkeypatch, content_type):
     conn = sqlite3.connect(":memory:")
     monkeypatch.setattr(db, "_connect", lambda: conn)
     db.init_db()
@@ -91,7 +96,7 @@ async def test_reset_success_persists_and_next_scan_does_not_repeat(monkeypatch)
     monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
     cid = db.create_collection("g1", "SDK receipt", deadline="2026-11-01 09:00")
     client = main.ACMBot()
-    session = prepare(client.http, [ConnectionResetError("reset"), {"id": "accepted"}])
+    session = prepare(client.http, [ConnectionResetError("reset"), {"id": "accepted"}], content_type)
     now = datetime(2026, 11, 1, 8, tzinfo=reminder.TZ)
     try:
         assert await reminder.check_general_reminders(client._send_group, now=now) == 1
@@ -102,3 +107,12 @@ async def test_reset_success_persists_and_next_scan_does_not_repeat(monkeypatch)
         assert session.requests == 2 and session.deliveries == 1
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("outcome", [None, {}, {"id": ""}, {"id": 123}, {"id": "receipt", "code": 1}, "not json"])
+async def test_textual_invalid_or_failed_receipt_is_not_success(monkeypatch, outcome):
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
+    monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
+    client = main.ACMBot()
+    prepare(client.http, [outcome], "application/json; charset=utf-8")
+    assert await client._send_group("g1", "test") is False

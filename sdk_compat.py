@@ -1,6 +1,7 @@
 """qq-botpy 1.2.1 断线重试回执兼容；不修改安装目录。"""
 
 from contextvars import ContextVar
+import json
 
 from botpy.http import BotHttp
 
@@ -12,7 +13,8 @@ class ReceiptBotHttp(BotHttp):
     """保留同一请求递归重试的返回值，并发请求各自隔离。
 
     SDK 1.2.1 的 ConnectionResetError 分支递归调用缺少 return。
-    这里仍执行 SDK 原始请求、鉴权和重试，仅补回内部实际返回的回执。
+    这里仍执行 SDK 原始请求、鉴权和重试，补回内部实际返回的回执。
+    SDK 把带 charset 的 JSON 响应当成文本时，恢复有效的 JSON 对象。
     超时或重试耗尽没有回执时仍返回 None。
     """
 
@@ -20,6 +22,13 @@ class ReceiptBotHttp(BotHttp):
         token = _retry_receipt.set(None) if retry_time == 0 else None
         try:
             result = await super().request(route, retry_time, **kwargs)
+            if isinstance(result, str):
+                try:
+                    decoded = json.loads(result)
+                except (ValueError, RecursionError):
+                    decoded = None
+                if isinstance(decoded, (dict, list)):
+                    result = decoded
             if result is not None:
                 _retry_receipt.set(result)
             return result if result is not None else _retry_receipt.get()
