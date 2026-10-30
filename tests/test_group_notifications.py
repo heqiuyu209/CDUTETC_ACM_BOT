@@ -2,7 +2,6 @@
 
 import asyncio
 import importlib
-import json
 import re
 import sqlite3
 from datetime import datetime
@@ -17,7 +16,6 @@ import commands
 import config
 import database
 import main
-import llm
 import reminder
 
 
@@ -263,48 +261,6 @@ async def test_publish_notifies_all_allowed_groups_and_reports_real_results(bot,
     assert "已记录" in text
     _assert_sent_ratio(text, 2, 3)
     assert re.search(r"其余\s*1\s*个群未确认发送", text)
-
-
-@pytest.mark.parametrize("official_aliases", [False, True])
-async def test_sdk_publish_twice_preserves_all_extracted_fields_without_second_notification(bot, monkeypatch, official_aliases):
-    client, api = bot
-    url = "https://example.com/contest"
-    extracted = {
-        "name": "完整校赛", "edition": "2026", "reg_start": "2026-11-01 08:00",
-        "reg_deadline": "2026-11-10 23:59", "contest_time": "2026-11-20 09:00",
-        "tracks": "团队赛", "raw_note": "规则原文", "device_req": "自带电脑",
-        "summary": "官方摘要", "official_site": "https://invented.example.com/wrong",
-    }
-    if official_aliases:
-        for old, canonical in (("reg_start", "official_reg_start"),
-                               ("reg_deadline", "official_reg_deadline"),
-                               ("contest_time", "official_time"), ("raw_note", "official_rules")):
-            extracted[canonical] = extracted.pop(old)
-    monkeypatch.setattr(main, "fetch_text", AsyncMock(return_value="官网正文"))
-    monkeypatch.setattr(llm, "_chat_once", AsyncMock(return_value=json.dumps(extracted, ensure_ascii=False)))
-    await client.on_group_at_message_create(_message(api, f"发布 {url}", member="teacher", msg_id="first"))
-    record = database.list_competitions(status="confirmed")[0]
-    expected = {
-        "edition": "2026", "official_reg_start": "2026-11-01 08:00", "tracks": "团队赛",
-        "official_rules": "规则原文", "device_req": "自带电脑", "summary": "官方摘要",
-        "official_site": url,
-    }
-    for field, value in expected.items():
-        assert record[field] == value
-    first_calls = list(_active_calls(api))
-    assert [call["group_openid"] for call in first_calls] == ["g1", "g2", "g3"]
-    assert all("2026-11-10 23:59" in call["content"] and "2026-11-20 09:00" in call["content"]
-               for call in first_calls)
-
-    await client.on_group_at_message_create(_message(api, f"发布 {url}", member="teacher", msg_id="second"))
-    assert database.list_competitions(status="confirmed") == [record]
-    assert len(database.list_sources(record["id"])) == 1
-    assert len(database.list_competition_versions(record["id"])) == 1
-    assert _active_calls(api) == first_calls
-    second_replies = [call for call in _reply_calls(api) if call["msg_id"] == "second"]
-    assert len(second_replies) == 1
-    assert "已存档" in second_replies[0]["content"]
-    assert second_replies[0]["msg_seq"] == 1
 
 
 def _use_fixed_general_reminders(monkeypatch):

@@ -7,8 +7,8 @@
   只有「实质变化」才调用一次模型提取。
 - 提取严格 schema 校验失败不写库（复用 llm.validate_contest_info），
   只记录来源状态为 error，不生成/更新任何记录。
-- 免审发布：首次抓取新建比赛直接 confirmed（不生成审核草稿）；
-  已确认比赛出现实质变化时正式内容不被覆盖，新内容存待审
+- 仅扫描有效关联且未停用的来源；已确认比赛出现实质变化时
+  正式内容不被覆盖，新内容存待审
   （competition_pending_updates），供超管 /修正 决策。
 - v2 默认不通知全员：自动抓取生成的记录只返回结果，不向任何群自动发送；
   超管确认后才通知全员或 /修正 调整/删除。
@@ -17,20 +17,24 @@
 
 import hashlib
 import logging
+from collections.abc import Mapping
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import database as db
 import fetcher
 import llm
-from config import AUTO_FETCH_ENABLED, FETCH_MIN_INTERVAL_MINUTES, TZ_NAME
 from contest_fields import map_competition_info
+from config import AUTO_FETCH_ENABLED, FETCH_MIN_INTERVAL_MINUTES, TZ_NAME
 
 logger = logging.getLogger(__name__)
 
 TZ = ZoneInfo(TZ_NAME)
 
 _TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M")
+_SOURCE_STATE_FIELDS = (
+    "etag", "last_modified", "body_hash", "last_fetched_at", "last_status", "last_error",
+)
 
 
 def _parse_db_time(text: str) -> datetime | None:
@@ -76,6 +80,149 @@ def _map_competition_info(info: dict) -> dict:
     return map_competition_info(info)
 
 
+def _source_is_active(source: dict) -> bool:
+    return source.get("active", 1) != 0 and source.get("last_status") != "disabled"
+
+
+def _source_still_active(source: dict) -> bool:
+    """等待后核对关联及抓取快照，旧任务不能覆盖后来成功的基线。"""
+    comp = db.get_competition(source["competition_id"])
+    if comp is None or comp.get("status") not in ("draft", "confirmed"):
+        return False
+    if hasattr(db, "source_snapshot_matches"):
+        return db.source_snapshot_matches(source)
+    return any(
+        current["id"] == source["id"] and current["url"] == source["url"]
+        and _source_is_active(current)
+        and all(current.get(field) == source.get(field) for field in _SOURCE_STATE_FIELDS)
+        for current in db.list_sources(source["competition_id"])
+    )
+
+
+def _update_source_state(source: dict, **state) -> bool:
+    """来源同步接口可用时用条件写入；旧数据库只支持同步快照复查。"""
+    if hasattr(db, "source_snapshot_matches"):
+        return db.update_source_fetch(source["id"], expected_source=source, **state)
+    if not _source_still_active(source):
+        return False
+    db.update_source_fetch(source["id"], **state)
+    return True
+
+
+def _source_superseded(source: dict) -> dict:
+    return {"kind": "skip", "source_id": source["id"], "reason": "来源已停用、关联或抓取基线已更新"}
+
+
+def _source_error(source: dict, name: str, now: datetime, error: Exception) -> dict:
+    err = str(error) or type(error).__name__
+    try:
+        updated = _update_source_state(
+            source, etag=source.get("etag") or "",
+            last_modified=source.get("last_modified") or "",
+            body_hash=source.get("body_hash") or "",
+            last_fetched_at=now.strftime("%Y-%m-%d %H:%M:%S"),
+            last_status="error", last_error=err[:500],
+        )
+        if not updated:
+            logger.info("忽略过期来源任务的失败: %s（%s）", source["id"], err)
+            return _source_superseded(source)
+    except Exception as status_error:
+        logger.warning("来源错误状态写入失败: %s（%s）", source["id"], status_error)
+    logger.warning("来源处理失败: %s（%s）", source["url"], err)
+    return {
+        "kind": "error", "source_id": source["id"], "name": name,
+        "error": err, "notify_groups": [],
+    }
+
+
+async def _process_source(source: dict, comp: dict | None, now: datetime, fetch, extract) -> dict:
+    """处理一条来源；异常由扫描层统一隔离并保留成功基线。"""
+    sid, cid = source["id"], source["competition_id"]
+    if comp is None or comp.get("status") not in ("draft", "confirmed"):
+        return {"kind": "skip", "source_id": sid, "reason": "来源关联比赛无效"}
+    name = comp["name"]
+    if is_within_min_interval(source, now):
+        return {"kind": "skip", "source_id": sid, "reason": "最小抓取间隔未到"}
+
+    text, headers = await fetch(source["url"])
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("抓取正文必须是非空字符串")
+    if not isinstance(headers, Mapping):
+        raise ValueError("抓取响应头必须是对象")
+    validators = []
+    for field in ("etag", "last-modified"):
+        value = headers.get(field)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"响应头 {field} 必须是字符串")
+        validators.append((value or "").strip()[:500])
+    etag, last_modified = validators
+    if not _source_still_active(source):
+        return _source_superseded(source)
+    if not detect_change(source, text, etag, last_modified):
+        updated = _update_source_state(
+            source, etag=etag, last_modified=last_modified,
+            body_hash=source.get("body_hash") or "",
+            last_fetched_at=now.strftime("%Y-%m-%d %H:%M:%S"),
+            last_status="nochange", last_error="",
+        )
+        if not updated:
+            return _source_superseded(source)
+        return {"kind": "nochange", "source_id": sid, "competition_id": cid, "name": name}
+
+    info, err = await extract(text)
+    if err or info is None:
+        raise ValueError(str(err) if err else "提取校验失败")
+    info, err = llm.validate_contest_info(info)
+    if err:
+        raise ValueError(err)
+    comp_info = _map_competition_info(info)
+    # 来源地址取自登记的抓取任务，模型链接不作为写库依据。
+    comp_info["official_site"] = source["url"]
+    existing = db.get_competition(cid)
+    if existing is None or existing.get("status") not in ("draft", "confirmed"):
+        return {"kind": "skip", "source_id": sid, "reason": "来源关联比赛无效"}
+    if not _source_still_active(source):
+        return _source_superseded(source)
+    new_source_state = {
+        "etag": etag, "last_modified": last_modified, "body_hash": _body_hash(text),
+        "last_fetched_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if hasattr(db, "store_crawled_competition"):
+        # 同事务核对快照并保存内容/基线，覆盖最终复查到写入的并发窗口。
+        stored = db.store_crawled_competition(source, comp_info, new_source_state)
+        if stored is None:
+            return _source_superseded(source)
+        action = stored["action"]
+        if action == "pending":
+            update_id = stored["update_id"]
+    elif existing["status"] == "confirmed":
+        update_id = db.add_pending_update(
+            cid, comp_info, source_id=sid,
+            change_note="公共来源实质变化（免审版不自动替换），待超管确认",
+            created_by="crawler:auto",
+        )
+        action = "pending"
+    else:
+        if not db.update_competition(cid, comp_info, operator="crawler:auto",
+                                     note="公共来源实质变化，更新草稿"):
+            raise ValueError("来源关联比赛更新失败")
+        action = "updated"
+    if not hasattr(db, "store_crawled_competition"):
+        if not _update_source_state(
+            source, **new_source_state,
+            last_status="pending" if action == "pending" else "draft", last_error="",
+        ):
+            return _source_superseded(source)
+    item = {
+        "kind": "pending_auto" if action == "pending" else "updated_auto",
+        "source_id": sid, "competition_id": cid, "name": comp_info["name"],
+        "action": action, "notify_groups": [], "notified": False,
+    }
+    if action == "pending":
+        item["update_id"] = update_id
+    return item
+
+
 async def run_fetch(now: datetime | None = None,
                     fetch=None,
                     extract=None,
@@ -93,8 +240,6 @@ async def run_fetch(now: datetime | None = None,
         - {kind: "disabled"}                          AUTO_FETCH_ENABLED=False 整体跳过
         - {kind: "skip", source_id, reason}            未到抓取间隔/无来源
         - {kind: "nochange", source_id, competition_id, name}   无实质变化
-        - {kind: "auto_created", source_id, competition_id, name,
-           action: "created"}    首次抓取免审确认（不通知）
         - {kind: "pending_auto", source_id, competition_id, name,
            action: "pending", update_id}   已确认比赛变化存待审（不通知）
         - {kind: "updated_auto", source_id, competition_id, name,
@@ -111,125 +256,18 @@ async def run_fetch(now: datetime | None = None,
         return results
 
     for source in db.list_sources():
-        comp = db.get_competition(source["competition_id"])
-        name = comp["name"] if comp else f"比赛#{source['competition_id']}"
-        if is_within_min_interval(source, now):
-            results.append({"kind": "skip", "source_id": source["id"], "reason": "最小抓取间隔未到"})
-            continue
+        name = f"比赛#{source['competition_id']}"
         try:
-            text, headers = await fetch(source["url"])
-        except Exception as e:
-            err = str(e) or type(e).__name__
-            db.update_source_fetch(
-                source["id"], etag="", last_modified="", body_hash="",
-                last_fetched_at=now.strftime("%Y-%m-%d %H:%M:%S"),
-                last_status="error", last_error=err[:500],
-            )
-            notify = []
-            logger.warning("来源抓取失败: %s（%s）", source["url"], err)
-            results.append({
-                "kind": "error", "source_id": source["id"], "name": name,
-                "error": err, "notify_groups": notify,
-            })
-            continue
-
-        etag = (headers.get("etag") or "").strip()[:500]
-        last_modified = (headers.get("last-modified") or "").strip()[:500]
-        if not detect_change(source, text, etag, last_modified):
-            db.update_source_fetch(
-                source["id"], etag=etag, last_modified=last_modified,
-                body_hash=source.get("body_hash", ""),
-                last_fetched_at=now.strftime("%Y-%m-%d %H:%M:%S"),
-                last_status="nochange", last_error="",
-            )
-            results.append({
-                "kind": "nochange", "source_id": source["id"],
-                "competition_id": source["competition_id"], "name": name,
-            })
-            continue
-
-        # 实质变化：调一次模型生成提取结果；校验失败不写库
-        info, err = await extract(text)
-        if err or info is None:
-            db.update_source_fetch(
-                source["id"], etag=etag, last_modified=last_modified,
-                body_hash=source.get("body_hash", ""),
-                last_fetched_at=now.strftime("%Y-%m-%d %H:%M:%S"),
-                last_status="error", last_error=(err or "提取校验失败")[:500],
-            )
-            notify = []
-            results.append({
-                "kind": "error", "source_id": source["id"], "name": name,
-                "error": err or "提取校验失败", "notify_groups": notify,
-            })
-            continue
-
-        try:
-            comp_info = _map_competition_info(info)
-            # 来源地址取自已登记的抓取任务，模型可能漏提或生成错误链接。
-            comp_info["official_site"] = source["url"]
-            existing = db.get_competition(source["competition_id"])
-            if existing is None:
-                # v2 免审发布：首次抓取直接确认（不再生成审核草稿）
-                cid = db.create_competition(comp_info, status="confirmed",
-                                            operator="crawler:auto")
-                action = "created"
-            elif existing["status"] == "confirmed":
-                # 已确认比赛出现实质变化：正式内容不被覆盖，
-                # 新内容存待审，供超管 /修正 决策；默认不通知全员。
-                update_id = db.add_pending_update(
-                    source["competition_id"], comp_info,
-                    source_id=source["id"],
-                    change_note="公共来源实质变化（免审版不自动替换），待超管确认",
-                    created_by="crawler:auto",
-                )
-                cid = source["competition_id"]
-                action = "pending"
-            else:
-                # 兼容旧草稿状态：直接更新（历史遗留数据）
-                db.update_competition(source["competition_id"], comp_info,
-                                      operator="crawler:auto",
-                                      note="公共来源实质变化，更新草稿")
-                cid = source["competition_id"]
-                action = "updated"
-        except ValueError as e:
-            # 提取结果未通过严格 schema 校验（或映射后字段非法）：不写库
-            db.update_source_fetch(
-                source["id"], etag=etag, last_modified=last_modified,
-                body_hash=source.get("body_hash", ""),
-                last_fetched_at=now.strftime("%Y-%m-%d %H:%M:%S"),
-                last_status="error", last_error=(str(e)[:500] or "schema 校验失败"),
-            )
-            notify = []
-            results.append({
-                "kind": "error", "source_id": source["id"], "name": name,
-                "error": str(e) or "schema 校验失败", "notify_groups": notify,
-            })
-            continue
-
-        db.update_source_fetch(
-            source["id"], etag=etag, last_modified=last_modified,
-            body_hash=_body_hash(text),
-            last_fetched_at=now.strftime("%Y-%m-%d %H:%M:%S"),
-            last_status="confirmed" if action == "created" else (
-                "pending" if action == "pending" else "draft"),
-            last_error="",
-        )
-        # v2 不自动通知全员：仅返回结果，由超管确认后统一通知/修正
-        item = {
-            "kind": {
-                "created": "auto_created",
-                "pending": "pending_auto",
-                "updated": "updated_auto",
-            }[action],
-            "source_id": source["id"],
-            "competition_id": cid, "name": comp_info["name"] or name,
-            "action": action, "notify_groups": [],
-            "notified": False,
-        }
-        if action == "pending":
-            item["update_id"] = update_id
-        results.append(item)
+            if not _source_is_active(source):
+                results.append({"kind": "skip", "source_id": source["id"], "reason": "来源已停用"})
+                continue
+            comp = db.get_competition(source["competition_id"])
+            if comp is not None:
+                name = comp.get("name") or name
+            results.append(await _process_source(source, comp, now, fetch, extract))
+        except Exception as error:
+            # 包含抓取、提取、校验、比赛写入和状态写入；只失败当前来源。
+            results.append(_source_error(source, name, now, error))
     return results
 
 

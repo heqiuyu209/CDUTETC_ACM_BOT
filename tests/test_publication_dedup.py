@@ -1,16 +1,23 @@
 """真实 SQLite 发布幂等回归；模型、网络和 QQ SDK 均不联网。"""
 
 import hashlib
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 import crawler
+import config
 import database
+import llm
+import main
 from contest_fields import map_competition_info
 from llm import validate_contest_info
+from onebot_client import OneBotMessage
 
 
 URL = "https://contest.example.com/announcement?track=acm"
@@ -286,3 +293,52 @@ def test_mapper_requires_name_for_each_complete_extraction(info):
 def test_optional_field_types_are_validated_before_storage(field):
     cleaned, error = validate_contest_info({"name": "校赛", field: 123})
     assert cleaned is None and error
+
+
+@pytest.mark.parametrize("official_aliases", [False, True])
+async def test_onebot_publish_twice_preserves_fields_without_second_notification(db_file, monkeypatch, official_aliases):
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2", "g3"})
+    monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
+    monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
+    onebot = SimpleNamespace(send_group_msg=AsyncMock(return_value=True))
+    bot = main.ACMBot(onebot)
+    extracted = {
+        "name": "完整校赛", "edition": "2026", "reg_start": "2026-11-01 08:00",
+        "reg_deadline": "2026-11-10 23:59", "contest_time": "2026-11-20 09:00",
+        "tracks": "团队赛", "raw_note": "规则原文", "device_req": "自带电脑",
+        "summary": "官方摘要", "official_site": "https://invented.example.com/wrong",
+    }
+    if official_aliases:
+        for legacy, official in (("reg_start", "official_reg_start"),
+                                 ("reg_deadline", "official_reg_deadline"),
+                                 ("contest_time", "official_time"), ("raw_note", "official_rules")):
+            extracted[official] = extracted.pop(legacy)
+    monkeypatch.setattr(main, "fetch_text", AsyncMock(return_value=PAGE))
+    monkeypatch.setattr(llm, "_chat_once", AsyncMock(return_value=json.dumps(extracted, ensure_ascii=False)))
+
+    def message(mid):
+        return OneBotMessage({"post_type": "message", "message_type": "group", "group_id": "g1",
+                              "user_id": "teacher", "message_id": mid, "raw_message": f"发布 {URL}"})
+
+    await bot.on_group_at_message_create(message("first"))
+    record = database.list_competitions(status="confirmed")[0]
+    expected = {
+        "edition": "2026", "official_reg_start": "2026-11-01 08:00",
+        "official_reg_deadline": "2026-11-10 23:59", "official_time": "2026-11-20 09:00",
+        "tracks": "团队赛", "official_rules": "规则原文", "device_req": "自带电脑",
+        "summary": "官方摘要", "official_site": URL,
+    }
+    for field, value in expected.items():
+        assert record[field] == value
+    first_calls = list(onebot.send_group_msg.await_args_list)
+    notices = [call.args for call in first_calls if "【新比赛发布】" in call.args[1]]
+    assert [group for group, content in notices] == ["g1", "g2", "g3"]
+    assert all(expected["official_reg_deadline"] in content and expected["official_time"] in content
+               for group, content in notices)
+    assert "已记录" in first_calls[0].args[1] and "群通知" in first_calls[-1].args[1]
+
+    await bot.on_group_at_message_create(message("second"))
+    assert database.list_competitions(status="confirmed") == [record]
+    assert counts(db_file[0]) == (1, 1, 1, 1)
+    added = onebot.send_group_msg.await_args_list[len(first_calls):]
+    assert len(added) == 1 and added[0].args[0] == "g1" and "已存档" in added[0].args[1]
