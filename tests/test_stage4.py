@@ -84,32 +84,18 @@ def test_is_within_min_interval(db):
 # ---------- 抓取调度与变化检测（集成，注入 mock 回调） ----------
 
 
-def test_run_fetch_first_auto_publish(db, monkeypatch):
-    """v2 免审发布：来源对应比赛记录缺失时，首次抓取直接创建 confirmed 比赛，不通知任何群。"""
+def test_run_fetch_missing_competition_is_skipped(db, monkeypatch):
+    """关联比赛缺失的来源跳过，不创建无法正确关联的新比赛。"""
     cid, sid = _new_competition_source(db)
-    # 模拟来源关联的比赛记录缺失（自动抓取首次建库场景）：
-    # 只让 crawler 内部第一次查询返回 None，后续查询仍走真实实现
-    real_get = database.get_competition
-    state = {"n": 0}
-
-    def fake_get(_cid):
-        # run_fetch 内部会先取 comp（取名字）再取 existing，两处都要模拟缺失
-        state["n"] += 1
-        return None if state["n"] <= 2 else real_get(_cid)
-
-    monkeypatch.setattr(database, "get_competition", fake_get)
+    monkeypatch.setattr(database, "get_competition", lambda _cid: None)
     results = asyncio.run(crawler.run_fetch(
         now=_now(), fetch=_fetch_text, extract=_extract_ok))
     assert len(results) == 1
     r = results[0]
-    assert r["kind"] == "auto_created" and r["action"] == "created"
-    assert r["notify_groups"] == []
-    comp = database.get_competition(r["competition_id"])
-    assert comp["status"] == "confirmed"  # 免审：直接确认发布
-    assert comp["official_reg_deadline"] == "2026-11-10 23:59"  # 提取结果写库
-    # 新比赛无来源；原来源的状态被标记为 confirmed（免审发布成功）
+    assert r["kind"] == "skip" and r["source_id"] == sid
+    assert len(database.list_competitions()) == 1
     source = database.list_sources(cid)[0]
-    assert source["last_status"] == "confirmed" and source["body_hash"]
+    assert not source["last_status"] and not source["body_hash"]
 
 
 def test_run_fetch_updates_existing_draft(db):
@@ -235,7 +221,7 @@ def test_run_fetch_confirmed_changes_go_to_pending_review(db):
     assert database.get_pending_update(cid) is None
 
 
-def test_run_fetch_auto_created_no_group_notification(db, monkeypatch):
+def test_run_fetch_orphan_source_has_no_group_notification(db, monkeypatch):
     cid, sid = _new_competition_source(db)
     monkeypatch.setattr(database, "get_competition", lambda _cid: None)
     sent = []
@@ -246,8 +232,8 @@ def test_run_fetch_auto_created_no_group_notification(db, monkeypatch):
 
     results = asyncio.run(crawler.run_fetch(now=_now(), fetch=_fetch_text,
                                             extract=_extract_ok, send_group=send))
-    assert results[0]["kind"] == "auto_created"
-    assert len(sent) == 0  # v2：自动发布不通知任何群，由超管 /修正 后统一通知
+    assert results[0]["kind"] == "skip"
+    assert len(sent) == 0
 
 
 def test_run_fetch_second_round_all_skip_within_interval(db):
