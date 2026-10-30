@@ -97,6 +97,7 @@ python scripts/export_collection.py --group-id '群openid' --collection-id 1 --o
 | `ACM_FETCH_MIN_INTERVAL_MINUTES` | 否 | `60` | 公共来源最小抓取间隔（分钟），低频抓取控制 |
 | `ACM_LLM_MAX_INPUT_CHARS` | 否 | `6000` | 单次模型请求输入上限 |
 | `ACM_LLM_MAX_OUTPUT_TOKENS` | 否 | `2000` | 单次模型请求输出上限 |
+| `ACM_LLM_MAX_RESPONSE_BYTES` | 否 | `262144` | 实际模型响应及 gzip 解压后字节上限，超限中止读取 |
 | `ACM_LLM_CONCURRENCY` | 否 | `2` | 模型并发请求上限 |
 | `ACM_REMIND_CHECK_INTERVAL_MINUTES` | 否 | `30` | 提醒检查周期（分钟） |
 | `ACM_REMIND_BEFORE_HOURS` | 否 | `24` | 提前多少小时提醒 |
