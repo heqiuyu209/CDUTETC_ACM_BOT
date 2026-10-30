@@ -2,7 +2,6 @@
 
 import json
 import sqlite3
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -11,6 +10,7 @@ import config
 import database
 import llm
 import main
+from onebot_client import OneBotMessage
 
 
 @pytest.fixture
@@ -23,26 +23,26 @@ def memory_db(monkeypatch):
 
 
 @pytest.fixture
-def bot(memory_db, monkeypatch):
+def bot(memory_db, monkeypatch, onebot_client):
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
-    client = main.ACMBot()
+    monkeypatch.setattr(config, "BOT_QQ", "")
+    client = main.ACMBot(onebot_client)
     replies = []
 
     async def reply(message, content):
-        replies.append((message.group_openid, content))
+        replies.append((message.group_id, content))
 
     monkeypatch.setattr(client, "_safe_reply", reply)
-    monkeypatch.setattr(client, "_send_group_log_only", AsyncMock(return_value=False))
+    monkeypatch.setattr(client, "_send_group", AsyncMock(return_value=False))
     return client, replies
 
 
 def _message(content, group_id="g1", member_id="student"):
-    return SimpleNamespace(
-        content=content,
-        group_openid=group_id,
-        author=SimpleNamespace(member_openid=member_id),
-    )
+    return OneBotMessage({"post_type": "message", "message_type": "group",
+                         "raw_message": f"[CQ:at,qq=30001] {content}",
+                         "group_id": group_id, "user_id": member_id,
+                         "message_id": 12345, "self_id": 30001})
 
 
 def _public(name="正式校赛", **overrides):
