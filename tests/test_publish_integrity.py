@@ -1,11 +1,11 @@
-"""真实 SDK 入口的发布边界与持久化回归。"""
+"""OneBot 事件入口的发布边界与持久化回归。"""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 import sqlite3
 
 import pytest
-from botpy.message import GroupMessage
+from onebot_client import OneBotMessage
 
 import commands
 import config
@@ -31,12 +31,10 @@ async def test_question_does_not_publish_or_fetch(monkeypatch, text):
     monkeypatch.setattr(main, "fetch_text", fetch)
     monkeypatch.setattr(main, "extract_contest", extract)
     monkeypatch.setattr(commands, "handle_non_command_message", AsyncMock(return_value=[]))
-    client = main.ACMBot()
-    api = SimpleNamespace(post_group_message=AsyncMock(return_value={"id": "reply"}))
-    client.api = api
-    message = GroupMessage(api=api, event_id="event", data={
-        "id": "incoming", "content": text, "group_openid": "g1",
-        "author": {"member_openid": "teacher"},
+    client = main.ACMBot(SimpleNamespace(send_group_msg=AsyncMock(return_value=True)))
+    message = OneBotMessage({
+        "message_id": 1, "raw_message": text, "group_id": "g1",
+        "message_type": "group", "user_id": "teacher",
     })
     try:
         await client.on_group_at_message_create(message)
@@ -60,7 +58,7 @@ def test_custom_command_requires_its_own_boundary():
 
 
 @pytest.mark.parametrize("separator", ["", " ", "\n", "\u3000"])
-async def test_sdk_explicit_url_publication_keeps_documented_syntax(monkeypatch, separator):
+async def test_onebot_explicit_url_publication_keeps_documented_syntax(monkeypatch, separator):
     conn = sqlite3.connect(":memory:")
     monkeypatch.setattr(db, "_connect", lambda: conn)
     db.init_db()
@@ -72,12 +70,10 @@ async def test_sdk_explicit_url_publication_keeps_documented_syntax(monkeypatch,
     extract = AsyncMock(return_value=({"name": "校赛"}, None))
     monkeypatch.setattr(main, "fetch_text", fetch)
     monkeypatch.setattr(main, "extract_contest", extract)
-    client = main.ACMBot()
-    api = SimpleNamespace(post_group_message=AsyncMock(return_value={"id": "reply"}))
-    client.api = api
-    message = GroupMessage(api=api, event_id="event", data={
-        "id": "incoming", "content": f"发布{separator}https://contest.example.com", "group_openid": "g1",
-        "author": {"member_openid": "teacher"},
+    client = main.ACMBot(SimpleNamespace(send_group_msg=AsyncMock(return_value=True)))
+    message = OneBotMessage({
+        "message_id": 1, "raw_message": f"发布{separator}https://contest.example.com", "group_id": "g1",
+        "message_type": "group", "user_id": "teacher",
     })
     try:
         await client.on_group_at_message_create(message)
