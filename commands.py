@@ -22,7 +22,7 @@ import config
 import crawler
 import database as db
 import llm
-from fetcher import FetchError, fetch_text
+from fetcher import fetch_text
 from utils import is_super_admin, is_teacher, parse_command
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -33,6 +33,9 @@ HELP_TEXT = """【CDUTETC ACM 事务助手 · 命令帮助】
 /修正 <比赛id> <字段=值 ...>  修正已发布比赛字段（超管）
   例：/修正 1 time=2026-12-01 19:00 name="ICPC 2026 区域赛"
 /修正 <比赛id> 重新提取 <链接>  重新提取官网信息（超管）
+/待审列表                查看后台来源更新的编号与改动字段（超管）
+/待审批准 <更新id>       合并来源更新的有效字段（超管）
+/待审拒绝 <更新id> [原因]  保留正式资料并拒绝来源更新（超管）
 --- 学校安排 ---
 /校安排                  查看学校统一安排（仅共享部分）
 --- 课程与训练 ---
@@ -186,26 +189,37 @@ async def cmd_amend(group_id: str, sender: str, args: str) -> list[dict]:
 
 
 async def _amend_refetch(group_id: str, cid: int, comp: dict, rest: str) -> list[dict]:
-    """/修正 <id> 重新提取 <链接>：抓官网 → 模型提取 → 严格校验 → 覆盖官方字段。"""
+    """重新提取有效字段，并将真实抓取地址及正文基线与比赛同事务保存。"""
     url = rest[len("重新提取"):].strip()
     if not url:
         return [{"group_id": group_id, "text": "用法：/修正 <比赛id> 重新提取 <链接>"}]
     try:
         page = await fetch_text(url)
-    except FetchError as e:
+    except Exception as e:
         return [{"group_id": group_id, "text": f"链接抓取失败：{e}"}]
-    info, err = await llm.extract_contest(f"链接正文：{page}\n超管修正补充：{rest}")
+    if not isinstance(page, str) or not page.strip():
+        return [{"group_id": group_id, "text": "链接正文为空，未修正"}]
+    try:
+        info, err = await llm.extract_contest(f"链接正文：{page}\n超管修正补充：{rest}")
+    except Exception:
+        return [{"group_id": group_id, "text": "信息提取失败，未修正"}]
     if err is not None or not info:
         return [{"group_id": group_id, "text": f"信息提取失败：{err or '未知原因'}"}]
+    validated, err = llm.validate_contest_info(info)
+    if err:
+        return [{"group_id": group_id, "text": f"信息提取失败：{err}"}]
+    info = {**info, **validated}
+    aliases = {"reg_deadline": "official_reg_deadline", "contest_time": "official_time", "raw_note": "official_rules"}
+    aliases.update({field: field for field in _AMEND_FIELD_MAP.values()})
     fields = {
-        "name": info.get("name", ""),
-        "official_reg_deadline": info.get("reg_deadline", ""),
-        "official_time": info.get("contest_time", ""),
-        "official_rules": info.get("raw_note", ""),
-        "official_site": info.get("source_link", "") or url,
+        target: info[key] for key, target in aliases.items() if key in info
+        and info[key] is not None and not (isinstance(info[key], str) and not info[key].strip())
     }
+    fields["official_site"] = url
     try:
-        ok = db.amend_competition(cid, fields, operator="super_admin", note=f"重新提取：{url}")
+        ok = db.amend_competition(
+            cid, fields, operator="super_admin", note=f"重新提取：{url}", source_text=page,
+        )
     except ValueError as e:
         return [{"group_id": group_id, "text": f"修正失败：{e}"}]
     if not ok:
@@ -213,6 +227,52 @@ async def _amend_refetch(group_id: str, cid: int, comp: dict, rest: str) -> list
     msgs = [{"group_id": group_id, "text": f"已重新提取并修正「{fields['name']}」（#{cid}），修正版本已生成"}]
     msgs += _broadcast_to_groups(fields["name"], cid, f"比赛「{fields['name']}」（#{cid}）官网信息已由超管更新，请以最新信息为准", exclude=group_id)
     return msgs
+
+
+def cmd_pending_list(group_id: str, sender: str, args: str) -> list[dict]:
+    """只在发起群展示公共比赛及字段名，不发送提取原文、操作者或个人数据。"""
+    if not is_super_admin(sender):
+        return [{"group_id": group_id, "text": "仅超管可查看来源待审更新"}]
+    updates = db.list_pending_updates()
+    if not updates:
+        return [{"group_id": group_id, "text": "当前没有来源待审更新"}]
+    lines = [f"来源待审更新：共 {len(updates)} 条（最多显示 20 条；编号用于 /待审批准 或 /待审拒绝）"]
+    for update in updates[:20]:
+        fields = update["fields"]
+        keys = [field for field in _AMEND_FIELD_MAP.values() if isinstance(fields, dict) and field in fields]
+        names = "、".join(dict.fromkeys(keys)) or "无有效字段（可拒绝）"
+        lines.append(f"更新 #{update['id']}｜比赛 #{update['competition_id']} {update['name']}｜字段：{names}")
+    return [{"group_id": group_id, "text": "\n".join(lines)}]
+
+
+def cmd_pending_apply(group_id: str, sender: str, args: str) -> list[dict]:
+    """超管批准部分更新；仅向发起群确认，不广播字段值。"""
+    if not is_super_admin(sender):
+        return [{"group_id": group_id, "text": "仅超管可批准来源待审更新"}]
+    try:
+        update_id = int(args.strip())
+    except ValueError:
+        return [{"group_id": group_id, "text": "用法：/待审批准 <更新id>（来自 /待审列表）"}]
+    try:
+        ok = db.apply_pending_update(update_id, operator=sender)
+    except ValueError:
+        return [{"group_id": group_id, "text": "待审更新无效或来源已停用，未修改正式资料；可用 /待审拒绝 处理"}]
+    text = f"待审更新 #{update_id} 已批准，公共比赛资料已更新" if ok else "待审更新不存在，或比赛不是正式记录"
+    return [{"group_id": group_id, "text": text}]
+
+
+def cmd_pending_reject(group_id: str, sender: str, args: str) -> list[dict]:
+    """超管拒绝来源更新；原因保存在本机审计，不作为群通知发送。"""
+    if not is_super_admin(sender):
+        return [{"group_id": group_id, "text": "仅超管可拒绝来源待审更新"}]
+    parts = args.strip().split(None, 1)
+    try:
+        update_id = int(parts[0])
+    except (ValueError, IndexError):
+        return [{"group_id": group_id, "text": "用法：/待审拒绝 <更新id> [原因]（来自 /待审列表）"}]
+    ok = db.reject_pending_update(update_id, operator=sender, note=parts[1] if len(parts) > 1 else "")
+    text = f"待审更新 #{update_id} 已拒绝，正式资料保持原样" if ok else "待审更新不存在"
+    return [{"group_id": group_id, "text": text}]
 
 
 # ---------------------------------------------------------------------
@@ -536,6 +596,9 @@ async def handle_command(text: str, group_id: str, sender: str) -> list[dict] | 
         return [{"group_id": group_id, "text": HELP_TEXT}]
     handlers = {
         "修正": cmd_amend,
+        "待审列表": cmd_pending_list,
+        "待审批准": cmd_pending_apply,
+        "待审拒绝": cmd_pending_reject,
         "征集": cmd_collection_create,
         "报名": cmd_collection_register,
         "征集汇总": cmd_collection_summary,

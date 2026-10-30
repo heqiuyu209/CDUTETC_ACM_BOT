@@ -26,6 +26,7 @@ import sqlite3
 import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import urlsplit
 
 from config import DB_PATH
 
@@ -100,6 +101,8 @@ CREATE TABLE IF NOT EXISTS competition_sources (
     last_fetched_at TEXT NOT NULL DEFAULT '',
     last_status     TEXT NOT NULL DEFAULT '',
     last_error      TEXT NOT NULL DEFAULT '',
+    active          INTEGER NOT NULL DEFAULT 1,
+    revision        INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT NOT NULL DEFAULT '',
     UNIQUE (competition_id, url)
 )
@@ -343,6 +346,27 @@ def _migrate_v1(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE contests ADD COLUMN group_id TEXT NOT NULL DEFAULT ''")
 
 
+def _migrate_source_activity(conn: sqlite3.Connection) -> None:
+    """旧库保留来源历史，并使此前修正过的官网成为有效监控地址。"""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(competition_sources)")}
+    if "active" in cols and "revision" in cols:
+        return
+    conn.execute("SAVEPOINT source_activity_migration")
+    try:
+        if "revision" not in cols:
+            conn.execute("ALTER TABLE competition_sources ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
+        if "active" not in cols:
+            conn.execute("ALTER TABLE competition_sources ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+            for cid, url in conn.execute("SELECT id, official_site FROM competitions WHERE official_site != ''").fetchall():
+                if url.strip():
+                    _sync_competition_source_on(conn, cid, url.strip())
+    except Exception:
+        conn.execute("ROLLBACK TO source_activity_migration")
+        conn.execute("RELEASE source_activity_migration")
+        raise
+    conn.execute("RELEASE source_activity_migration")
+
+
 def init_db() -> None:
     """初始化数据库：建表 + 旧库迁移 + 索引。程序启动时调用一次。"""
     with _connect() as conn:
@@ -352,6 +376,7 @@ def init_db() -> None:
         _migrate_reminder_deliveries(conn)
         for ddl in _INDEX_DDL:
             conn.execute(ddl)
+        _migrate_source_activity(conn)
 
 
 # =====================================================================
@@ -519,6 +544,31 @@ def _clean_competition_info(info: dict) -> dict:
         cleaned[field] = _as_str(info.get(field) or "")
     for field in ("official_reg_start", "official_reg_deadline", "official_time"):
         cleaned[field] = _clean_time(info.get(field))
+    return cleaned
+
+
+def _clean_competition_patch(info: dict, *, ignore_empty: bool = False) -> dict:
+    """部分更新只清洗传入字段；自动提取的空值不表示删除。"""
+    if not isinstance(info, dict):
+        raise ValueError("比赛更新内容必须是字典")
+    cleaned = {}
+    for field, value in info.items():
+        if field not in _COMPETITION_FIELDS:
+            raise ValueError(f"不支持的字段：{field}")
+        if ignore_empty and (value is None or isinstance(value, str) and not value.strip()):
+            continue
+        if field == "name":
+            cleaned[field] = _as_str(value)
+            if not cleaned[field]:
+                raise ValueError("比赛名称不能为空")
+        elif field in ("official_reg_start", "official_reg_deadline", "official_time"):
+            cleaned[field] = _clean_time(value)
+        else:
+            cleaned[field] = _as_str(value if value is not None else "")
+        if field == "official_site" and cleaned[field]:
+            parsed = urlsplit(cleaned[field])
+            if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username is not None or parsed.password is not None:
+                raise ValueError("官网必须是无账号密码的 HTTP/HTTPS 链接")
     return cleaned
 
 
@@ -740,7 +790,7 @@ def list_competition_versions(cid: int) -> list[dict]:
 
 _SOURCE_COLS = (
     "id, competition_id, url, etag, last_modified, body_hash,"
-    " last_fetched_at, last_status, last_error, created_at"
+    " last_fetched_at, last_status, last_error, created_at, active, revision"
 )
 
 
@@ -748,7 +798,8 @@ def _row_to_source(r: sqlite3.Row) -> dict:
     return {
         "id": r[0], "competition_id": r[1], "url": r[2], "etag": r[3],
         "last_modified": r[4], "body_hash": r[5], "last_fetched_at": r[6],
-        "last_status": r[7], "last_error": r[8], "created_at": r[9],
+        "last_status": r[7], "last_error": r[8], "created_at": r[9], "active": bool(r[10]),
+        "revision": r[11],
     }
 
 
@@ -778,45 +829,98 @@ def add_competition_source(cid: int, url: str,
         return row[0]
 
 
+_SOURCE_SNAPSHOT_FIELDS = (
+    "id", "competition_id", "url", "etag", "last_modified", "body_hash",
+    "last_fetched_at", "last_status", "last_error", "active", "revision",
+)
+
+
+def _source_snapshot_condition(source: dict) -> tuple[str, list]:
+    defaults = {"active": True, "revision": 0}
+    return (
+        " AND ".join(f"{field} = ?" for field in _SOURCE_SNAPSHOT_FIELDS),
+        [source.get(field, defaults.get(field, "")) for field in _SOURCE_SNAPSHOT_FIELDS],
+    )
+
+
+def source_snapshot_matches(source: dict, conn: sqlite3.Connection | None = None) -> bool:
+    """检查来源标识、有效性和整份抓取基线快照；事务调用方传入同一连接。"""
+    condition, values = _source_snapshot_condition(source)
+    query = f"SELECT 1 FROM competition_sources WHERE active = 1 AND {condition}"
+    if conn is not None:
+        return conn.execute(query, values).fetchone() is not None
+    with _connect() as conn:
+        return conn.execute(query, values).fetchone() is not None
+
+
 def update_source_fetch(source_id: int, *, etag: str = "", last_modified: str = "",
                         body_hash: str = "", last_status: str = "",
                         last_error: str = "", last_fetched_at: str | None = None,
-                        conn: sqlite3.Connection | None = None) -> None:
-    """更新来源状态；时间默认取北京时间，传入 conn 时参与调用方事务。"""
+                        conn: sqlite3.Connection | None = None,
+                        expected_source: dict | None = None) -> bool:
+    """条件更新有效来源；expected_source 过期时零写入，返回 False。"""
     if last_fetched_at is None:
         last_fetched_at = now_str()
     sql = (
         "UPDATE competition_sources SET etag = ?, last_modified = ?, body_hash = ?,"
-        " last_fetched_at = ?, last_status = ?, last_error = ? WHERE id = ?"
+        " last_fetched_at = ?, last_status = ?, last_error = ?, revision = revision + 1 WHERE id = ? AND active = 1"
     )
     values = (etag, last_modified, body_hash, last_fetched_at, last_status, last_error, source_id)
+    if expected_source is not None:
+        condition, expected_values = _source_snapshot_condition(expected_source)
+        sql += f" AND {condition}"
+        values += tuple(expected_values)
     if conn is not None:
-        conn.execute(sql, values)
-        return
+        return conn.execute(sql, values).rowcount == 1
     with _connect() as conn:
-        conn.execute(sql, values)
+        return conn.execute(sql, values).rowcount == 1
 
 
-def get_source_by_url(url: str) -> dict | None:
+def get_source_by_url(url: str, competition_id: int | None = None) -> dict | None:
+    """查询有效来源；指定比赛时不借用其他比赛相同 URL 的基线。"""
+    where = "url = ? AND active = 1"
+    args = [url]
+    if competition_id is not None:
+        where += " AND competition_id = ?"
+        args.append(competition_id)
     with _connect() as conn:
         row = conn.execute(
-            f"SELECT {_SOURCE_COLS} FROM competition_sources WHERE url = ?", (url,)
+            f"SELECT {_SOURCE_COLS} FROM competition_sources WHERE {where} ORDER BY id DESC LIMIT 1", args,
         ).fetchone()
     return _row_to_source(row) if row else None
 
 
-def list_sources(competition_id: int | None = None) -> list[dict]:
+def list_sources(competition_id: int | None = None, *, active_only: bool = True) -> list[dict]:
+    """抓取默认只读有效来源；active_only=False 用于查看保留的来源历史。"""
+    conditions = ["active = 1"] if active_only else []
+    args = []
+    if competition_id is not None:
+        conditions.append("competition_id = ?")
+        args.append(competition_id)
+    where = " WHERE " + " AND ".join(conditions) if conditions else ""
     with _connect() as conn:
-        if competition_id is None:
-            rows = conn.execute(
-                f"SELECT {_SOURCE_COLS} FROM competition_sources ORDER BY id DESC"
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                f"SELECT {_SOURCE_COLS} FROM competition_sources WHERE competition_id = ? ORDER BY id DESC",
-                (competition_id,),
-            ).fetchall()
+        rows = conn.execute(
+            f"SELECT {_SOURCE_COLS} FROM competition_sources{where} ORDER BY id DESC", args,
+        ).fetchall()
     return [_row_to_source(r) for r in rows]
+
+
+def _sync_competition_source_on(conn: sqlite3.Connection, cid: int, url: str,
+                                source_text: str | None = None) -> None:
+    """在比赛事务中切换有效官网；只有真实抓取的正文才建立新基线。"""
+    conn.execute(
+        "UPDATE competition_sources SET active = 0, revision = revision + 1"
+        " WHERE competition_id = ? AND url != ? AND active = 1", (cid, url),
+    )
+    if not url:
+        return
+    sid = add_competition_source(cid, url, conn=conn)
+    conn.execute("UPDATE competition_sources SET active = 1, revision = revision + 1 WHERE id = ? AND active = 0", (sid,))
+    if source_text is not None:
+        update_source_fetch(
+            sid, body_hash=hashlib.sha256(source_text.encode("utf-8")).hexdigest(),
+            last_status="confirmed", conn=conn,
+        )
 
 
 def create_published_competition(info: dict, source_url: str, source_text: str,
@@ -1432,7 +1536,8 @@ def summarize_collection(cid: int) -> dict:
     }
 
 
-def amend_competition(cid: int, info: dict, operator: str = "", note: str = "") -> bool:
+def amend_competition(cid: int, info: dict, operator: str = "", note: str = "", *,
+                      source_text: str | None = None) -> bool:
     """超管修正已发布比赛（v2 修正流程，免审）。
 
     - 直接更新指定字段（校验同 update_competition）
@@ -1440,35 +1545,25 @@ def amend_competition(cid: int, info: dict, operator: str = "", note: str = "") 
     - 清除该比赛未应用的待审更新（人工修正以最新信息为准）
     - 写入审计
     """
-    cleaned: dict[str, str] = {}
-    allowed = {
-        "name", "edition", "official_site", "official_reg_start",
-        "official_reg_deadline", "official_time", "tracks", "official_rules",
-        "device_req", "summary",
-    }
-    for field in info:
-        if field not in allowed:
-            raise ValueError(f"不支持的字段：{field}")
-        if field == "name":
-            name = _as_str(info[field])
-            if not name:
-                raise ValueError("比赛名称不能为空")
-            cleaned[field] = name
-        elif field in ("official_reg_start", "official_reg_deadline", "official_time"):
-            cleaned[field] = _clean_time(info[field])
-        else:
-            cleaned[field] = _as_str(info[field] or "")
+    cleaned = _clean_competition_patch(info)
+    if source_text is not None and (
+        not isinstance(source_text, str) or not source_text.strip() or not cleaned.get("official_site")
+    ):
+        raise ValueError("重新提取必须提供官网链接和有效正文")
     cols = list(cleaned)
     if not cols:
         return False
     sets = ", ".join(f"{c} = ?" for c in cols)
     args = [cleaned[c] for c in cols] + [now_str(), cid]
     with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         cur = conn.execute(
             f"UPDATE competitions SET {sets}, updated_at = ? WHERE id = ?", args
         )
         if cur.rowcount == 0:
             return False
+        if "official_site" in cleaned:
+            _sync_competition_source_on(conn, cid, cleaned["official_site"], source_text)
         cur_comp = conn.execute(
             f"SELECT {_COMPETITION_COLS} FROM competitions WHERE id = ?", (cid,)
         ).fetchone()
@@ -1971,32 +2066,74 @@ def add_pending_update(competition_id: int, fields: dict, *,
                        created_by: str = "") -> int:
     """为已确认比赛登记一条待审更新（同一比赛仅保留最新一条，覆盖旧待审）。
 
-    返回待审更新 id（新插入或覆盖旧记录均返回当前记录 id），失败返回 0。
+    返回待审更新 id（新插入或覆盖旧记录均返回当前记录 id）；校验失败抛 ValueError。
     """
-    if not isinstance(fields, dict):
-        raise ValueError("待审更新内容必须是字典")
+    fields = _clean_competition_patch(fields, ignore_empty=True)
+    if not fields:
+        raise ValueError("待审更新没有有效字段")
     with _connect() as conn:
-        row = conn.execute(
-            "SELECT id FROM competition_pending_updates WHERE competition_id = ?",
-            (competition_id,),
-        ).fetchone()
-        fields_json = json.dumps(fields, ensure_ascii=False)
-        if row is not None:
-            conn.execute(
-                "UPDATE competition_pending_updates SET fields_json = ?, source_id = ?,"
-                " change_note = ?, created_by = ?, updated_at = ? WHERE id = ?",
-                (fields_json, source_id, change_note or "", created_by or "",
-                 now_str(), row[0]),
-            )
-            return row[0]
-        cur = conn.execute(
-            "INSERT INTO competition_pending_updates (competition_id, fields_json,"
-            " source_id, change_note, created_by, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (competition_id, fields_json, source_id, change_note or "",
-             created_by or "", now_str(), now_str()),
+        conn.execute("BEGIN IMMEDIATE")
+        source_url = _validate_pending_source_on(conn, competition_id, source_id)
+        if source_url and fields.get("official_site", source_url) != source_url:
+            raise ValueError("待审官网与抓取来源不一致")
+        return _add_pending_update_on(conn, competition_id, fields, source_id, change_note, created_by)
+
+
+def _add_pending_update_on(conn: sqlite3.Connection, cid: int, fields: dict,
+                           source_id: int, note: str, operator: str) -> int:
+    row = conn.execute("SELECT id FROM competition_pending_updates WHERE competition_id = ?", (cid,)).fetchone()
+    fields_json = json.dumps(fields, ensure_ascii=False)
+    if row is not None:
+        conn.execute(
+            "UPDATE competition_pending_updates SET fields_json = ?, source_id = ?,"
+            " change_note = ?, created_by = ?, updated_at = ? WHERE id = ?",
+            (fields_json, source_id, note or "", operator or "", now_str(), row[0]),
         )
-        return cur.lastrowid
+        return row[0]
+    cur = conn.execute(
+        "INSERT INTO competition_pending_updates (competition_id, fields_json,"
+        " source_id, change_note, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (cid, fields_json, source_id, note or "", operator or "", now_str(), now_str()),
+    )
+    return cur.lastrowid
+
+
+def store_crawled_competition(expected_source: dict, patch: dict, new_source_state: dict) -> dict | None:
+    """原子核对来源快照并保存待审/旧草稿及基线；过期结果返回 None，零写入。"""
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if not source_snapshot_matches(expected_source, conn=conn):
+            return None
+        cid = expected_source["competition_id"]
+        row = conn.execute(f"SELECT {_COMPETITION_COLS} FROM competitions WHERE id = ?", (cid,)).fetchone()
+        if row is None or row[11] not in ("draft", "confirmed"):
+            return None
+        fields = _clean_competition_patch(patch, ignore_empty=True)
+        if not fields:
+            raise ValueError("来源更新没有有效字段")
+        if fields.get("official_site", expected_source["url"]) != expected_source["url"]:
+            raise ValueError("更新官网与抓取来源不一致")
+        item = {"competition_id": cid}
+        if row[11] == "confirmed":
+            item["action"] = "pending"
+            item["update_id"] = _add_pending_update_on(
+                conn, cid, fields, expected_source["id"], "公共来源变化，待超管确认", "crawler:auto",
+            )
+            status = "pending"
+        else:
+            sets = ", ".join(f"{field} = ?" for field in fields)
+            conn.execute(
+                f"UPDATE competitions SET {sets}, updated_at = ? WHERE id = ?",
+                [*fields.values(), now_str(), cid],
+            )
+            current = conn.execute(f"SELECT {_COMPETITION_COLS} FROM competitions WHERE id = ?", (cid,)).fetchone()
+            _add_version(conn, cid, "draft", _row_to_competition(current), "公共来源变化，更新草稿", "crawler:auto")
+            item["action"] = "updated"
+            status = "draft"
+        state = {**new_source_state, "last_status": status, "last_error": ""}
+        if not update_source_fetch(expected_source["id"], conn=conn, **state):
+            raise ValueError("来源基线保存失败")
+        return item
 
 
 def get_pending_update(competition_id: int) -> dict | None:
@@ -2010,7 +2147,7 @@ def get_pending_update(competition_id: int) -> dict | None:
 
 
 def list_pending_updates() -> list[dict]:
-    """列出全部待审更新（join 比赛名，供 /审核列表 使用）。"""
+    """列出全部待审更新（join 比赛名，供 /待审列表 使用）。"""
     with _connect() as conn:
         rows = conn.execute(
             f"SELECT pu.id, pu.competition_id, pu.fields_json, pu.source_id,"
@@ -2029,12 +2166,25 @@ def list_pending_updates() -> list[dict]:
     return result
 
 
+def _validate_pending_source_on(conn: sqlite3.Connection, cid: int, source_id: int) -> str | None:
+    if source_id:
+        row = conn.execute(
+            "SELECT url FROM competition_sources WHERE id = ? AND competition_id = ? AND active = 1",
+            (source_id, cid),
+        ).fetchone()
+        if row is None:
+            raise ValueError("待审来源已停用或不属于该比赛")
+        return row[0]
+    return None
+
+
 def apply_pending_update(update_id: int, operator: str = "") -> bool:
-    """审核通过：将待审内容覆盖为正式内容（status 保持 confirmed），并记录版本。
+    """批准有效字段的部分更新，保留未包含或待定字段，并记录完整版本。
 
     与取数、写版本、删待审在同一连接同一事务内完成。
     """
     with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             f"SELECT {_PENDING_UPDATE_COLS} FROM competition_pending_updates WHERE id = ?",
             (update_id,),
@@ -2048,24 +2198,16 @@ def apply_pending_update(update_id: int, operator: str = "") -> bool:
         ).fetchone()
         if comp is None or comp[11] != "confirmed":
             return False
-        fields = pending["fields"]
-        cols = [
-            "name", "edition", "official_site", "official_reg_start",
-            "official_reg_deadline", "official_time", "tracks", "official_rules",
-            "device_req", "summary",
-        ]
-        cleaned = {}
-        for f in cols:
-            v = fields.get(f)
-            if f == "name":
-                name = _as_str(v or "")
-                if not name:
-                    raise ValueError("比赛名称不能为空")
-                cleaned[f] = name
-            elif f in ("official_reg_start", "official_reg_deadline", "official_time"):
-                cleaned[f] = _clean_time(v)
-            else:
-                cleaned[f] = _as_str(v or "")
+        source_url = _validate_pending_source_on(conn, comp_id, pending["source_id"])
+        try:
+            fields = json.loads(pending["fields_json"])
+        except (ValueError, TypeError):
+            raise ValueError("待审内容格式错误") from None
+        cleaned = _clean_competition_patch(fields, ignore_empty=True)
+        if not cleaned:
+            raise ValueError("待审更新没有有效字段")
+        if source_url and cleaned.get("official_site", source_url) != source_url:
+            raise ValueError("待审官网与抓取来源不一致")
         sets = ", ".join(f"{c} = ?" for c in cleaned)
         args = [cleaned[c] for c in cleaned] + [now_str(), now_str(), comp_id]
         conn.execute(
@@ -2073,6 +2215,8 @@ def apply_pending_update(update_id: int, operator: str = "") -> bool:
             " verified_at = ?, updated_at = ? WHERE id = ?",
             args,
         )
+        if "official_site" in cleaned:
+            _sync_competition_source_on(conn, comp_id, cleaned["official_site"])
         conn.execute(
             "DELETE FROM competition_pending_updates WHERE id = ?", (update_id,)
         )
@@ -2089,6 +2233,7 @@ def apply_pending_update(update_id: int, operator: str = "") -> bool:
 def reject_pending_update(update_id: int, operator: str = "", note: str = "") -> bool:
     """审核拒绝：删除待审更新，正式内容保持不变。"""
     with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             f"SELECT {_PENDING_UPDATE_COLS} FROM competition_pending_updates WHERE id = ?",
             (update_id,),
