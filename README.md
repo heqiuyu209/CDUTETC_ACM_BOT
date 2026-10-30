@@ -25,7 +25,7 @@
 - **学校安排（org_events）**：学校统一安排，`shareable=1` 的公开项所有群可看。
 - **群内安排（training_sessions / faqs / unanswered_questions / activities）**：全部带 `group_id`，严格按群隔离。
 - **活动登记（activity_responses）**：同一活动+成员幂等登记（仅一条 registered），取消置 cancelled 保留记录；容量校验、截止时间校验、字段白名单校验。
-- **提醒投递（reminder_deliveries）**：去重键含群号（`group_id:obj_type:obj_id:remind_type:target`），发送成功才标记 sent，失败留 pending 自动重试。
+- **提醒投递（reminder_deliveries）**：去重键含群号（`group_id|obj_type|obj_id|remind_type|target`，自动迁移旧冒号键），发送成功才标记 sent，失败留 pending 有界重试，耗尽后 failed；关闭/改期计划 cancelled，超过目标时间 expired。
 - **来源抓取（competition_sources）**：记录 ETag/Last-Modified/正文哈希/最近抓取时间/状态/错误，支撑低频抓取与变化检测。
 
 发布比赛时，正式比赛、来源 URL 和已抓取正文的哈希在同一事务保存。开启 `ACM_AUTO_FETCH_ENABLED=1` 后，新发布链接按 `ACM_FETCH_MIN_INTERVAL_MINUTES` 进入后台监控；正文未变化不再调用模型，有变化则保存待审更新。`/抓取状态` 可查看来源登记与最近检查结果。
@@ -121,7 +121,7 @@ python -m pytest -q
 - **资源限制**：响应体按 Content-Length 提前拒绝 + 流式读取上限 + gzip 边解压边限流；正文、模型输入/输出、并发均有上限。
 - **数据校验**：模型提取结果严格结构校验（名称必填、时间合法并归一化）；**校验失败不写库、不回复成功**；公共来源提取结果映射后再次经 `create_competition`/`update_competition` 严格 schema 校验，失败只记来源 error、不生成草稿。
 - **时区统一**：业务时间统一北京时间 `Asia/Shanghai`（zoneinfo），UTC 主机同样按北京时区计算，格式 `YYYY-MM-DD HH:MM`。
-- **提醒去重**：去重键含群号并持久化在 `reminder_deliveries`；**发送成功才标记 sent**，失败留 pending 自动重试（attempts 计数），不拿日志冒充已发送。
+- **提醒去重**：去重键含群号并持久化在 `reminder_deliveries`；SQLite 原子领取后进入 sending（120 秒租约），新旧提醒发送均有 60 秒超时和逐条异常处理，只有成功回执才标记 sent。每次领取消耗一次尝试，默认最多 3 次；进程中断后租约到期可恢复。发送前复核对象状态和时间；`/提醒状态` 按本群显示队列与终结状态统计。
 - **公共抓取**：集中低频调度（`FETCH_MIN_INTERVAL_MINUTES`）；ETag / Last-Modified / 正文哈希三层变化检测，以正文哈希为强信号；**仅实质变化才调用一次模型**生成审核草稿；已确认比赛被实质变化打回草稿需重新审核；订阅群与来源异常均返回通知目标，由发送回调统一处理。
 
 ## 已知问题

@@ -21,13 +21,16 @@
 
 import hashlib
 import json
+import logging
 import sqlite3
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from config import DB_PATH
 
 TZ = ZoneInfo("Asia/Shanghai")
+logger = logging.getLogger(__name__)
 
 _MAIN_DDL = """
 CREATE TABLE IF NOT EXISTS contests (
@@ -238,7 +241,17 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries (
     sent_at     TEXT NOT NULL DEFAULT '',
     last_error  TEXT NOT NULL DEFAULT '',
     dedup_key   TEXT NOT NULL DEFAULT '',
+    lease_token TEXT NOT NULL DEFAULT '',
+    lease_until TEXT NOT NULL DEFAULT '',
     UNIQUE (dedup_key)
+)
+"""
+
+_REMINDER_SUCCESS_RECEIPTS_DDL = """
+CREATE TABLE IF NOT EXISTS reminder_success_receipts (
+    dedup_key   TEXT PRIMARY KEY,
+    lease_token TEXT NOT NULL,
+    sent_at     TEXT NOT NULL
 )
 """
 
@@ -280,7 +293,7 @@ _ALL_DDL = (
     _ORG_EVENTS_DDL,
     _TRAINING_SESSIONS_DDL, _GROUP_FAQ_DDL, _UNANSWERED_DDL,
     _COLLECTIONS_DDL, _COLLECTION_RESPONSES_DDL,
-    _REMINDER_DELIVERIES_DDL, _AUDIT_LOG_DDL,
+    _REMINDER_DELIVERIES_DDL, _REMINDER_SUCCESS_RECEIPTS_DDL, _AUDIT_LOG_DDL,
 )
 
 
@@ -336,6 +349,7 @@ def init_db() -> None:
         for ddl in _ALL_DDL:
             conn.execute(ddl)
         _migrate_v1(conn)
+        _migrate_reminder_deliveries(conn)
         for ddl in _INDEX_DDL:
             conn.execute(ddl)
 
@@ -1474,7 +1488,7 @@ def amend_competition(cid: int, info: dict, operator: str = "", note: str = "") 
 
 _DELIVERY_COLS = (
     "id, group_id, obj_type, obj_id, remind_type, target_time, attempts,"
-    " status, sent_at, last_error, dedup_key"
+    " status, sent_at, last_error, dedup_key, lease_token, lease_until"
 )
 
 
@@ -1483,12 +1497,261 @@ def _row_to_delivery(r: sqlite3.Row) -> dict:
         "id": r[0], "group_id": r[1], "obj_type": r[2], "obj_id": r[3],
         "remind_type": r[4], "target_time": r[5], "attempts": r[6],
         "status": r[7], "sent_at": r[8], "last_error": r[9], "dedup_key": r[10],
+        "lease_token": r[11], "lease_until": r[12],
     }
 
 
 def delivery_dedup_key(group_id: str, obj_type: str, obj_id: int,
                        remind_type: str, target_time: str) -> str:
     return f"{group_id}|{obj_type}|{obj_id}|{remind_type}|{target_time}"
+
+
+def _canonical_delivery_key(key: str) -> str:
+    """兼容旧扫描器的冒号键；身份仍由数据库对象字段确定。"""
+    parts = key.split("|", 4) if "|" in key else key.split(":", 4)
+    if len(parts) != 5:
+        return key
+    try:
+        obj_id = int(parts[2])
+    except ValueError:
+        return key
+    return delivery_dedup_key(parts[0], parts[1], obj_id, parts[3], parts[4])
+
+
+def _migrate_reminder_deliveries(conn: sqlite3.Connection) -> None:
+    """补租约字段并合并同对象旧键，保留成功回执与最大尝试次数。"""
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(reminder_deliveries)")}
+    for column in ("lease_token", "lease_until"):
+        if column not in cols:
+            conn.execute(f"ALTER TABLE reminder_deliveries ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+    rows = conn.execute(f"SELECT {_DELIVERY_COLS} FROM reminder_deliveries ORDER BY id").fetchall()
+    grouped: dict[tuple, list[dict]] = {}
+    for row in rows:
+        delivery = _row_to_delivery(row)
+        identity = tuple(delivery[k] for k in ("group_id", "obj_type", "obj_id", "remind_type", "target_time"))
+        grouped.setdefault(identity, []).append(delivery)
+    rank = {"sent": 6, "sending": 5, "pending": 4, "failed": 3, "expired": 2, "cancelled": 1}
+    for identity, deliveries in grouped.items():
+        winner = max(deliveries, key=lambda d: (rank.get(d["status"], 0), d["attempts"], -d["id"]))
+        for delivery in deliveries:
+            if delivery["id"] != winner["id"]:
+                conn.execute("DELETE FROM reminder_deliveries WHERE id = ?", (delivery["id"],))
+        key = delivery_dedup_key(*identity)
+        conn.execute(
+            "UPDATE reminder_deliveries SET dedup_key = ?, attempts = ? WHERE id = ?",
+            (key, max(d["attempts"] for d in deliveries), winner["id"]),
+        )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_identity ON reminder_deliveries"
+        " (group_id, obj_type, obj_id, remind_type, target_time)"
+    )
+    # 成功事实独立提交；状态投影写入失败时，查询仍显示已发送并保留去重。
+    conn.execute("""CREATE VIEW IF NOT EXISTS reminder_delivery_states AS
+        SELECT d.id, d.group_id, d.obj_type, d.obj_id, d.remind_type,
+               d.target_time, d.attempts,
+               CASE WHEN r.dedup_key IS NOT NULL THEN 'sent' ELSE d.status END AS status,
+               COALESCE(r.sent_at, d.sent_at) AS sent_at,
+               CASE WHEN r.dedup_key IS NOT NULL THEN '' ELSE d.last_error END AS last_error,
+               d.dedup_key,
+               CASE WHEN r.dedup_key IS NOT NULL THEN '' ELSE d.lease_token END AS lease_token,
+               CASE WHEN r.dedup_key IS NOT NULL THEN '' ELSE d.lease_until END AS lease_until
+        FROM reminder_deliveries d
+        LEFT JOIN reminder_success_receipts r ON r.dedup_key = d.dedup_key
+    """)
+
+
+def _delivery_now(now: datetime | None = None) -> datetime:
+    now = now or datetime.now(TZ)
+    return now.replace(tzinfo=TZ) if now.tzinfo is None else now.astimezone(TZ)
+
+
+def _delivery_parse_time(text: str) -> datetime | None:
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=TZ)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _delivery_invalid_status(conn: sqlite3.Connection, delivery: dict,
+                             now: datetime, allowed_groups: set[str] | None = None) -> str | None:
+    """发送前按当前对象状态/目标复核；旧计划失效即终结。"""
+    if allowed_groups is not None and delivery["group_id"] not in allowed_groups:
+        return "cancelled"
+    if delivery["obj_type"] == "collection":
+        if delivery["remind_type"] != "deadline" or not delivery["group_id"]:
+            return "cancelled"
+        row = conn.execute(
+            "SELECT group_id, status, deadline FROM collections WHERE id = ?", (delivery["obj_id"],)
+        ).fetchone()
+        if row is None or row[0] != delivery["group_id"] or row[1] != "open" or row[2] != delivery["target_time"]:
+            return "cancelled"
+    elif delivery["obj_type"] == "competition":
+        field = {"reg_deadline": "official_reg_deadline", "contest_time": "official_time"}.get(delivery["remind_type"])
+        if field is None:
+            return "cancelled"
+        row = conn.execute(f"SELECT status, {field} FROM competitions WHERE id = ?", (delivery["obj_id"],)).fetchone()
+        if row is None or row[0] != "confirmed" or row[1] != delivery["target_time"]:
+            return "cancelled"
+    else:
+        return "cancelled"
+    target = _delivery_parse_time(delivery["target_time"])
+    if target is None:
+        return "cancelled"
+    return "expired" if target <= now else None
+
+
+def reconcile_deliveries(now: datetime | None = None, *, max_attempts: int = 3,
+                         allowed_groups: set[str] | None = None) -> None:
+    """终结旧计划，恢复过期租约；活跃发送者保留其回执写入权。"""
+    now = _delivery_now(now)
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            f"SELECT {_DELIVERY_COLS} FROM reminder_deliveries"
+            " WHERE status IN ('pending', 'sending', 'cancelled')"
+            " AND NOT EXISTS (SELECT 1 FROM reminder_success_receipts r"
+            " WHERE r.dedup_key = reminder_deliveries.dedup_key)"
+        ).fetchall()
+        for row in rows:
+            delivery = _row_to_delivery(row)
+            # 在途发送仍有写回权；对象关闭/改期只能阻止尚未发送的计划。
+            if delivery["status"] == "sending":
+                until = _delivery_parse_time(delivery["lease_until"])
+                if until is not None and until > now and delivery["lease_token"]:
+                    continue
+            status = _delivery_invalid_status(conn, delivery, now, allowed_groups)
+            if status is None:
+                if delivery["attempts"] >= max_attempts:
+                    status = "failed"
+                elif delivery["status"] in ("sending", "cancelled"):
+                    status = "pending"
+            if status is not None:
+                conn.execute(
+                    "UPDATE reminder_deliveries SET status = ?, lease_token = '', lease_until = '' WHERE id = ?",
+                    (status, delivery["id"]),
+                )
+
+
+def claim_delivery(group_id: str, obj_type: str, obj_id: int, remind_type: str,
+                   target_time: str, *, now: datetime | None = None,
+                   max_attempts: int = 3, lease_seconds: int = 120,
+                   allowed_groups: set[str] | None = None) -> str | None:
+    """同一写事务复核对象并领取；计数在领取时递增，进程中断也消耗尝试。"""
+    if max_attempts < 1 or lease_seconds < 1:
+        raise ValueError("提醒尝试次数和发送租约必须大于零")
+    now = _delivery_now(now)
+    key = delivery_dedup_key(group_id, obj_type, obj_id, remind_type, target_time)
+    if allowed_groups is not None and group_id not in allowed_groups:
+        return None
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT OR IGNORE INTO reminder_deliveries (group_id, obj_type, obj_id, remind_type, target_time, dedup_key)"
+            " VALUES (?, ?, ?, ?, ?, ?)", (group_id, obj_type, obj_id, remind_type, target_time, key),
+        )
+        row = conn.execute(f"SELECT {_DELIVERY_COLS} FROM reminder_deliveries WHERE dedup_key = ?", (key,)).fetchone()
+        delivery = _row_to_delivery(row)
+        if delivery["status"] == "sent" or conn.execute(
+            "SELECT 1 FROM reminder_success_receipts WHERE dedup_key = ?", (key,)
+        ).fetchone():
+            return None
+        if delivery["status"] == "sending":
+            until = _delivery_parse_time(delivery["lease_until"])
+            if until is not None and until > now and delivery["lease_token"]:
+                return None
+        status = _delivery_invalid_status(conn, delivery, now, allowed_groups)
+        if status:
+            if delivery["status"] != "sent":
+                conn.execute(
+                    "UPDATE reminder_deliveries SET status = ?, lease_token = '', lease_until = '' WHERE id = ?",
+                    (status, delivery["id"]),
+                )
+            return None
+        if delivery["status"] in ("failed", "expired"):
+            return None
+        if delivery["attempts"] >= max_attempts:
+            conn.execute(
+                "UPDATE reminder_deliveries SET status = 'failed', lease_token = '', lease_until = '' WHERE id = ?",
+                (delivery["id"],),
+            )
+            return None
+        token = uuid.uuid4().hex
+        until = (now + timedelta(seconds=lease_seconds)).strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute(
+            "UPDATE reminder_deliveries SET status = 'sending', attempts = attempts + 1, lease_token = ?, lease_until = ?"
+            " WHERE id = ?", (token, until, delivery["id"]),
+        )
+        return token
+
+
+def validate_delivery_claim(dedup_key: str, token: str, *, now: datetime | None = None,
+                            allowed_groups: set[str] | None = None) -> bool:
+    """投递前再检查租约和对象，已关闭/改期的计划不发送。"""
+    now = _delivery_now(now)
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            f"SELECT {_DELIVERY_COLS} FROM reminder_deliveries WHERE dedup_key = ? AND status = 'sending' AND lease_token = ?",
+            (_canonical_delivery_key(dedup_key), token),
+        ).fetchone()
+        if row is None:
+            return False
+        if conn.execute("SELECT 1 FROM reminder_success_receipts WHERE dedup_key = ?",
+                        (_canonical_delivery_key(dedup_key),)).fetchone():
+            return False
+        delivery = _row_to_delivery(row)
+        status = _delivery_invalid_status(conn, delivery, now, allowed_groups)
+        if status:
+            conn.execute(
+                "UPDATE reminder_deliveries SET status = ?, lease_token = '', lease_until = '' WHERE id = ?",
+                (status, delivery["id"]),
+            )
+            return False
+        until = _delivery_parse_time(delivery["lease_until"])
+        return until is not None and until > now
+
+
+def record_delivery_success(dedup_key: str, token: str, *, now: datetime | None = None) -> bool:
+    """独立提交当前发送者的成功事实；同一回执幂等，旧租约不能冒认成功。"""
+    key = _canonical_delivery_key(dedup_key)
+    now_text = _delivery_now(now).strftime("%Y-%m-%d %H:%M:%S")
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT OR IGNORE INTO reminder_success_receipts (dedup_key, lease_token, sent_at)"
+            " SELECT dedup_key, lease_token, ? FROM reminder_deliveries"
+            " WHERE dedup_key = ? AND status = 'sending' AND lease_token = ?",
+            (now_text, key, token),
+        )
+        row = conn.execute("SELECT lease_token FROM reminder_success_receipts WHERE dedup_key = ?", (key,)).fetchone()
+        return row is not None and row[0] == token
+
+
+def finish_delivery(dedup_key: str, token: str, ok: bool, *, error: str = "",
+                    now: datetime | None = None, max_attempts: int = 3) -> bool:
+    """成功事实先独立提交；状态更新异常不撤销成功，也不会导致租约过期重发。"""
+    key = _canonical_delivery_key(dedup_key)
+    now_text = _delivery_now(now).strftime("%Y-%m-%d %H:%M:%S")
+    if ok and not record_delivery_success(key, token, now=now):
+        return False
+    try:
+        with _connect() as conn:
+            cur = conn.execute(
+                "UPDATE reminder_deliveries SET status = CASE WHEN ? THEN 'sent' WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,"
+                " sent_at = CASE WHEN ? THEN ? ELSE sent_at END, last_error = ?, lease_token = '', lease_until = ''"
+                " WHERE dedup_key = ? AND status = 'sending' AND lease_token = ?",
+                (ok, max_attempts, ok, now_text, "" if ok else (error or "发送失败"), key, token),
+            )
+            return ok or cur.rowcount > 0
+    except sqlite3.Error:
+        if not ok:
+            raise
+        logger.exception("提醒状态更新失败，已保留成功回执: %s", key)
+        return True
 
 
 def ensure_delivery(group_id: str, obj_type: str, obj_id: int,
@@ -1508,8 +1771,8 @@ def ensure_delivery(group_id: str, obj_type: str, obj_id: int,
 def get_delivery_by_key(dedup_key: str) -> dict | None:
     with _connect() as conn:
         row = conn.execute(
-            f"SELECT {_DELIVERY_COLS} FROM reminder_deliveries WHERE dedup_key = ?",
-            (dedup_key,),
+            f"SELECT {_DELIVERY_COLS} FROM reminder_delivery_states WHERE dedup_key = ?",
+            (_canonical_delivery_key(dedup_key),),
         ).fetchone()
     return _row_to_delivery(row) if row else None
 
@@ -1517,27 +1780,51 @@ def get_delivery_by_key(dedup_key: str) -> dict | None:
 def list_pending_deliveries(limit: int = 200) -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
-            f"SELECT {_DELIVERY_COLS} FROM reminder_deliveries"
+            f"SELECT {_DELIVERY_COLS} FROM reminder_delivery_states"
             " WHERE status = 'pending' ORDER BY id LIMIT ?",
             (limit,),
         ).fetchall()
     return [_row_to_delivery(r) for r in rows]
 
 
-def record_delivery_attempt(dedup_key: str, ok: bool, error: str = "") -> None:
-    """记录一次发送尝试：失败累计 attempts；成功标记 sent（发送成功才标）。"""
+def list_deliveries(group_id: str, *, statuses: tuple[str, ...] | None = None,
+                    limit: int = 200) -> list[dict]:
+    where = "group_id = ?"
+    args: list = [group_id]
+    if statuses:
+        where += " AND status IN (" + ",".join("?" for _ in statuses) + ")"
+        args.extend(statuses)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_DELIVERY_COLS} FROM reminder_delivery_states WHERE {where} ORDER BY id DESC LIMIT ?",
+            [*args, limit],
+        ).fetchall()
+    return [_row_to_delivery(row) for row in rows]
+
+
+def delivery_status_counts(group_id: str) -> dict[str, int]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) FROM reminder_delivery_states WHERE group_id = ? GROUP BY status", (group_id,)
+        ).fetchall()
+    return dict(rows)
+
+
+def record_delivery_attempt(dedup_key: str, ok: bool, error: str = "", *, max_attempts: int = 3) -> None:
+    """兼容旧调用：只记录未领取 pending，不能覆盖租约或成功记录。"""
     with _connect() as conn:
         if ok:
             conn.execute(
                 "UPDATE reminder_deliveries SET attempts = attempts + 1, status = 'sent',"
-                " sent_at = ?, last_error = '' WHERE dedup_key = ?",
-                (now_str(), dedup_key),
+                " sent_at = ?, last_error = '' WHERE dedup_key = ? AND status = 'pending'",
+                (now_str(), _canonical_delivery_key(dedup_key)),
             )
         else:
             conn.execute(
-                "UPDATE reminder_deliveries SET attempts = attempts + 1, status = 'pending',"
-                " last_error = ? WHERE dedup_key = ?",
-                (error or "发送失败", dedup_key),
+                "UPDATE reminder_deliveries SET attempts = attempts + 1,"
+                " status = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE 'pending' END,"
+                " last_error = ? WHERE dedup_key = ? AND status = 'pending'",
+                (max_attempts, error or "发送失败", _canonical_delivery_key(dedup_key)),
             )
 
 
