@@ -4,7 +4,7 @@
 - 自动抓取默认关闭（AUTO_FETCH_ENABLED，默认 False）；开启后同一来源
   最小间隔由 FETCH_MIN_INTERVAL_MINUTES 控制，集中低频抓取。
 - 变化检测三层信号：ETag / Last-Modified / 正文哈希；以正文哈希为强信号，
-  只有「实质变化」才调用一次模型提取。
+  只有「实质变化」才完整提取正文；长正文使用有界分段请求。
 - 提取严格 schema 校验失败不写库（复用 llm.validate_contest_info），
   只记录来源状态为 error，不生成/更新任何记录。
 - 仅扫描有效关联且未停用的来源；已确认比赛出现实质变化时
@@ -189,6 +189,8 @@ async def _process_source(source: dict, comp: dict | None, now: datetime, fetch,
             return _source_superseded(source)
         return {"kind": "nochange", "source_id": sid, "competition_id": cid, "name": name}
 
+    # 提取回调须完整覆盖正文：覆盖超限、任一分段失败或冲突都返回错误。
+    # 在完整提取成功前不能更新正文哈希，否则下轮会错误地认定 nochange。
     info, err = await extract(text)
     if err or info is None:
         raise ValueError(str(err) if err else "提取校验失败")

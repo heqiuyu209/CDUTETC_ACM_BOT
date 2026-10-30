@@ -67,7 +67,7 @@ async def test_tail_change_creates_pending_update_and_hashes_complete_text(page,
     assert database.get_competition(cid)["official_reg_deadline"] == "2026-11-10 23:59"
 
 
-async def test_model_input_limit_is_independent_of_fetch_output(page, monkeypatch):
+async def test_model_rejects_uncovered_body_instead_of_silently_truncating(page, monkeypatch):
     page.update(body=("<p>" + "比赛公告" * 2000 + "</p>").encode())
     monkeypatch.setattr(llm.config, "LLM_MAX_INPUT_CHARS", 120)
     calls = []
@@ -80,8 +80,8 @@ async def test_model_input_limit_is_independent_of_fetch_output(page, monkeypatc
     text = await fetcher.fetch_text(URL)
     assert len(text) == 8000
     info, error = await llm.extract_contest(text)
-    assert error is None and info["name"] == "离线校赛"
-    assert calls == [text[:120]]
+    assert info is None and "超过完整提取预算" in error
+    assert calls == []
 
 
 @pytest.mark.parametrize("body,ctype,expected", [
