@@ -79,34 +79,42 @@ class OneBotClient:
             logger.info("OneBot 已连接: %s", self.ws_url)
             if self.on_ready is not None:
                 await self.on_ready()
-            async for raw in ws:
-                await self._dispatch(raw)
+            await self._read_loop(ws)
 
-    async def _dispatch(self, raw: str) -> None:
+    async def _read_loop(self, ws) -> None:
+        """读取循环：API 回执同步 resolve，消息事件异步派发（不阻塞回执读取）。"""
+        async for raw in ws:
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                logger.warning("收到非 JSON 数据，忽略")
+                continue
+
+            if "echo" in data:
+                # API 动作回执：立即完成，避免事件处理阻塞导致回执超时
+                fut = self._pending.pop(data.get("echo"), None)
+                if fut is not None and not fut.done():
+                    fut.set_result(data)
+                continue
+
+            post_type = data.get("post_type")
+            if post_type == "meta_event":
+                continue  # 心跳/生命周期，无需处理
+            if post_type != "message":
+                continue
+
+            msg = OneBotMessage(data)
+            if msg.message_type == "group" and self.group_msg_handler is not None:
+                asyncio.create_task(self._guard(self.group_msg_handler, msg))
+            elif msg.message_type == "private" and self.private_msg_handler is not None:
+                asyncio.create_task(self._guard(self.private_msg_handler, msg))
+
+    async def _guard(self, handler: MessageHandler, msg: OneBotMessage) -> None:
+        """事件任务包装：handler 异常记录日志，不中断读取循环。"""
         try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            logger.warning("收到非 JSON 数据，忽略")
-            return
-
-        if "echo" in data:
-            # API 动作回执
-            fut = self._pending.pop(data.get("echo"), None)
-            if fut is not None and not fut.done():
-                fut.set_result(data)
-            return
-
-        post_type = data.get("post_type")
-        if post_type == "meta_event":
-            return  # 心跳/生命周期，无需处理
-        if post_type != "message":
-            return
-
-        msg = OneBotMessage(data)
-        if msg.message_type == "group" and self.group_msg_handler is not None:
-            await self.group_msg_handler(msg)
-        elif msg.message_type == "private" and self.private_msg_handler is not None:
-            await self.private_msg_handler(msg)
+            await handler(msg)
+        except Exception:
+            logger.exception("事件处理失败 type=%s", msg.message_type)
 
     async def call_api(self, action: str, **params) -> dict | None:
         """调用 OneBot API，返回响应 dict；连接断开或超时返回 None。"""
