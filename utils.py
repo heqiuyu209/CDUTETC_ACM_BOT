@@ -27,11 +27,11 @@ def contains_link(content: str) -> bool:
 
 
 def is_publish_command(text: str, cmd: str = "发布") -> bool:
-    """完整命令词后须为空或空白，避免把“发布的比赛……”当成操作。"""
+    """完整命令词后须为空、空白或 HTTP 链接，避免误认普通提问。"""
     if not cmd or not text.startswith(cmd):
         return False
     rest = text[len(cmd):]
-    return not rest or rest[0].isspace()
+    return not rest or rest[0].isspace() or rest.startswith(("http://", "https://"))
 
 
 def is_allowed_group(group_id: str | None, allowed_groups: set[str]) -> bool:
