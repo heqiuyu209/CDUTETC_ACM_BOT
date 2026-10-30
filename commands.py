@@ -2,7 +2,7 @@
 
 对应 PRODUCT_SPEC v2：
 - 移除订阅/取消订阅/比赛列表/比赛详情、审核列表/通过/拒绝、活动全套命令；
-  新增 /修正（超管）、/征集 /征集汇总 /征集关闭（老师/超管）、/报名（群成员）；
+  新增 /修正（超管）、/征集 /征集关闭（老师/超管）、/征集汇总 /报名（群成员）；
   发布改为免审（老师白名单，见 main.py）。
 - 命令式敏感操作 + 清晰帮助：所有写操作必须以命令形式显式发出，禁止隐式触发。
 - 权限默认全拒绝：super_admin=超管（/修正、全局管理）；teacher=老师
@@ -43,7 +43,7 @@ HELP_TEXT = """【CDUTETC ACM 事务助手 · 命令帮助】
 /征集 <标题> [截止时间] [名额] [字段1,字段2]  发起征集（老师/超管）
 /报名 <征集id> [字段=值 ...]   报名/更新我的登记（群成员）
 /报名 取消 <征集id>      取消我的报名（群成员）
-/征集汇总 <征集id>       查看汇总与明细（老师/超管）
+/征集汇总 <征集id>       查看本群人数和剩余名额（群成员）
 /征集关闭 <征集id>       关闭征集停止报名（老师/超管）
 --- FAQ 与提问 ---
 /FAQ列表 [关键词]       查看本群 FAQ
@@ -289,9 +289,7 @@ def cmd_collection_register(group_id: str, sender: str, args: str) -> list[dict]
 
 
 def cmd_collection_summary(group_id: str, sender: str, args: str) -> list[dict]:
-    """老师/超管查看征集汇总与明细。"""
-    if not (is_teacher(sender) or is_super_admin(sender)):
-        return [{"group_id": group_id, "text": "仅老师/超管可查看征集汇总"}]
+    """群内只展示汇总；请求者是管理员也不向群成员发送个人明细。"""
     try:
         cid = int(args.strip().split()[0])
     except (ValueError, IndexError):
@@ -309,18 +307,6 @@ def cmd_collection_summary(group_id: str, sender: str, args: str) -> list[dict]:
         f"已取消：{s['cancelled']} 人",
         f"剩余名额：{remaining}",
     ]
-    regs = db.list_collection_responses(cid)
-    if regs:
-        lines.append(f"明细（{len(regs)} 人）：")
-        for r in regs:
-            try:
-                data = json.loads(r["data_json"] or "{}")
-            except ValueError:
-                data = {}
-            extra = "；".join(f"{k}={v}" for k, v in data.items())
-            lines.append(f"{r['member_id']}｜{extra}")
-    else:
-        lines.append("暂无报名")
     return [{"group_id": group_id, "text": "\n".join(lines)}]
 
 
