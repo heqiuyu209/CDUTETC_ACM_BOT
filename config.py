@@ -7,6 +7,12 @@
 """
 
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# 加载项目根目录下的 .env（若存在）。系统环境变量优先，.env 不覆盖已注入的值。
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # ================= QQ 机器人（必填） =================
 APPID = os.getenv("ACM_APPID", "")

@@ -146,6 +146,13 @@ class ACMBot(botpy.Client):
                 getattr(message, "group_openid", None)
                 or getattr(message, "group_id", None)
             )
+            # 临时调试：采集 openid 用于配置白名单，确认后可删除本行
+            logger.info(
+                "[openid采集] group_openid=%s member_openid=%s content=%s",
+                group_id,
+                self._extract_member_id(message),
+                (message.content or "")[:50],
+            )
             if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
                 logger.info("非授权群消息已忽略: %s", group_id)
                 return
