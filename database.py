@@ -100,8 +100,7 @@ CREATE TABLE IF NOT EXISTS publication_claims (
 
 # 待超管确认的发布申请：老师发布 → 私聊超管 → 同意入库 / 拒绝丢弃。
 # 存整理好的完整字段与原始来源，超管确认前不写 competitions，群内看不到。
-_PENDING_PUBLICATIONS_DDL = """
-CREATE TABLE IF NOT EXISTS pending_publications (
+_PENDING_PUBLICATIONS_DDL = """CREATE TABLE IF NOT EXISTS pending_publications (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id        TEXT NOT NULL DEFAULT '',
     name            TEXT NOT NULL DEFAULT '',
@@ -117,6 +116,26 @@ CREATE TABLE IF NOT EXISTS pending_publications (
     status          TEXT NOT NULL DEFAULT 'pending',
     decided_by      TEXT NOT NULL DEFAULT '',
     decided_at      TEXT NOT NULL DEFAULT ''
+)
+"""
+
+# 运行时白名单：超管用 /加群 /加老师 动态扩充，与 .env 基线取并集。
+# 超管白名单不在此表，只能通过配置文件指定，避免运行时提权失控。
+_RUNTIME_WHITELIST_DDL = """
+CREATE TABLE IF NOT EXISTS runtime_allowed_groups (
+    group_id    TEXT PRIMARY KEY,
+    note        TEXT NOT NULL DEFAULT '',
+    added_by    TEXT NOT NULL DEFAULT '',
+    added_at    TEXT NOT NULL DEFAULT ''
+)
+"""
+
+_RUNTIME_TEACHER_DDL = """
+CREATE TABLE IF NOT EXISTS runtime_teachers (
+    user_id     TEXT PRIMARY KEY,
+    note        TEXT NOT NULL DEFAULT '',
+    added_by    TEXT NOT NULL DEFAULT '',
+    added_at    TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -322,6 +341,8 @@ _ALL_DDL = (
     _MAIN_DDL, _REMIND_DDL,
     _COMPETITIONS_DDL, _WEEKLY_CONTEST_RUNS_DDL, _PUBLICATION_CLAIMS_DDL,
     _PENDING_PUBLICATIONS_DDL,
+    _RUNTIME_WHITELIST_DDL,
+    _RUNTIME_TEACHER_DDL,
     _COMPETITION_SOURCES_DDL, _COMPETITION_VERSIONS_DDL,
     _PENDING_UPDATES_DDL,
     _ORG_EVENTS_DDL,
@@ -2759,3 +2780,93 @@ def reject_pending_update(update_id: int, operator: str = "", note: str = "") ->
                   str(pending["competition_id"]), "",
                   f"拒绝更新：{note or '未说明原因'}", conn=conn)
         return True
+
+
+# =====================================================================
+# 运行时白名单（超管 /加群 /加老师 动态扩充）
+# =====================================================================
+
+def list_runtime_groups() -> list[dict]:
+    """列出运行时添加的允许群。"""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT group_id, note, added_by, added_at FROM runtime_allowed_groups"
+            " ORDER BY added_at DESC"
+        ).fetchall()
+    return [
+        {"group_id": r[0], "note": r[1], "added_by": r[2], "added_at": r[3]}
+        for r in rows
+    ]
+
+
+def add_runtime_group(group_id: str, operator: str = "", note: str = "") -> bool:
+    """添加运行时允许群；已存在返回 False。"""
+    gid = _as_str(group_id)
+    if not gid:
+        raise ValueError("群号不能为空")
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO runtime_allowed_groups"
+            " (group_id, note, added_by, added_at) VALUES (?, ?, ?, ?)",
+            (gid, _as_str(note or ""), _as_str(operator or ""), now_str()),
+        )
+        if cur.rowcount:
+            add_audit(operator, gid, "add_group", "runtime_whitelist", gid,
+                      "", note or "", conn=conn)
+        return bool(cur.rowcount)
+
+
+def remove_runtime_group(group_id: str, operator: str = "") -> bool:
+    """删除运行时允许群（不影响 .env 基线）。"""
+    gid = _as_str(group_id)
+    with _connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM runtime_allowed_groups WHERE group_id = ?", (gid,)
+        )
+        if cur.rowcount:
+            add_audit(operator, gid, "remove_group", "runtime_whitelist", gid,
+                      "", "", conn=conn)
+        return bool(cur.rowcount)
+
+
+def list_runtime_teachers() -> list[dict]:
+    """列出运行时添加的老师。"""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT user_id, note, added_by, added_at FROM runtime_teachers"
+            " ORDER BY added_at DESC"
+        ).fetchall()
+    return [
+        {"user_id": r[0], "note": r[1], "added_by": r[2], "added_at": r[3]}
+        for r in rows
+    ]
+
+
+def add_runtime_teacher(user_id: str, operator: str = "", note: str = "") -> bool:
+    """添加运行时老师；已存在返回 False。"""
+    uid = _as_str(user_id)
+    if not uid:
+        raise ValueError("QQ 号不能为空")
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO runtime_teachers"
+            " (user_id, note, added_by, added_at) VALUES (?, ?, ?, ?)",
+            (uid, _as_str(note or ""), _as_str(operator or ""), now_str()),
+        )
+        if cur.rowcount:
+            add_audit(operator, "", "add_teacher", "runtime_whitelist", uid,
+                      "", note or "", conn=conn)
+        return bool(cur.rowcount)
+
+
+def remove_runtime_teacher(user_id: str, operator: str = "") -> bool:
+    """删除运行时老师（不影响 .env 基线）。"""
+    uid = _as_str(user_id)
+    with _connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM runtime_teachers WHERE user_id = ?", (uid,)
+        )
+        if cur.rowcount:
+            add_audit(operator, "", "remove_teacher", "runtime_whitelist", uid,
+                      "", "", conn=conn)
+        return bool(cur.rowcount)
