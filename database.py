@@ -336,10 +336,57 @@ def _clean_time(value) -> str:
     if not s:
         return ""
     try:
-        datetime.strptime(s, "%Y-%m-%d %H:%M")
+        parsed = datetime.strptime(s, "%Y-%m-%d %H:%M")
     except ValueError:
         raise ValueError(f"时间格式非法（应为 YYYY-MM-DD HH:MM）: {s}") from None
-    return s
+    return parsed.strftime("%Y-%m-%d %H:%M")
+
+
+def _canonical_time(text: str) -> str:
+    """同一北京时间使用同一存储身份；旧秒级时间保留非零秒，非法旧值原样保留。"""
+    parsed = _delivery_parse_time(text)
+    if parsed is None:
+        return text
+    fmt = "%Y-%m-%d %H:%M:%S" if parsed.second else "%Y-%m-%d %H:%M"
+    return parsed.strftime(fmt)
+
+
+def _migrate_business_times(conn: sqlite3.Connection) -> None:
+    """只规范化运行中的业务日期，不改审计和历史版本中的原始资料。"""
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    columns = {
+        "contests": ("reg_deadline", "contest_time"),
+        "competitions": ("official_reg_start", "official_reg_deadline", "official_time"),
+        "collections": ("deadline",),
+        "org_events": ("reg_deadline", "contest_time", "effective_start", "effective_end"),
+        "training_sessions": ("effective_start", "effective_end"),
+    }
+    for table, fields in columns.items():
+        for row in conn.execute(f"SELECT id, {', '.join(fields)} FROM {table}").fetchall():
+            changed = {}
+            for field, value in zip(fields, row[1:]):
+                canonical = _canonical_time(value)
+                if canonical != value:
+                    changed[field] = canonical
+            if changed:
+                sets = ", ".join(f"{field} = ?" for field in changed)
+                conn.execute(f"UPDATE {table} SET {sets} WHERE id = ?", [*changed.values(), row[0]])
+
+    # 旧版成功标记也按真实时刻合并，避免仅改变补零格式后再发一次。
+    grouped: dict[tuple, list[tuple]] = {}
+    for row in conn.execute(
+        "SELECT id, group_id, contest_id, remind_type, target_time, sent_at FROM reminders ORDER BY id"
+    ).fetchall():
+        identity = (*row[1:4], _canonical_time(row[4]))
+        grouped.setdefault(identity, []).append(row)
+    for identity, rows in grouped.items():
+        winner = min(rows, key=lambda row: (row[5], row[0]))
+        for row in rows:
+            if row[0] != winner[0]:
+                conn.execute("DELETE FROM reminders WHERE id = ?", (row[0],))
+        if winner[4] != identity[3]:
+            conn.execute("UPDATE reminders SET target_time = ? WHERE id = ?", (identity[3], winner[0]))
 
 
 def now_str() -> str:
@@ -385,6 +432,7 @@ def init_db() -> None:
         for ddl in _ALL_DDL:
             conn.execute(ddl)
         _migrate_v1(conn)
+        _migrate_business_times(conn)
         _migrate_reminder_deliveries(conn)
         for ddl in _INDEX_DDL:
             conn.execute(ddl)
@@ -401,8 +449,8 @@ def save_contest(group_id: str, info: dict) -> int:
     values = (
         group_id.strip(),
         _as_str(info.get("name")),
-        _as_str(info.get("reg_deadline") or ""),
-        _as_str(info.get("contest_time") or ""),
+        _canonical_time(_as_str(info.get("reg_deadline") or "")),
+        _canonical_time(_as_str(info.get("contest_time") or "")),
         _as_str(info.get("mode") or ""),
         _as_str(info.get("location") or ""),
         _as_str(info.get("source_link") or ""),
@@ -505,6 +553,7 @@ def delete_contest(group_id: str, cid: int) -> bool:
 
 def has_reminded(group_id: str, contest_id: int, remind_type: str, target_time: str) -> bool:
     """是否已对该（比赛, 类型, 目标时间）发过提醒。"""
+    target_time = _canonical_time(target_time)
     with _connect() as conn:
         row = conn.execute(
             "SELECT 1 FROM reminders WHERE group_id=? AND contest_id=? AND remind_type=? AND target_time=?",
@@ -515,6 +564,7 @@ def has_reminded(group_id: str, contest_id: int, remind_type: str, target_time: 
 
 def mark_reminded(group_id: str, contest_id: int, remind_type: str, target_time: str) -> bool:
     """标记已提醒（发送成功后才可调用）。"""
+    target_time = _canonical_time(target_time)
     with _connect() as conn:
         cur = conn.execute(
             "INSERT OR IGNORE INTO reminders (group_id, contest_id, remind_type, target_time, sent_at)"
@@ -1555,8 +1605,12 @@ def register_collection(cid: int, group_id: str, member_id: str,
             return False, "征集不属于本群"
         if coll["status"] != "open":
             return False, "征集已结束或取消，无法报名"
-        if coll["deadline"] and coll["deadline"] <= now_str()[:16]:
-            return False, "已超过征集截止时间"
+        if coll["deadline"]:
+            deadline = _delivery_parse_time(coll["deadline"])
+            if deadline is None:
+                return False, "征集截止时间无效，请联系老师"
+            if deadline <= _delivery_parse_time(now_str()):
+                return False, "已超过征集截止时间"
         try:
             declared = json.loads(coll["fields_json"] or "[]")
         except (ValueError, TypeError):
@@ -1738,7 +1792,7 @@ def _row_to_delivery(r: sqlite3.Row) -> dict:
 
 def delivery_dedup_key(group_id: str, obj_type: str, obj_id: int,
                        remind_type: str, target_time: str) -> str:
-    return f"{group_id}|{obj_type}|{obj_id}|{remind_type}|{target_time}"
+    return f"{group_id}|{obj_type}|{obj_id}|{remind_type}|{_canonical_time(target_time)}"
 
 
 def _canonical_delivery_key(key: str) -> str:
@@ -1761,10 +1815,21 @@ def _migrate_reminder_deliveries(conn: sqlite3.Connection) -> None:
     for column in ("lease_token", "lease_until"):
         if column not in cols:
             conn.execute(f"ALTER TABLE reminder_deliveries ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+    # 成功事实保留原始记录，并为旧时间格式补规范身份；状态投影失败的成功也不能重发。
+    for key, token, sent_at in conn.execute(
+        "SELECT dedup_key, lease_token, sent_at FROM reminder_success_receipts ORDER BY sent_at"
+    ).fetchall():
+        canonical = _canonical_delivery_key(key)
+        if canonical != key:
+            conn.execute(
+                "INSERT OR IGNORE INTO reminder_success_receipts (dedup_key, lease_token, sent_at) VALUES (?, ?, ?)",
+                (canonical, token, sent_at),
+            )
     rows = conn.execute(f"SELECT {_DELIVERY_COLS} FROM reminder_deliveries ORDER BY id").fetchall()
     grouped: dict[tuple, list[dict]] = {}
     for row in rows:
         delivery = _row_to_delivery(row)
+        delivery["target_time"] = _canonical_time(delivery["target_time"])
         identity = tuple(delivery[k] for k in ("group_id", "obj_type", "obj_id", "remind_type", "target_time"))
         grouped.setdefault(identity, []).append(delivery)
     rank = {"sent": 6, "sending": 5, "pending": 4, "failed": 3, "expired": 2, "cancelled": 1}
@@ -1775,8 +1840,8 @@ def _migrate_reminder_deliveries(conn: sqlite3.Connection) -> None:
                 conn.execute("DELETE FROM reminder_deliveries WHERE id = ?", (delivery["id"],))
         key = delivery_dedup_key(*identity)
         conn.execute(
-            "UPDATE reminder_deliveries SET dedup_key = ?, attempts = ? WHERE id = ?",
-            (key, max(d["attempts"] for d in deliveries), winner["id"]),
+            "UPDATE reminder_deliveries SET dedup_key = ?, target_time = ?, attempts = ? WHERE id = ?",
+            (key, identity[4], max(d["attempts"] for d in deliveries), winner["id"]),
         )
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_identity ON reminder_deliveries"
@@ -1803,9 +1868,11 @@ def _delivery_now(now: datetime | None = None) -> datetime:
 
 
 def _delivery_parse_time(text: str) -> datetime | None:
+    if not isinstance(text, str):
+        return None
     for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M"):
         try:
-            return datetime.strptime(text, fmt).replace(tzinfo=TZ)
+            return datetime.strptime(text.strip(), fmt).replace(tzinfo=TZ)
         except (ValueError, TypeError):
             continue
     return None
@@ -1822,14 +1889,14 @@ def _delivery_invalid_status(conn: sqlite3.Connection, delivery: dict,
         row = conn.execute(
             "SELECT group_id, status, deadline FROM collections WHERE id = ?", (delivery["obj_id"],)
         ).fetchone()
-        if row is None or row[0] != delivery["group_id"] or row[1] != "open" or row[2] != delivery["target_time"]:
+        if row is None or row[0] != delivery["group_id"] or row[1] != "open" or _canonical_time(row[2]) != delivery["target_time"]:
             return "cancelled"
     elif delivery["obj_type"] == "competition":
         field = {"reg_deadline": "official_reg_deadline", "contest_time": "official_time"}.get(delivery["remind_type"])
         if field is None:
             return "cancelled"
         row = conn.execute(f"SELECT status, {field} FROM competitions WHERE id = ?", (delivery["obj_id"],)).fetchone()
-        if row is None or row[0] != "confirmed" or row[1] != delivery["target_time"]:
+        if row is None or row[0] != "confirmed" or _canonical_time(row[1]) != delivery["target_time"]:
             return "cancelled"
     else:
         return "cancelled"
@@ -1879,6 +1946,7 @@ def claim_delivery(group_id: str, obj_type: str, obj_id: int, remind_type: str,
     if max_attempts < 1 or lease_seconds < 1:
         raise ValueError("提醒尝试次数和发送租约必须大于零")
     now = _delivery_now(now)
+    target_time = _canonical_time(target_time)
     key = delivery_dedup_key(group_id, obj_type, obj_id, remind_type, target_time)
     if allowed_groups is not None and group_id not in allowed_groups:
         return None
@@ -1992,6 +2060,7 @@ def finish_delivery(dedup_key: str, token: str, ok: bool, *, error: str = "",
 def ensure_delivery(group_id: str, obj_type: str, obj_id: int,
                     remind_type: str, target_time: str) -> bool:
     """登记一条待发送提醒（幂等：同去重键只建一次）。返回是否新创建。"""
+    target_time = _canonical_time(target_time)
     key = delivery_dedup_key(group_id, obj_type, obj_id, remind_type, target_time)
     with _connect() as conn:
         cur = conn.execute(
