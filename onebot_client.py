@@ -10,6 +10,7 @@
 import asyncio
 import json
 import logging
+import time
 from typing import Awaitable, Callable
 
 import websockets
@@ -81,10 +82,16 @@ class OneBotMessage:
 class OneBotClient:
     """正向 WebSocket 客户端：接收事件 + 调用 OneBot API。"""
 
-    def __init__(self, ws_url: str, token: str = "", reconnect_delay: float = 5.0):
+    def __init__(self, ws_url: str, token: str = "", reconnect_delay: float = 5.0,
+                 idle_timeout: float = 180.0):
         self.ws_url = ws_url
         self.token = token
         self.reconnect_delay = reconnect_delay
+        # 静默超时：超过这么久收不到任何事件（含心跳）就主动断开重连。
+        # 用于兜住 TCP 半开连接——那种情况下读循环会永远阻塞，
+        # 既不报错也不重连，表现为「没动它自己就不回消息了」。
+        self.idle_timeout = idle_timeout
+        self._last_rx = 0.0
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._pending: dict[str, asyncio.Future] = {}
         self._echo_seq = 0
@@ -95,12 +102,23 @@ class OneBotClient:
 
     async def start(self) -> None:
         """常驻入口：连接成功进入事件循环，异常/断开后自动重连。"""
+        failures = 0
         while True:
             try:
                 await self._run_once()
+                failures = 0
             except Exception:
+                failures += 1
                 logger.exception("OneBot 连接异常，%.1fs 后重连", self.reconnect_delay)
             await asyncio.sleep(self.reconnect_delay)
+            # 一直连不上通常是 NapCat 侧 QQ 已退出登录，需要人工重新扫码
+            if failures and failures % 6 == 0:
+                logger.error(
+                    "OneBot 已连续 %d 次连接失败（约 %.0f 秒）。"
+                    "若 NapCat WebUI 显示账号离线，需要在 NapCat 重新扫码登录，"
+                    "本程序会自动等待并重连。",
+                    failures, failures * self.reconnect_delay,
+                )
 
     async def _run_once(self) -> None:
         headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
@@ -108,14 +126,42 @@ class OneBotClient:
             self.ws_url, additional_headers=headers, max_size=4 * 1024 * 1024
         ) as ws:
             self._ws = ws
+            self._last_rx = time.monotonic()
             logger.info("OneBot 已连接: %s", self.ws_url)
             if self.on_ready is not None:
                 await self.on_ready()
-            await self._read_loop(ws)
+            watchdog = asyncio.create_task(self._idle_watchdog(ws))
+            try:
+                await self._read_loop(ws)
+            finally:
+                watchdog.cancel()
+                self._ws = None
+
+    async def _idle_watchdog(self, ws) -> None:
+        """静默看门狗：长时间没有任何事件就主动断开，交给外层重连。"""
+        if self.idle_timeout <= 0:
+            return
+        # 检查频率随超时缩放：180 秒超时 → 每 60 秒查一次；不超过 60 秒一次。
+        interval = max(1.0, min(self.idle_timeout / 3, 60.0))
+        while True:
+            await asyncio.sleep(interval)
+            idle = time.monotonic() - self._last_rx
+            if idle > self.idle_timeout:
+                logger.warning(
+                    "OneBot 已静默 %.0f 秒（阈值 %.0f 秒），主动断开以触发重连",
+                    idle, self.idle_timeout,
+                )
+                try:
+                    await ws.close()
+                except Exception:  # noqa: BLE001
+                    logger.debug("关闭静默连接时出错", exc_info=True)
+                return
 
     async def _read_loop(self, ws) -> None:
         """读取循环：API 回执同步 resolve，消息事件异步派发（不阻塞回执读取）。"""
         async for raw in ws:
+            # 任何一帧（含心跳）都算连接活跃
+            self._last_rx = time.monotonic()
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:

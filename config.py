@@ -113,6 +113,10 @@ ONEBOT_WS_URL = os.getenv("ACM_ONEBOT_WS_URL", "")
 ONEBOT_TOKEN = os.getenv("ACM_ONEBOT_TOKEN", "")
 # 机器人自身 QQ 号（用于识别群内 @ 目标；缺省使用 OneBot 事件的 self_id）
 BOT_QQ = os.getenv("ACM_BOT_QQ", "")
+# WebSocket 静默超时（秒）：超过该时长收不到任何事件（含 NapCat 心跳）就主动
+# 断开重连，用于兜住 TCP 半开连接导致的「机器人突然不回消息且不恢复」。
+# NapCat 默认心跳 5 秒左右，180 秒足够宽松；设 0 可关闭该看门狗。
+WS_IDLE_TIMEOUT_SECONDS = float(os.getenv("ACM_WS_IDLE_TIMEOUT_SECONDS", "180"))
 # 普通 QQ 无平台主动消息限制；保留开关以便在需要时暂停提醒投递。
 GROUP_ACTIVE_MESSAGES_ENABLED = os.getenv("ACM_GROUP_ACTIVE_MESSAGES_ENABLED", "1") == "1"
 

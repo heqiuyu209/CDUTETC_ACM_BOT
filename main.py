@@ -818,6 +818,7 @@ def run_bot() -> None:
     client = OneBotClient(
         ws_url=config.ONEBOT_WS_URL,
         token=config.ONEBOT_TOKEN,
+        idle_timeout=config.WS_IDLE_TIMEOUT_SECONDS,
     )
     ACMBot(client)
     try:

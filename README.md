@@ -88,6 +88,7 @@ python scripts/export_collection.py --group-id '群openid' --collection-id 1 --o
 | `ACM_LLM_API_KEY` | **是** | - | 大模型 API Key（OpenAI 兼容） |
 | `ACM_ONEBOT_TOKEN` | 否 | 空 | OneBot 鉴权 token，与 NapCat 配置一致 |
 | `ACM_BOT_QQ` | 否 | 空 | 机器人自身 QQ 号；留空用 OneBot 事件 `self_id` |
+| `ACM_WS_IDLE_TIMEOUT_SECONDS` | 否 | `180` | WebSocket 静默超时（秒），超时主动重连，兜住 TCP 半开导致的「突然不回消息」；`0` 关闭 |
 | `ACM_ALLOWED_GROUPS` | 否 | 空 | 允许服务的群号（逗号分隔）。**未配置 = 不服务任何群** |
 | `ACM_SUPER_ADMIN` | 否 | 空 | 超管 QQ 号（逗号分隔）：`/修正`、审批发布、私聊管理命令。**未配置 = 无任何超管权限** |
 | `ACM_TEACHER_WHITELIST` | 否 | 空 | 老师 QQ 号（逗号分隔）：发布比赛、课程/FAQ/征集管理。**未配置 = 无任何老师权限** |
