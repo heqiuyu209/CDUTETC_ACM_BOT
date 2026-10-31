@@ -4,6 +4,7 @@ import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
@@ -33,13 +34,13 @@ async def bot(memory_db, monkeypatch):
     monkeypatch.setattr(config, "WEEKLY_CONTEST_START", "19:00")
     monkeypatch.setattr(config, "WEEKLY_CONTEST_END", "21:00")
     monkeypatch.setattr(config, "WEEKLY_CONTEST_TEMPLATE", "ACM 周赛（本周）")
-    client = main.ACMBot()
+    client = main.ACMBot(SimpleNamespace(send_group_msg=AsyncMock(return_value=True)))
     monkeypatch.setattr(client, "_send_group_log_only", AsyncMock(return_value=False))
     return client
 
 
 def _now(day=1):
-    return datetime(2026, 11, day, 19, 0, tzinfo=BEIJING)
+    return datetime(2026, 11, day, 18, 0, tzinfo=BEIJING)
 
 
 def _info(name="ACM 周赛（本周）"):
@@ -79,7 +80,7 @@ async def test_same_week_remains_idempotent_after_restart_and_amendment(bot, mem
     monkeypatch.setattr(config, "WEEKLY_CONTEST_END", "22:00")
 
     await bot._weekly_contest_job(now=_now())
-    restarted = main.ACMBot()
+    restarted = main.ACMBot(SimpleNamespace(send_group_msg=AsyncMock(return_value=True)))
     await restarted._weekly_contest_job(now=_now())
 
     competitions = database.list_competitions()
