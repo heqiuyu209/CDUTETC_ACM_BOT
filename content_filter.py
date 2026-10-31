@@ -157,6 +157,28 @@ def question_match_score(question: str, stored: str) -> float:
     return record_match_score(question, stored)
 
 
+# 「问机器人能做什么」的措辞特征：情态词 + 能力相关名词同时出现才算。
+_CAPABILITY_MODAL = ("能", "会", "可以", "支持", "有没有", "是否", "能否")
+_CAPABILITY_ACTION = (
+    "自动", "定时", "提醒", "功能", "做什么", "干什么", "干嘛", "会什么",
+)
+
+
+def is_capability_query(text: str) -> bool:
+    """是否在问机器人自身能力（「周赛你能自动提醒吗」「你有什么功能」）。
+
+    这类问题必须用固定话术回答，不能交给模型自由发挥——否则模型会
+    编出「我不能定时提醒」「我没有数据库权限」这类与事实相反的结论。
+    """
+    t = (text or "").lower()
+    if not t:
+        return False
+    return (
+        any(m in t for m in _CAPABILITY_MODAL)
+        and any(a in t for a in _CAPABILITY_ACTION)
+    )
+
+
 # ----------------------------------------------------------------------
 # 1) 话题范围硬限制：本地意图判断（不调 LLM）
 # ----------------------------------------------------------------------

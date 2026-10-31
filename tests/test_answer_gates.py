@@ -394,3 +394,30 @@ async def test_answer_question_closes_and_indexes_faq(memory_db, monkeypatch):
     )
     assert "本周日 19:00 机房" in replies[0]["text"]
     chat.assert_not_awaited()
+
+
+# ----------------------------------------------------------------------
+# 9) 能力类提问：固定话术，不能让模型臆造「我不能自动提醒」
+# ----------------------------------------------------------------------
+def test_capability_query_detected():
+    for question in ("周赛你能自动提醒吗", "你能自动提醒吗", "机器人有什么功能", "你会做什么"):
+        assert content_filter.is_capability_query(question)
+
+
+def test_normal_question_is_not_capability_query():
+    for question in ("这周有周赛吗", "这周有课吗", "比赛什么时候提醒"):
+        assert not content_filter.is_capability_query(question)
+
+
+async def test_capability_question_uses_fixed_text_without_model(monkeypatch):
+    """能力类问题必须走固定话术，不产生模型调用（否则会说不能提醒）。"""
+    chat = AsyncMock(return_value="我这边不能主动定时自动提醒")
+    monkeypatch.setattr(llm, "_chat_once", chat)
+
+    for staff in (True, False):
+        replies = await commands.handle_non_command_message(
+            "周赛你能自动提醒吗", "g1", "someone", staff=staff
+        )
+        assert replies[0]["text"] == commands.CAPABILITY_TEXT
+        assert "自动提醒" in replies[0]["text"]
+    chat.assert_not_awaited()

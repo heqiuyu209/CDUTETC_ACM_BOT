@@ -894,6 +894,19 @@ async def _answer_from_knowledge_base(text: str, group_id: str) -> str | None:
     return None
 
 
+# 机器人能力说明：由固定话术回答，不走模型，避免模型臆造「做不到」
+CAPABILITY_TEXT = """【我能做的事】
+- 问答：比赛、课程、校安排、FAQ 都能查；查不到会自动转给老师
+- 自动提醒：比赛报名截止 / 开赛、征集截止、课程开课，临近时我会主动发到群里
+  （默认提前 24 小时和 1 小时各提醒一次，不需要谁 @ 我）
+- 发布比赛：老师 @我 发「发布 <链接>」→ 我整理后私聊超管确认 → 同意后入库并通知各群
+- 征集报名：老师发起征集，同学用 /报名
+- 课程与 FAQ：老师维护，同学查询
+- 群与老师授权：超管用 /加群 /加老师，立即生效
+
+想改提醒时间点，可以找超管调整（提前多久、提醒几次都能配）。"""
+
+
 async def handle_non_command_message(text: str, group_id: str, sender: str,
                                      staff: bool = False) -> list[dict]:
     """非命令消息问答。
@@ -907,6 +920,9 @@ async def handle_non_command_message(text: str, group_id: str, sender: str,
     faq = match_faq(group_id, text)
     if faq is not None:
         return [{"group_id": group_id, "text": f"Q：{faq['question']}\nA：{faq['answer']}"}]
+    # 能力类提问用固定话术，避免模型臆造「我不能自动提醒」这类错误结论
+    if content_filter.is_capability_query(text):
+        return [{"group_id": group_id, "text": CAPABILITY_TEXT}]
     # 算法话题（题解/思路/概念科普）一律不调模型，FAQ 已优先命中，避免浪费 token
     if config.QA_PROBLEM_GATE_ENABLED and content_filter.is_algorithm_query(text):
         return [{"group_id": group_id, "text": config.QA_PROBLEM_REPLY}]
