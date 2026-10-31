@@ -7,12 +7,104 @@
 """
 
 import os
+import shutil
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+BASE_DIR = Path(__file__).resolve().parent
+ENV_FILE = BASE_DIR / ".env"
+ENV_EXAMPLE = BASE_DIR / ".env.example"
+
+
+def _bootstrap_env_file() -> bool:
+    """首次运行时用 .env.example 生成 .env，避免用户漏配必填项。
+
+    只在 .env 不存在时创建，绝不覆盖已有文件（保护真实密钥）。
+    Returns: 是否新建了 .env。
+    """
+    if ENV_FILE.exists() or not ENV_EXAMPLE.exists():
+        return False
+    try:
+        shutil.copyfile(ENV_EXAMPLE, ENV_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def _env_keys(text: str) -> list[str]:
+    """解析 .env 文本里已定义的键（忽略注释与空行）。"""
+    keys: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        keys.append(stripped.split("=", 1)[0].strip())
+    return [k for k in keys if k]
+
+
+def _sync_env_keys() -> list[str]:
+    """把 .env.example 里有、而 .env 里缺的键追加到 .env 末尾。
+
+    只追加缺失键，绝不修改或删除已有行（保护已填写的真实值）。
+    这样拉取新版本后新增的配置项会自动出现在 .env 里，用户只需补值。
+    Returns: 本次追加的键名列表。
+    """
+    if not ENV_FILE.exists() or not ENV_EXAMPLE.exists():
+        return []
+    try:
+        current_text = ENV_FILE.read_text(encoding="utf-8")
+        template_text = ENV_EXAMPLE.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    existing = set(_env_keys(current_text))
+
+    # 按「注释块 + 赋值行」分组，补齐时保留原有说明文字
+    blocks: list[tuple[list[str], str, str]] = []
+    comments: list[str] = []
+    for line in template_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            comments = []
+            continue
+        if stripped.startswith("#"):
+            comments.append(line)
+            continue
+        if "=" not in stripped:
+            comments = []
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        blocks.append((comments, line, key))
+        comments = []
+
+    additions: list[str] = []
+    added_keys: list[str] = []
+    for comments, assignment, key in blocks:
+        if not key or key in existing:
+            continue
+        additions.extend(comments)
+        additions.append(assignment)
+        added_keys.append(key)
+
+    if not additions:
+        return []
+    try:
+        with ENV_FILE.open("a", encoding="utf-8") as handle:
+            if not current_text.endswith("\n"):
+                handle.write("\n")
+            handle.write("\n# ===== 以下为本次自动补齐的新增配置项 =====\n")
+            handle.write("\n".join(additions))
+            handle.write("\n")
+    except OSError:
+        return []
+    return added_keys
+
+
+ENV_CREATED = _bootstrap_env_file()
+ENV_ADDED_KEYS = _sync_env_keys()
+
 # 加载项目根目录下的 .env（若存在）。系统环境变量优先，.env 不覆盖已注入的值。
-load_dotenv(Path(__file__).resolve().parent / ".env")
+load_dotenv(ENV_FILE, override=False)
 
 # ================= QQ 机器人接入（OneBot/NapCat，必填） =================
 # NapCatQQ 正向 WebSocket 地址，例如 ws://127.0.0.1:3001
@@ -220,14 +312,21 @@ FETCH_MIN_INTERVAL_MINUTES = int(os.getenv("ACM_FETCH_MIN_INTERVAL_MINUTES", "60
 # 自动抓取生成的记录默认不通知全员，由超管确认后处理（/修正 或 /比赛详情 人工核对）。
 
 # ================= 本地数据 =================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.getenv("ACM_DB_PATH", os.path.join(BASE_DIR, "contests.db"))
+# 本地数据目录：沿用上面已解析的项目根目录（字符串形式）
+DB_PATH = os.getenv("ACM_DB_PATH", os.path.join(str(BASE_DIR), "contests.db"))
 
 # ================= 启动前配置检查 =================
 
 REQUIRED_CONFIG = {
     "ACM_ONEBOT_WS_URL": ONEBOT_WS_URL,
     "ACM_LLM_API_KEY": LLM_API_KEY,
+}
+
+# 不影响启动、但不配就等于没有功能的配置项（启动时只告警）
+RECOMMENDED_CONFIG = {
+    "ACM_ALLOWED_GROUPS": ENV_ALLOWED_GROUPS,
+    "ACM_TEACHER_WHITELIST": ENV_TEACHER_WHITELIST,
+    "ACM_SUPER_ADMIN": SUPER_ADMIN,
 }
 
 
@@ -238,3 +337,8 @@ def check_config() -> None:
         raise RuntimeError(
             "缺少必要配置（请通过环境变量设置）: " + ", ".join(missing)
         )
+
+
+def describe_empty_config() -> list[str]:
+    """返回「已识别但留空」的建议配置项名，供启动日志提示。"""
+    return [name for name, value in RECOMMENDED_CONFIG.items() if not value]

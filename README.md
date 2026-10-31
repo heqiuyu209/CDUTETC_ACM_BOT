@@ -140,6 +140,19 @@ python scripts/export_collection.py --group-id '群openid' --collection-id 1 --o
 
 完整可复制模板见 [`.env.example`](.env.example)。
 
+### 配置引导（拉取即填）
+
+1. 拉取代码后**直接运行** `python scripts/check_env.py` 或 `python main.py`：
+   若没有 `.env`，程序会按 `.env.example` 自动生成一份，然后把当前缺哪些必填项列出来。
+2. 新版本新增的配置项会**自动追加**到已有 `.env` 末尾（只补缺失键，绝不覆盖你已填的值）。
+3. 按提示填好 `ACM_ONEBOT_WS_URL`、`ACM_LLM_API_KEY`、`ACM_ALLOWED_GROUPS`、
+   `ACM_SUPER_ADMIN`、`ACM_TEACHER_WHITELIST`，再跑一次体检脚本确认即可启动。
+
+```bash
+python scripts/check_env.py   # 体检：列出已填/未填，退出码 0 表示必填齐全
+python main.py                # 启动
+```
+
 启动前 `check_config()` 会校验必填项，缺失时抛出缺失项名（不打印密钥值）。**密钥一律不进源码 / 日志 / 测试**。
 
 ## 安装与测试

@@ -804,7 +804,17 @@ class ACMBot:
 
 def run_bot() -> None:
     """启动入口：配置检查 → 创建 OneBot 客户端 → 常驻连接。"""
+    if config.ENV_CREATED:
+        logger.warning(
+            "未找到 .env，已按 .env.example 生成：%s\n"
+            "请填写 ACM_ONEBOT_WS_URL、ACM_LLM_API_KEY、ACM_ALLOWED_GROUPS、"
+            "ACM_SUPER_ADMIN、ACM_TEACHER_WHITELIST 后重新启动。",
+            config.ENV_FILE,
+        )
     config.check_config()
+    empty = config.describe_empty_config()
+    if empty:
+        logger.warning("以下配置留空，对应功能不会生效: %s", ", ".join(empty))
     client = OneBotClient(
         ws_url=config.ONEBOT_WS_URL,
         token=config.ONEBOT_TOKEN,
