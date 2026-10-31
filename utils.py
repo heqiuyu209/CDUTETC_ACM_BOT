@@ -91,11 +91,19 @@ def is_super_admin(member_id: str | None) -> bool:
 
 
 def is_teacher(member_id: str | None) -> bool:
-    """老师 = 教师白名单成员（可免审发布比赛/管理课程/FAQ/发起征集/查看征集汇总）。
-    默认全拒绝。"""
+    """老师 = 教师白名单成员。默认全拒绝。"""
     return bool(member_id) and member_id in config.TEACHER_WHITELIST
 
 
 def can_manage_group(member_id: str | None) -> bool:
     """老师和超管可管理课程/FAQ及查看管理状态；普通成员默认拒绝。"""
     return is_teacher(member_id) or is_super_admin(member_id)
+
+
+def admin_group_id() -> str:
+    """私聊管理命令作用的默认群：优先 ACM_ADMIN_GROUP，留空取允许群首个。"""
+    if config.ADMIN_GROUP:
+        return config.ADMIN_GROUP
+    if config.ALLOWED_GROUPS:
+        return sorted(config.ALLOWED_GROUPS)[0]
+    return ""

@@ -27,6 +27,10 @@ def bot(memory_db, monkeypatch, onebot_client):
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
     monkeypatch.setattr(config, "BOT_QQ", "")
+    # 五层防护默认开启：本组用例聚焦旧问答链路，显式关闭白名单与限流
+    # 以保持原有“普通成员可连续提问”的覆盖（两层的专门行为由 test_answer_gates 覆盖）
+    monkeypatch.setattr(config, "QA_WHITELIST_ENABLED", False)
+    monkeypatch.setattr(config, "QA_RATE_LIMIT_ENABLED", False)
     client = main.ACMBot(onebot_client)
     replies = []
 

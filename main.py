@@ -31,6 +31,7 @@ from onebot_client import OneBotClient, OneBotMessage
 
 import commands
 import config
+import content_filter
 import crawler
 import database as db
 from contest_fields import map_competition_info
@@ -39,9 +40,11 @@ from fetcher import FetchError, fetch_text
 from llm import extract_contest
 from reminder import check_general_reminders, check_reminders
 from utils import (
+    admin_group_id,
     extract_url,
     is_allowed_group,
     is_publish_command,
+    is_super_admin,
     is_teacher,
     mentioned_user_ids,
     strip_at,
@@ -116,12 +119,18 @@ def _weekly_contest_window(now: datetime):
 class ACMBot:
     """CDUTETC ACM 机器人：OneBot 协议接入普通 QQ 账号。"""
 
-    def __init__(self, client: OneBotClient):
+    def __init__(self, client: OneBotClient | None = None):
         self.client = client
         self.sched: AsyncIOScheduler | None = None
-        client.group_msg_handler = self.on_group_at_message_create
-        client.private_msg_handler = self.on_private_message_create
-        client.on_ready = self._on_ready
+        # 五层防护-4：频率防刷限流器（单用户滑动窗口，参数来自 config）
+        self._qa_rate_limiter = content_filter.RateLimiter(
+            config.QA_RATE_LIMIT_MAX_CALLS,
+            config.QA_RATE_LIMIT_SECONDS,
+        )
+        if client is not None:
+            client.group_msg_handler = self.on_group_at_message_create
+            client.private_msg_handler = self.on_private_message_create
+            client.on_ready = self._on_ready
 
     # ---------- 生命周期 ----------
 
@@ -180,9 +189,26 @@ class ACMBot:
     # ---------- 私聊消息路由 ----------
 
     async def on_private_message_create(self, message: OneBotMessage):
-        """私聊消息：回复确认收到，不记录原文。"""
+        """私聊消息：超管可发 /命令 私聊管理（FAQ/课程/校安排等），其余回执验证链路。
+        默认不记录私聊原文；初次部署采集白名单时设置 ACM_DEBUG_LOG_IDENTITY=1 临时开启。"""
         try:
             uid = message.user_id
+            content = message.content or ""
+            if config.DEBUG_LOG_IDENTITY:
+                logger.info("[私聊][调试] user_id=%s content=%s", uid, content[:50])
+            if content.strip().startswith("/") and is_super_admin(uid):
+                admin_gid = admin_group_id()
+                if not admin_gid:
+                    await self.client.send_private_msg(
+                        uid,
+                        "未配置允许群，无法定位管理群（请设置 ACM_ADMIN_GROUP 或 ACM_ALLOWED_GROUPS）",
+                    )
+                    return
+                replies = await commands.handle_command(content, admin_gid, uid)
+                for reply in replies or []:
+                    if reply.get("text"):
+                        await self.client.send_private_msg(uid, reply["text"])
+                return
             await self.client.send_private_msg(uid, f"收到（{uid}）")
         except Exception:
             logger.exception("私聊处理失败")
@@ -193,6 +219,15 @@ class ACMBot:
         reply_token = _reply_sequence.set(0)
         try:
             group_id = message.group_id
+            # 默认不记录群号/QQ号/消息内容，避免长期留存个人信息；
+            # 初次部署采集白名单时设置 ACM_DEBUG_LOG_IDENTITY=1 临时开启。
+            if config.DEBUG_LOG_IDENTITY:
+                logger.info(
+                    "[身份采集][调试] group_id=%s user_id=%s content=%s",
+                    group_id,
+                    getattr(message, "user_id", "") or "",
+                    (message.content or "")[:50],
+                )
             if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
                 logger.info("非授权群消息已忽略: %s", group_id)
                 return
@@ -214,7 +249,24 @@ class ACMBot:
                 return
             replies = await commands.handle_command(text, group_id, member_id)
             if replies is None:
+                # 非命令消息进入问答链路前，先过五层防护入口闸门
+                allowed, gate_reply = self._qa_gate(member_id, text)
+                if not allowed:
+                    if gate_reply:
+                        await self._safe_reply(message, gate_reply)
+                    return
                 replies = await commands.handle_non_command_message(text, group_id, member_id)
+                # 五层防护-5：输出过滤（FAQ/模型回答统一二次敏感检查、长度截断、禁超长链接）
+                if replies:
+                    replies = [
+                        {**reply, "text": content_filter.sanitize_output(
+                            reply.get("text", ""),
+                            max_length=config.QA_OUTPUT_MAX_LENGTH,
+                            max_link_length=config.QA_OUTPUT_MAX_LINK_LENGTH,
+                        )}
+                        for reply in replies
+                        if reply.get("text")
+                    ]
             cross_sent = 0
             cross_total = 0
             for reply in replies:
@@ -238,8 +290,60 @@ class ACMBot:
     # ---------- 内部处理 ----------
 
     def _extract_member_id(self, message: OneBotMessage) -> str:
-        """提取消息成员标识：OneBot 群消息直接取 user_id（QQ 号）。"""
-        return message.user_id
+        """提取消息成员标识。
+
+        OneBot 群消息直接取 user_id（QQ 号）；同时兼容旧 botpy 的
+        author.member_openid / 顶层 member_openid / author_id 等字段，
+        以便历史消息与测试消息都能稳定识别身份。返回统一字符串。
+        """
+        for attr in ("user_id", "member_openid", "author_id"):
+            value = getattr(message, attr, None)
+            if value not in (None, ""):
+                return str(value)
+        author = getattr(message, "author", None)
+        if author is not None:
+            for attr in ("member_openid", "user_id", "author_id"):
+                value = getattr(author, attr, None)
+                if value not in (None, ""):
+                    return str(value)
+        return ""
+
+    def _qa_gate(self, member_id: str, text: str) -> tuple[bool, str | None]:
+        """非命令消息进入问答链路前的输入侧闸门（五层防护中的 3/2/2.5/4 层）。
+
+        Returns:
+            (True, None)     放行进入问答链路；
+            (False, 话术)    拦截并回复话术（敏感内容 / 频率超限）；
+            (False, None)    拦截且忽略不回复（黑名单 / 非白名单成员）。
+        话题范围硬限制、算法话题拦截与输出过滤分别在 llm.answer_question、
+        commands.handle_non_command_message 与发送前完成。
+        """
+        # 五层防护-3：用户权限。黑名单命中直接忽略；
+        # 白名单开关开启且已配置白名单成员时，非白名单成员忽略。
+        # 白名单优先取显式 QA_WHITELIST；留空自动复用「老师 ∪ 超管」。
+        if config.QA_BLACKLIST and member_id in config.QA_BLACKLIST:
+            logger.info("问答已忽略（黑名单成员）: %s", member_id)
+            return False, None
+        whitelist = config.QA_WHITELIST or (config.TEACHER_WHITELIST | config.SUPER_ADMIN)
+        if (
+            config.QA_WHITELIST_ENABLED
+            and whitelist
+            and member_id not in whitelist
+        ):
+            logger.info("问答已忽略（非白名单成员）: %s", member_id)
+            return False, None
+
+        # 五层防护-2：敏感内容拦截（输入侧，llm 层另有双保险）
+        if config.QA_SENSITIVE_GATE_ENABLED and content_filter.has_sensitive(text):
+            logger.info("问答已拒绝（输入含敏感内容）: %s", member_id)
+            return False, config.QA_SENSITIVE_REPLY
+
+        # 五层防护-4：频率防刷（单用户滑动窗口限流）
+        if config.QA_RATE_LIMIT_ENABLED and not self._qa_rate_limiter.allow(member_id):
+            logger.info("问答已限流（成员 %s）", member_id)
+            return False, config.QA_RATE_LIMIT_REPLY
+
+        return True, None
 
     async def _handle_publish(self, message: OneBotMessage, text: str,
                               group_id: str, member_id: str):
@@ -303,6 +407,7 @@ class ACMBot:
             f"【新比赛发布】{info.get('name') or '未知'}\n"
             f"报名截止：{display_info.get('reg_deadline') or '待定'}\n"
             f"比赛时间：{display_info.get('contest_time') or '待定'}\n"
+            f"形式：{info.get('mode') or '待定'}｜地点：{info.get('location') or '待定'}\n"
             f"来源：{url}\n请及时查看并准备报名~"
         )
         targets = sorted(config.ALLOWED_GROUPS)

@@ -47,6 +47,81 @@ TEACHER_WHITELIST = {
 }
 # 发布命令前缀：授权成员发送“发布 <链接/信息>”才会入库，避免含链接的普通提问误触发
 PUBLISH_CMD = os.getenv("ACM_PUBLISH_CMD", "发布")
+# 私聊管理命令作用的默认群（超管私聊发 /FAQ添加、/课程添加 等命令时使用）；
+# 留空自动取 ALLOWED_GROUPS 中排序首个群号。
+ADMIN_GROUP = os.getenv("ACM_ADMIN_GROUP", "").strip()
+
+# ================= 回答限制（五层防护） =================
+# 在保留 llm.py 现有 system prompt 软约束的基础上，回答前增加五层硬限制：
+#   1) 话题范围硬限制：与 ACM 明显无关的问题不调模型，直接回复拒绝话术；
+#   2) 敏感内容拦截：用户输入 / 模型输出命中敏感词（政治、色情、暴力、广告、
+#      诈骗、涉密等）即拒绝；
+#   3) 用户权限：问答默认对全体群成员开放（学生本来就要提问）。
+#      显式配置 ACM_QA_WHITELIST 后仅白名单成员可问；留空则自动复用
+#      「老师白名单 ∪ 超管白名单」，若两者也为空则退化为群成员皆可提问。
+#      命中黑名单直接忽略不回复；
+#   4) 频率防刷：单用户对问答接口滑动窗口限流，超限返回提示话术；
+#   5) 输出过滤：回复文本二次敏感检查 + 长度上限截断 + 禁止超长链接。
+# 以上每层均可独立开关；全部默认开启。
+
+# 调试开关：是否把群号/QQ号/消息前 50 字写入日志（默认关闭，避免留存个人信息）。
+# 仅在初次部署采集白名单 openid 时临时设为 1。
+DEBUG_LOG_IDENTITY = os.getenv("ACM_DEBUG_LOG_IDENTITY", "0") == "1"
+
+# --- 1) 话题范围硬限制 ---
+QA_TOPIC_GATE_ENABLED = os.getenv("ACM_QA_TOPIC_GATE_ENABLED", "1") != "0"
+QA_OFFTOPIC_REPLY = os.getenv(
+    "ACM_QA_OFFTOPIC_REPLY", "我只回答与 ACM 集训队、比赛、训练相关的问题哦~"
+)
+
+# --- 2) 敏感内容拦截 ---
+QA_SENSITIVE_GATE_ENABLED = os.getenv("ACM_QA_SENSITIVE_GATE_ENABLED", "1") != "0"
+QA_SENSITIVE_REPLY = os.getenv(
+    "ACM_QA_SENSITIVE_REPLY", "这个问题我不方便回答，请换个话题~"
+)
+# 追加自定义敏感词（逗号分隔），与 content_filter.py 内置词表合并使用
+QA_SENSITIVE_EXTRA_WORDS = {
+    w.strip() for w in os.getenv("ACM_QA_SENSITIVE_EXTRA_WORDS", "").split(",") if w.strip()
+}
+
+# --- 3) 用户权限 ---
+# 开关默认开启。白名单动态合并：显式配置 ACM_QA_WHITELIST 时优先使用；
+# 留空则自动复用「老师白名单 ∪ 超管白名单」；若两者也为空，则退化为
+# “群成员皆可提问”（学生答疑的预期行为，如需限制请显式配置白名单）。
+QA_WHITELIST_ENABLED = os.getenv("ACM_QA_WHITELIST_ENABLED", "1") != "0"
+QA_BLACKLIST = {
+    m.strip() for m in os.getenv("ACM_QA_BLACKLIST", "").split(",") if m.strip()
+}
+QA_WHITELIST = {
+    m.strip() for m in os.getenv("ACM_QA_WHITELIST", "").split(",") if m.strip()
+}
+
+# --- 4) 频率防刷 ---
+QA_RATE_LIMIT_ENABLED = os.getenv("ACM_QA_RATE_LIMIT_ENABLED", "1") != "0"
+QA_RATE_LIMIT_SECONDS = int(os.getenv("ACM_QA_RATE_LIMIT_SECONDS", "10"))   # 窗口时长（秒）
+QA_RATE_LIMIT_MAX_CALLS = int(os.getenv("ACM_QA_RATE_LIMIT_MAX_CALLS", "1"))  # 窗口内最大调用次数
+QA_RATE_LIMIT_REPLY = os.getenv(
+    "ACM_QA_RATE_LIMIT_REPLY", "你问得太快啦，稍等几秒再问吧~"
+)
+
+# --- 5) 输出过滤 ---
+QA_OUTPUT_MAX_LENGTH = int(os.getenv("ACM_QA_OUTPUT_MAX_LENGTH", "800"))       # 回复长度上限（字符）
+QA_OUTPUT_MAX_LINK_LENGTH = int(os.getenv("ACM_QA_OUTPUT_MAX_LINK_LENGTH", "60"))  # 链接最长长度（字符）
+QA_OUTPUT_FILTERED_REPLY = os.getenv(
+    "ACM_QA_OUTPUT_FILTERED_REPLY", "这条回复内容不合规，已被过滤，换个问法试试~"
+)
+
+# --- 6) 算法话题限制（题解/思路/概念科普一律不答，省 token） ---
+# 命中算法相关提问（求解、要代码、调错、科普讲解等）直接拒绝并返回引导话术；
+# 队务类问题（课程/比赛/通知等）不受影响，FAQ 命中优先于本限制。
+QA_PROBLEM_GATE_ENABLED = os.getenv("ACM_QA_PROBLEM_GATE_ENABLED", "1") != "0"
+QA_PROBLEM_REPLY = os.getenv(
+    "ACM_QA_PROBLEM_REPLY",
+    "算法相关的题解、思路和概念科普，机器人这边就不展开啦（省点 token 留给队务和比赛消息~）。想啃题就自己多想想，或把代码贴给队友讨论，等集训课问老师收获更大！",
+)
+QA_PROBLEM_EXTRA_WORDS = {
+    w.strip() for w in os.getenv("ACM_QA_PROBLEM_EXTRA_WORDS", "").split(",") if w.strip()
+}
 
 # ================= 链接抓取（SSRF 与资源限制） =================
 # 域名白名单（逗号分隔，小写）。配置后仅白名单域名可抓取（重定向目标同样校验）

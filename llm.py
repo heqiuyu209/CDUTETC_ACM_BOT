@@ -19,6 +19,7 @@ from datetime import datetime
 import httpx
 
 import config
+import content_filter
 
 logger = logging.getLogger(__name__)
 
@@ -201,10 +202,26 @@ async def extract_contest(raw_text: str) -> tuple[dict | None, str | None]:
 
 
 async def answer_question(question: str, contests: list[dict]) -> str:
-    """按可见存档回答提问。contests 须为调用方筛选、限量的结果。"""
+    """按可见存档回答提问。contests 须为调用方筛选、限量的结果。
+
+    回答前先做五层防护中的本地判定（不调模型），system prompt 软约束保留：
+      - 话题范围硬限制：与 ACM 明显无关的问题直接拒绝，不产生模型调用；
+      - 敏感内容拦截：输入命中敏感词直接拒绝（main.py 已拦一道，此处双保险）；
+      - 输出过滤：模型回复做二次敏感检查 + 长度截断 + 禁止超长链接。
+    用户权限与频率防刷在 main.py 入口侧完成，llm 层不重复。
+    """
     question = (question or "")[: config.LLM_MAX_INPUT_CHARS]
     if not question.strip():
         return "请把问题说得具体一点~"
+
+    # 五层防护-1：话题范围硬限制（本地意图判断，不调 LLM）
+    if config.QA_TOPIC_GATE_ENABLED and not content_filter.is_topic_relevant(question):
+        return config.QA_OFFTOPIC_REPLY
+
+    # 五层防护-2：输入敏感拦截（防御纵深，main.py 入口已先拦一道）
+    if config.QA_SENSITIVE_GATE_ENABLED and content_filter.has_sensitive(question):
+        return config.QA_SENSITIVE_REPLY
+
     limited = _limit_contests(contests)
     system = (
         "你是 CDUTETC-ACM 集训队群助手，只回答与学校 ACM 集训队、比赛、训练相关的问题。\n"
@@ -214,7 +231,14 @@ async def answer_question(question: str, contests: list[dict]) -> str:
         f"【存档数据】\n{json.dumps(limited, ensure_ascii=False, indent=2)}"
     )
     try:
-        return (await _chat_once(system, question))[:1500]
+        answer = (await _chat_once(system, question))[:1500]
     except Exception as e:
         logger.warning("问答模型调用失败: %s", type(e).__name__)
         return "模型暂时不可用，请稍后再试~"
+
+    # 五层防护-5：输出过滤（二次敏感检查 + 长度截断 + 禁止超长链接）
+    return content_filter.sanitize_output(
+        answer,
+        max_length=config.QA_OUTPUT_MAX_LENGTH,
+        max_link_length=config.QA_OUTPUT_MAX_LINK_LENGTH,
+    )

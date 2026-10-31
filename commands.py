@@ -1,4 +1,4 @@
-﻿"""命令处理模块（v2）：命令式操作 + 权限校验 + 全部业务命令。
+"""命令处理模块（v2）：命令式操作 + 权限校验 + 全部业务命令。
 
 对应 PRODUCT_SPEC v2：
 - 移除订阅/取消订阅/比赛列表/比赛详情、审核列表/通过/拒绝、活动全套命令；
@@ -19,6 +19,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import config
+import content_filter
 import crawler
 import database as db
 import llm
@@ -58,6 +59,9 @@ HELP_TEXT = """【CDUTETC ACM 事务助手 · 命令帮助】
 /提醒状态                查看提醒投递队列状态（老师/超管）
 /抓取状态                查看公共来源抓取状态（老师/超管）
 /抓取一次                立即抓取一次公共来源（老师/超管）
+--- 私聊管理（超管） ---
+超管可私聊机器人发送以上 /FAQ添加 /FAQ删除 /课程添加 /课程取消
+等管理命令，作用于默认管理群（ACM_ADMIN_GROUP，留空取首个允许群）。
 --- 其他 ---
 /帮助                    显示本帮助"""# ---------------------------------------------------------------------
 # v2 命令：修正（超管）
@@ -643,10 +647,13 @@ def match_faq(group_id: str, text: str) -> dict | None:
 
 
 async def handle_non_command_message(text: str, group_id: str, sender: str) -> list[dict]:
-    """非命令消息：FAQ 匹配 → 模型问答 → 模型不可用/无解时才收集为未答问题。"""
+    """非命令消息：FAQ 匹配 → 算法话题拦截（省 token）→ 模型问答 → 模型不可用/无解时才收集为未答问题。"""
     faq = match_faq(group_id, text)
     if faq is not None:
         return [{"group_id": group_id, "text": f"Q：{faq['question']}\nA：{faq['answer']}"}]
+    # 算法话题（题解/思路/概念科普）一律不调模型，FAQ 已优先命中，避免浪费 token
+    if config.QA_PROBLEM_GATE_ENABLED and content_filter.is_algorithm_query(text):
+        return [{"group_id": group_id, "text": config.QA_PROBLEM_REPLY}]
     try:
         answer = await llm.answer_question(text, db.list_question_contests(group_id))
     except Exception:  # noqa: BLE001
