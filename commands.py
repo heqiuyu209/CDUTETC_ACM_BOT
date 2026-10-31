@@ -22,8 +22,8 @@ import config
 import crawler
 import database as db
 import llm
-from fetcher import fetch_text
-from utils import is_super_admin, is_teacher, parse_command
+from fetcher import FetchError, fetch_text
+from utils import can_manage_group, is_super_admin, parse_command
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -40,8 +40,8 @@ HELP_TEXT = """【CDUTETC ACM 事务助手 · 命令帮助】
 /校安排                  查看学校统一安排（仅共享部分）
 --- 课程与训练 ---
 /课程列表                查看本群课程安排
-/课程添加 <标题> [星期几] [开始-结束] [地点]  添加课程（老师）
-/课程取消 <id>           取消课程（老师）
+/课程添加 <标题> [星期几] [开始-结束] [地点]  添加课程（老师/超管）
+/课程取消 <id>           取消课程（老师/超管）
 --- 征集登记 ---
 /征集 <标题> [截止时间] [名额] [字段1,字段2]  发起征集（老师/超管）
 /报名 <征集id> [字段=值 ...]   报名/更新我的登记（群成员）
@@ -50,14 +50,14 @@ HELP_TEXT = """【CDUTETC ACM 事务助手 · 命令帮助】
 /征集关闭 <征集id>       关闭征集停止报名（老师/超管）
 --- FAQ 与提问 ---
 /FAQ列表 [关键词]       查看本群 FAQ
-/FAQ添加 <问题> = <答案> 添加 FAQ（老师）
-/FAQ删除 <id>            删除 FAQ（老师）
+/FAQ添加 <问题> = <答案> 添加 FAQ 并关闭同群同题未答问题（老师/超管）
+/FAQ删除 <id>            删除 FAQ（老师/超管）
 /提问 <问题>             记录未答问题，老师稍后回答
-/问题列表                查看未答问题（老师）
+/问题列表                查看未答问题（老师/超管）
 --- 提醒与抓取 ---
-/提醒状态                查看提醒投递队列状态（老师）
-/抓取状态                查看公共来源抓取状态（老师）
-/抓取一次                立即抓取一次公共来源（老师）
+/提醒状态                查看提醒投递队列状态（老师/超管）
+/抓取状态                查看公共来源抓取状态（老师/超管）
+/抓取一次                立即抓取一次公共来源（老师/超管）
 --- 其他 ---
 /帮助                    显示本帮助"""# ---------------------------------------------------------------------
 # v2 命令：修正（超管）
@@ -281,7 +281,7 @@ def cmd_pending_reject(group_id: str, sender: str, args: str) -> list[dict]:
 
 def cmd_collection_create(group_id: str, sender: str, args: str) -> list[dict]:
     """老师/超管发起征集。格式：/征集 <标题> [截止时间] [名额] [字段1,字段2] [用途=xxx]"""
-    if not (is_teacher(sender) or is_super_admin(sender)):
+    if not can_manage_group(sender):
         return [{"group_id": group_id, "text": "仅老师/超管可发起征集"}]
     parts = args.strip().split(None, 1)
     if not parts:
@@ -372,7 +372,7 @@ def cmd_collection_summary(group_id: str, sender: str, args: str) -> list[dict]:
 
 def cmd_collection_close(group_id: str, sender: str, args: str) -> list[dict]:
     """老师/超管关闭征集，停止报名。"""
-    if not (is_teacher(sender) or is_super_admin(sender)):
+    if not can_manage_group(sender):
         return [{"group_id": group_id, "text": "仅老师/超管可关闭征集"}]
     try:
         cid = int(args.strip().split()[0])
@@ -411,8 +411,8 @@ def cmd_training_list(group_id: str, sender: str, args: str) -> list[dict]:
 
 
 def cmd_training_add(group_id: str, sender: str, args: str) -> list[dict]:
-    if not is_teacher(sender):
-        return [{"group_id": group_id, "text": "仅老师可添加课程"}]
+    if not can_manage_group(sender):
+        return [{"group_id": group_id, "text": "仅老师/超管可添加课程"}]
     # 格式：/课程添加 标题 [星期几] [开始-结束] [地点]
     parts = args.strip().split(None, 3)
     if not parts:
@@ -434,8 +434,8 @@ def cmd_training_add(group_id: str, sender: str, args: str) -> list[dict]:
 
 
 def cmd_training_cancel(group_id: str, sender: str, args: str) -> list[dict]:
-    if not is_teacher(sender):
-        return [{"group_id": group_id, "text": "仅老师可取消课程"}]
+    if not can_manage_group(sender):
+        return [{"group_id": group_id, "text": "仅老师/超管可取消课程"}]
     try:
         tid = int(args.strip().split()[0])
     except (ValueError, IndexError):
@@ -459,8 +459,8 @@ def cmd_faq_list(group_id: str, sender: str, args: str) -> list[dict]:
 
 
 def cmd_faq_add(group_id: str, sender: str, args: str) -> list[dict]:
-    if not is_teacher(sender):
-        return [{"group_id": group_id, "text": "仅老师可添加 FAQ"}]
+    if not can_manage_group(sender):
+        return [{"group_id": group_id, "text": "仅老师/超管可添加 FAQ"}]
     if "=" not in args:
         return [{"group_id": group_id, "text": "用法：/FAQ添加 <问题> = <答案>"}]
     q, a = args.split("=", 1)
@@ -472,8 +472,8 @@ def cmd_faq_add(group_id: str, sender: str, args: str) -> list[dict]:
 
 
 def cmd_faq_delete(group_id: str, sender: str, args: str) -> list[dict]:
-    if not is_teacher(sender):
-        return [{"group_id": group_id, "text": "仅老师可删除 FAQ"}]
+    if not can_manage_group(sender):
+        return [{"group_id": group_id, "text": "仅老师/超管可删除 FAQ"}]
     try:
         fid = int(args.strip().split()[0])
     except (ValueError, IndexError):
@@ -494,8 +494,8 @@ def cmd_ask(group_id: str, sender: str, args: str) -> list[dict]:
 
 
 def cmd_question_list(group_id: str, sender: str, args: str) -> list[dict]:
-    if not is_teacher(sender):
-        return [{"group_id": group_id, "text": "仅老师可查看未答问题"}]
+    if not can_manage_group(sender):
+        return [{"group_id": group_id, "text": "仅老师/超管可查看未答问题"}]
     items = db.list_unanswered(group_id, status="open")
     if not items:
         return [{"group_id": group_id, "text": "暂无未答问题"}]
@@ -510,8 +510,8 @@ def cmd_question_list(group_id: str, sender: str, args: str) -> list[dict]:
 # ---------------------------------------------------------------------
 
 def cmd_fetch_status(group_id: str, sender: str, args: str) -> list[dict]:
-    if not is_teacher(sender):
-        return [{"group_id": group_id, "text": "仅老师可查看抓取状态"}]
+    if not can_manage_group(sender):
+        return [{"group_id": group_id, "text": "仅老师/超管可查看抓取状态"}]
     sources = db.list_sources()
     if not sources:
         return [{"group_id": group_id, "text": "暂无公共来源配置"}]
@@ -525,8 +525,8 @@ def cmd_fetch_status(group_id: str, sender: str, args: str) -> list[dict]:
 
 
 def cmd_reminder_status(group_id: str, sender: str, args: str) -> list[dict]:
-    if not is_teacher(sender):
-        return [{"group_id": group_id, "text": "仅老师可查看提醒状态"}]
+    if not can_manage_group(sender):
+        return [{"group_id": group_id, "text": "仅老师/超管可查看提醒状态"}]
     db.reconcile_deliveries(allowed_groups=set(config.ALLOWED_GROUPS))
     pending = db.list_deliveries(group_id, statuses=("pending", "sending"), limit=20)
     counts = db.delivery_status_counts(group_id)
@@ -548,8 +548,8 @@ async def cmd_trigger_fetch(group_id: str, sender: str, args: str) -> list[dict]
 
     异步执行：在现有事件循环中调度，避免嵌套 asyncio.run。
     """
-    if not is_teacher(sender):
-        return [{"group_id": group_id, "text": "仅老师可触发抓取"}]
+    if not can_manage_group(sender):
+        return [{"group_id": group_id, "text": "仅老师/超管可触发抓取"}]
     try:
         results = await crawler.run_fetch()
     except Exception as e:

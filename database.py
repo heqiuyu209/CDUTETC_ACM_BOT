@@ -1166,22 +1166,39 @@ def _row_to_faq(r: sqlite3.Row) -> dict:
     }
 
 
+def _normalize_question(question: str) -> str:
+    """只规范空白；不改变标点、大小写或按关键词猜测同题。"""
+    return " ".join(_as_str(question).split())
+
+
 def add_faq(group_id: str, question: str, answer: str, source: str = "",
             operator: str = "") -> int:
-    question = _as_str(question)
+    """添加 FAQ，并在同一事务关闭本群规范空白后完全相同的未答问题。"""
+    question = _normalize_question(question)
     answer = _as_str(answer)
     if not question or not answer:
         raise ValueError("FAQ 的问题与答案都不能为空")
     with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         cur = conn.execute(
             "INSERT INTO group_faq (group_id, question, answer, source, status, updated_at)"
             " VALUES (?, ?, ?, ?, 'confirmed', ?)",
             (group_id, question, answer, _as_str(source or ""), now_str()),
         )
-        if cur.lastrowid:
-            add_audit(operator, group_id, "create", "faq", str(cur.lastrowid), "",
-                      question[:50], conn=conn)
-        return cur.lastrowid
+        fid = cur.lastrowid
+        pending = conn.execute(
+            "SELECT id, question FROM unanswered_questions WHERE group_id = ? AND status = 'open'",
+            (group_id,),
+        ).fetchall()
+        for qid, stored_question in pending:
+            if _normalize_question(stored_question) == question:
+                conn.execute(
+                    "UPDATE unanswered_questions SET status = 'answered', faq_id = ?"
+                    " WHERE id = ? AND group_id = ? AND status = 'open'",
+                    (fid, qid, group_id),
+                )
+        add_audit(operator, group_id, "create", "faq", str(fid), "", question[:50], conn=conn)
+        return fid
 
 
 def list_faq(group_id: str, keyword: str | None = None) -> list[dict]:
@@ -1230,7 +1247,7 @@ def _row_to_unanswered(r: sqlite3.Row) -> dict:
 
 
 def add_unanswered_question(group_id: str, question: str, asker: str = "") -> int:
-    question = _as_str(question)
+    question = _normalize_question(question)
     if not question:
         raise ValueError("问题不能为空")
     with _connect() as conn:
