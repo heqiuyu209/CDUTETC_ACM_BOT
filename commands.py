@@ -30,7 +30,8 @@ TZ = ZoneInfo("Asia/Shanghai")
 
 HELP_TEXT = """【CDUTETC ACM 事务助手 · 命令帮助】
 --- 比赛资料 ---
-发布 <官网链接>          免审发布比赛并发送群通知（老师，@机器人发送）
+发布 <官网链接>          整理比赛信息后私聊超管确认（老师，@机器人发送）
+/待确认列表              查看自己提交的待确认发布申请（老师/超管）
 /修正 <比赛id> <字段=值 ...>  修正已发布比赛字段（超管）
   例：/修正 1 time=2026-12-01 19:00 name="ICPC 2026 区域赛"
 /修正 <比赛id> 重新提取 <链接>  重新提取官网信息（超管）
@@ -50,11 +51,13 @@ HELP_TEXT = """【CDUTETC ACM 事务助手 · 命令帮助】
 /征集汇总 <征集id>       查看本群人数和剩余名额（群成员）
 /征集关闭 <征集id>       关闭征集停止报名（老师/超管）
 --- FAQ 与提问 ---
-/FAQ列表 [关键词]       查看本群 FAQ
+/FAQ列表 [关键词]       查看本群 FAQ（老师/超管）
 /FAQ添加 <问题> = <答案> 添加 FAQ 并关闭同群同题未答问题（老师/超管）
 /FAQ删除 <id>            删除 FAQ（老师/超管）
 /提问 <问题>             记录未答问题，老师稍后回答
 /问题列表                查看未答问题（老师/超管）
+（普通成员 @机器人 提问只回答已录入的 FAQ/课程/校安排/比赛，
+  查不到会转人工，不会调用大模型）
 --- 提醒与抓取 ---
 /提醒状态                查看提醒投递队列状态（老师/超管）
 /抓取状态                查看公共来源抓取状态（老师/超管）
@@ -62,6 +65,7 @@ HELP_TEXT = """【CDUTETC ACM 事务助手 · 命令帮助】
 --- 私聊管理（超管） ---
 超管可私聊机器人发送以上 /FAQ添加 /FAQ删除 /课程添加 /课程取消
 等管理命令，作用于默认管理群（ACM_ADMIN_GROUP，留空取首个允许群）。
+超管在私聊回复「同意 <编号>」或「拒绝 <编号>」处理发布确认。
 --- 其他 ---
 /帮助                    显示本帮助"""# ---------------------------------------------------------------------
 # v2 命令：修正（超管）
@@ -451,6 +455,9 @@ def cmd_training_cancel(group_id: str, sender: str, args: str) -> list[dict]:
 
 
 def cmd_faq_list(group_id: str, sender: str, args: str) -> list[dict]:
+    # FAQ 列表含内部维护口径，仅老师/超管可见，避免普通成员看到管理端内容。
+    if not can_manage_group(sender):
+        return [{"group_id": group_id, "text": "仅老师/超管可查看 FAQ 列表"}]
     keyword = args.strip() or None
     faqs = db.list_faq(group_id, keyword)
     if not faqs:
@@ -459,6 +466,33 @@ def cmd_faq_list(group_id: str, sender: str, args: str) -> list[dict]:
     for f in faqs:
         lines.append(f"#{f['id']} Q：{f['question']}")
         lines.append(f"   A：{f['answer']}")
+    return [{"group_id": group_id, "text": "\n".join(lines)}]
+
+
+def cmd_pub_pending_list(group_id: str, sender: str, args: str) -> list[dict]:
+    """查看待超管确认的发布申请（老师看自己的，超管看全部）。"""
+    if not can_manage_group(sender):
+        return [{"group_id": group_id, "text": "仅老师/超管可查看待确认申请"}]
+    pending = db.list_pending_publications()
+    if is_super_admin(sender):
+        items = pending
+    else:
+        items = [p for p in pending if p.get("submitted_by") == sender]
+    if not items:
+        return [{"group_id": group_id, "text": "当前没有待确认的发布申请"}]
+    lines = ["待确认的发布申请："]
+    for item in items:
+        lines.append(
+            f"#{item['id']} {item['name'] or '未命名'}"
+            f"｜{item['official_time'] or '时间待定'}"
+            f"｜提交人 {item['submitted_by'] or '未知'}"
+        )
+        if item.get("duplicate_note"):
+            lines.append(f"   ⚠ {item['duplicate_note']}")
+    if is_super_admin(sender):
+        lines.append("在私聊回复「同意 <编号>」或「拒绝 <编号>」处理。")
+    else:
+        lines.append("等待超管在私聊中确认。")
     return [{"group_id": group_id, "text": "\n".join(lines)}]
 
 
@@ -614,6 +648,7 @@ async def handle_command(text: str, group_id: str, sender: str) -> list[dict] | 
         "FAQ列表": cmd_faq_list,
         "FAQ添加": cmd_faq_add,
         "FAQ删除": cmd_faq_delete,
+        "待确认列表": cmd_pub_pending_list,
         "提问": cmd_ask,
         "问题列表": cmd_question_list,
         "抓取状态": cmd_fetch_status,
@@ -646,14 +681,114 @@ def match_faq(group_id: str, text: str) -> dict | None:
     return None
 
 
-async def handle_non_command_message(text: str, group_id: str, sender: str) -> list[dict]:
-    """非命令消息：FAQ 匹配 → 算法话题拦截（省 token）→ 模型问答 → 模型不可用/无解时才收集为未答问题。"""
+async def _answer_from_knowledge_base(text: str, group_id: str) -> str | None:
+    """只查库内已录入内容作答，不调用模型（普通成员问答路径）。
+
+    依次尝试：已录入比赛 → 本群课程安排 → 学校安排 → 本群 FAQ。
+    命中返回整理好的纯事实文本；全部未命中返回 None（由调用方转人工）。
+
+    设计要点：比赛名、时间、地点等全部原样取自数据库，不做任何推测补全，
+    因此不会出现模型编造或“我没有数据库权限”这类管理端话术。
+    """
+    threshold = config.QA_KB_MATCH_MIN_SCORE
+
+    # 1) 已录入比赛：按名称/时间相似度取分最高者
+    best, best_score = None, 0.0
+    for comp in db.list_question_contests(group_id):
+        score = max(
+            content_filter.text_similarity(text, comp.get("name") or ""),
+            content_filter.text_similarity(text, comp.get("contest_time") or ""),
+        )
+        if score > best_score:
+            best, best_score = comp, score
+    if best is not None and best_score >= threshold:
+        lines = [f"【{best.get('name') or '未命名比赛'}】"]
+        for label, key in (("报名截止", "reg_deadline"), ("比赛时间", "contest_time"),
+                           ("形式", "mode"), ("地点", "location")):
+            value = (best.get(key) or "").strip()
+            if value:
+                lines.append(f"{label}：{value}")
+        lines.append("（以上为本群已录入信息，详细通知请看群公告）")
+        return "\n".join(lines)
+
+    # 2) 本群课程安排
+    best_t, best_t_score = None, 0.0
+    for session in db.list_training_sessions(group_id, active_only=True):
+        score = max(
+            content_filter.text_similarity(text, session.get("title") or ""),
+            content_filter.text_similarity(text, session.get("location") or ""),
+        )
+        if score > best_t_score:
+            best_t, best_t_score = session, score
+    if best_t is not None and best_t_score >= threshold:
+        lines = [f"【{best_t.get('title') or '集训课'}】"]
+        weekday = {0: "周一", 1: "周二", 2: "周三", 3: "周四",
+                   4: "周五", 5: "周六", 6: "周日"}.get(best_t.get("weekday"))
+        if weekday:
+            lines.append(f"时间：{weekday} {best_t.get('start_time') or ''}"
+                         f"-{best_t.get('end_time') or ''}".rstrip("-"))
+        if best_t.get("location"):
+            lines.append(f"地点：{best_t['location']}")
+        if best_t.get("needs_laptop"):
+            lines.append("需要带电脑")
+        if best_t.get("software"):
+            lines.append(f"软件：{best_t['software']}")
+        if best_t.get("device_req"):
+            lines.append(f"设备：{best_t['device_req']}")
+        return "\n".join(lines)
+
+    # 3) 学校安排（仅可共享给学生的条目）
+    best_e, best_e_score = None, 0.0
+    for event in db.list_org_events(status="confirmed", shareable_only=True):
+        score = max(
+            content_filter.text_similarity(text, event.get("title") or ""),
+            content_filter.text_similarity(text, event.get("location") or ""),
+        )
+        if score > best_e_score:
+            best_e, best_e_score = event, score
+    if best_e is not None and best_e_score >= threshold:
+        lines = [f"【{best_e.get('title') or '学校安排'}】"]
+        for label, key in (("类型", "event_type"), ("报名截止", "reg_deadline"),
+                           ("时间", "contest_time"), ("地点", "location"),
+                           ("负责老师", "teacher"), ("备注", "note")):
+            value = (best_e.get(key) or "").strip()
+            if value:
+                lines.append(f"{label}：{value}")
+        return "\n".join(lines)
+
+    # 4) FAQ（关键词包含匹配，与 FAQ 专用查询口径一致）
+    faq = match_faq(group_id, text)
+    if faq is not None:
+        return f"Q：{faq['question']}\nA：{faq['answer']}"
+    return None
+
+
+async def handle_non_command_message(text: str, group_id: str, sender: str,
+                                     staff: bool = False) -> list[dict]:
+    """非命令消息问答。
+
+    staff=False（普通成员）：只答库内已录入内容，绝不调用模型；
+        未命中则直接收集为未答问题转人工。
+    staff=True（老师/超管）：FAQ → 算法拦截 → 模型问答（可用未录入资料作答）。
+
+    text/group_id/sender 均由调用方校验完毕；本函数不做权限判断。
+    """
     faq = match_faq(group_id, text)
     if faq is not None:
         return [{"group_id": group_id, "text": f"Q：{faq['question']}\nA：{faq['answer']}"}]
     # 算法话题（题解/思路/概念科普）一律不调模型，FAQ 已优先命中，避免浪费 token
     if config.QA_PROBLEM_GATE_ENABLED and content_filter.is_algorithm_query(text):
         return [{"group_id": group_id, "text": config.QA_PROBLEM_REPLY}]
+
+    # 普通成员：知识库优先，未命中转人工，全程不产生模型调用
+    if not staff and config.QA_MEMBER_KB_ONLY:
+        answer = await _answer_from_knowledge_base(text, group_id)
+        if answer is not None:
+            return [{"group_id": group_id, "text": answer}]
+        qid = db.add_unanswered_question(group_id, text, sender)
+        return [{"group_id": group_id,
+                 "text": f"{config.QA_MEMBER_NO_MATCH_REPLY}（问题编号 #{qid}）"}]
+
     try:
         answer = await llm.answer_question(text, db.list_question_contests(group_id))
     except Exception:  # noqa: BLE001

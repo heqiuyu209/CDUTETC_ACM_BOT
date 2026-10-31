@@ -56,10 +56,31 @@ def _parse_time(text: str) -> datetime | None:
     return None
 
 
+def _due_offset_hours(delta: timedelta) -> float | None:
+    """返回该剩余时间命中的「最紧」提醒节点（小时）；未命中返回 None。
+
+    节点取自 config.REMIND_OFFSET_HOURS（降序存放）。判定方式是取所有
+    「节点小时数 ≥ 剩余时间」的节点中最小的那个，也就是已进入的最紧窗口：
+    剩 23 小时命中 24 小时节点，剩 0.5 小时命中 1 小时节点，剩 10 分钟
+    （若配置了 0.167=10 分钟）命中 10 分钟节点。
+
+    这样每个目标时间会按节点各发一次（去重键带节点），服务宕机错过某个
+    节点后恢复时仍会按下一个更紧的节点补发，不会漏提醒；同时不需要为
+    每场比赛单独创建定时器，内存占用与比赛数量无关。
+    """
+    if delta <= timedelta(0):
+        return None
+    candidates = [
+        offset for offset in config.REMIND_OFFSET_HOURS
+        if delta <= timedelta(hours=offset)
+    ]
+    return min(candidates) if candidates else None
+
+
 def build_reminders(contests: list[dict], now: datetime) -> list[dict]:
     """计算当前应提醒的清单（纯函数，便于离线测试）。
 
-    条件：目标时间在未来，且距目标时间不足 REMIND_BEFORE_HOURS 小时。
+    条件：目标时间在未来，且已进入 config.REMIND_OFFSET_HOURS 中某个节点窗口。
     """
     out: list[dict] = []
     for c in contests:
@@ -67,20 +88,22 @@ def build_reminders(contests: list[dict], now: datetime) -> list[dict]:
             target = _parse_time(c.get(field))
             if target is None:
                 continue
-            delta = target - now
-            if timedelta(0) < delta <= timedelta(hours=REMIND_BEFORE_HOURS):
-                out.append(
-                    {
-                        "group_id": c.get("group_id") or "",
-                        "contest_id": c["id"],
-                        "name": c["name"],
-                        "remind_type": field,
-                        "label": _LABELS[field],
-                        "target_str": c[field],
-                        "mode": c.get("mode"),
-                        "location": c.get("location"),
-                    }
-                )
+            offset = _due_offset_hours(target - now)
+            if offset is None:
+                continue
+            out.append(
+                {
+                    "group_id": c.get("group_id") or "",
+                    "contest_id": c["id"],
+                    "name": c["name"],
+                    "remind_type": field,
+                    "label": _LABELS[field],
+                    "target_str": c[field],
+                    "offset_hours": offset,
+                    "mode": c.get("mode"),
+                    "location": c.get("location"),
+                }
+            )
     return out
 
 
@@ -148,7 +171,7 @@ def build_general_reminders(collections: list[dict], competitions: list[dict],
     """计算通用提醒清单（纯函数，便于离线测试）。
 
     覆盖两类对象：
-    - 征集（群级）：deadline 距 now 在 REMIND_BEFORE_HOURS 内 → 提醒对应群；
+    - 征集（群级）：deadline 已进入某个提醒节点窗口 → 提醒对应群；
     - 已确认公共比赛：对每个允许群各生成一条报名截止/开赛提醒
       （比赛时间字段为空则跳过，视为待定不提醒）。
 
@@ -161,8 +184,8 @@ def build_general_reminders(collections: list[dict], competitions: list[dict],
         target = _parse_time(a.get("deadline") or "")
         if target is None:
             continue
-        delta = target - now
-        if timedelta(0) < delta <= timedelta(hours=REMIND_BEFORE_HOURS):
+        offset = _due_offset_hours(target - now)
+        if offset is not None:
             out.append({
                 "group_id": a["group_id"],
                 "obj_type": "collection",
@@ -184,7 +207,8 @@ def build_general_reminders(collections: list[dict], competitions: list[dict],
             if target is None:
                 continue
             delta = target - now
-            if timedelta(0) < delta <= timedelta(hours=REMIND_BEFORE_HOURS):
+            offset = _due_offset_hours(target - now)
+            if offset is not None:
                 for gid in sorted(config.ALLOWED_GROUPS):
                     out.append({
                         "group_id": gid,
@@ -192,6 +216,7 @@ def build_general_reminders(collections: list[dict], competitions: list[dict],
                         "obj_id": c["id"],
                         "remind_type": kind,
                         "target_str": c[field],
+                        "offset_hours": offset,
                         "text": (
                             f"【提醒】公共比赛「{c['name']}」{_LABELS[kind]}：{c[field]}\n"
                             f"官网：{c.get('official_site') or '待定'}\n请同学们提前做好准备！"
@@ -203,8 +228,14 @@ def build_general_reminders(collections: list[dict], competitions: list[dict],
 def _delivery_key(item: dict) -> str:
     # 键必须包含群号：同一对象的提醒要为每个允许群各发一条，
     # 不带群号会导致多群订阅时只有第一个群收到。
-    return delivery_dedup_key(item["group_id"], item["obj_type"], item["obj_id"],
+    # 键还必须包含提醒节点：同一目标时间要按 24h/1h 等多个节点各发一次，
+    # 不带节点会让第一个节点发完就把后续节点一起吞掉。
+    base = delivery_dedup_key(item["group_id"], item["obj_type"], item["obj_id"],
                               item["remind_type"], item["target_str"])
+    offset = item.get("offset_hours")
+    if offset is None:
+        return base
+    return f"{base}|{offset:g}"
 
 
 def build_training_reminders(sessions: list[dict], now: datetime) -> list[dict]:

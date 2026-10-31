@@ -57,9 +57,9 @@ ADMIN_GROUP = os.getenv("ACM_ADMIN_GROUP", "").strip()
 #   2) 敏感内容拦截：用户输入 / 模型输出命中敏感词（政治、色情、暴力、广告、
 #      诈骗、涉密等）即拒绝；
 #   3) 用户权限：问答默认对全体群成员开放（学生本来就要提问）。
-#      显式配置 ACM_QA_WHITELIST 后仅白名单成员可问；留空则自动复用
-#      「老师白名单 ∪ 超管白名单」，若两者也为空则退化为群成员皆可提问。
-#      命中黑名单直接忽略不回复；
+#      只有显式配置 ACM_QA_WHITELIST 才限制为白名单成员，留空即全群可问；
+#      命中 ACM_QA_BLACKLIST 直接忽略不回复。
+#      注意：不要回退成「老师 ∪ 超管」白名单，那会让普通成员被静默忽略。
 #   4) 频率防刷：单用户对问答接口滑动窗口限流，超限返回提示话术；
 #   5) 输出过滤：回复文本二次敏感检查 + 长度上限截断 + 禁止超长链接。
 # 以上每层均可独立开关；全部默认开启。
@@ -85,9 +85,11 @@ QA_SENSITIVE_EXTRA_WORDS = {
 }
 
 # --- 3) 用户权限 ---
-# 开关默认开启。白名单动态合并：显式配置 ACM_QA_WHITELIST 时优先使用；
-# 留空则自动复用「老师白名单 ∪ 超管白名单」；若两者也为空，则退化为
-# “群成员皆可提问”（学生答疑的预期行为，如需限制请显式配置白名单）。
+# 默认对全群开放（学生答疑的预期行为），仅以下两种方式限制：
+#   - 在 ACM_QA_BLACKLIST 里拉黑个别成员（静默忽略）；
+#   - 显式配置 ACM_QA_WHITELIST 后，仅白名单成员可提问。
+# 不再回退到「老师 ∪ 超管」白名单：那样会让配了老师白名单的部署
+# 变成“只有管理员能提问”，普通成员被静默忽略。
 QA_WHITELIST_ENABLED = os.getenv("ACM_QA_WHITELIST_ENABLED", "1") != "0"
 QA_BLACKLIST = {
     m.strip() for m in os.getenv("ACM_QA_BLACKLIST", "").split(",") if m.strip()
@@ -95,11 +97,14 @@ QA_BLACKLIST = {
 QA_WHITELIST = {
     m.strip() for m in os.getenv("ACM_QA_WHITELIST", "").split(",") if m.strip()
 }
+QA_WHITELIST_REPLY = os.getenv(
+    "ACM_QA_WHITELIST_REPLY", "这个群暂时只允许指定成员提问哦~"
+)
 
 # --- 4) 频率防刷 ---
 QA_RATE_LIMIT_ENABLED = os.getenv("ACM_QA_RATE_LIMIT_ENABLED", "1") != "0"
 QA_RATE_LIMIT_SECONDS = int(os.getenv("ACM_QA_RATE_LIMIT_SECONDS", "10"))   # 窗口时长（秒）
-QA_RATE_LIMIT_MAX_CALLS = int(os.getenv("ACM_QA_RATE_LIMIT_MAX_CALLS", "1"))  # 窗口内最大调用次数
+QA_RATE_LIMIT_MAX_CALLS = int(os.getenv("ACM_QA_RATE_LIMIT_MAX_CALLS", "3"))  # 窗口内最大调用次数
 QA_RATE_LIMIT_REPLY = os.getenv(
     "ACM_QA_RATE_LIMIT_REPLY", "你问得太快啦，稍等几秒再问吧~"
 )
@@ -122,6 +127,19 @@ QA_PROBLEM_REPLY = os.getenv(
 QA_PROBLEM_EXTRA_WORDS = {
     w.strip() for w in os.getenv("ACM_QA_PROBLEM_EXTRA_WORDS", "").split(",") if w.strip()
 }
+
+# --- 7) 普通成员问答范围：只答已录入内容，不调模型 ---
+# 开启后普通成员（非老师/超管）的提问只匹配 FAQ / 课程 / 校安排 / 已录入比赛：
+# 命中则按库内内容作答，未命中直接转人工收集为未答问题，绝不调用大模型。
+# 这样既不会出现“我没有数据库权限”这类模型臆造的管理端话术，
+# 也把普通成员提问的 token 成本降为 0。老师/超管不受此限制。
+QA_MEMBER_KB_ONLY = os.getenv("ACM_QA_MEMBER_KB_ONLY", "1") != "0"
+QA_MEMBER_NO_MATCH_REPLY = os.getenv(
+    "ACM_QA_MEMBER_NO_MATCH_REPLY",
+    "这个问题我暂时查不到确切答案，已经帮你转给老师啦，稍等一下~",
+)
+# 已录入比赛的本地检索：问题与比赛名称/时间的字符串相似度低于阈值即视为未命中。
+QA_KB_MATCH_MIN_SCORE = float(os.getenv("ACM_QA_KB_MATCH_MIN_SCORE", "0.34"))
 
 # ================= 链接抓取（SSRF 与资源限制） =================
 # 域名白名单（逗号分隔，小写）。配置后仅白名单域名可抓取（重定向目标同样校验）
@@ -146,6 +164,20 @@ TZ_NAME = "Asia/Shanghai"
 REMIND_CHECK_INTERVAL_MINUTES = int(os.getenv("ACM_REMIND_CHECK_INTERVAL_MINUTES", "30"))
 REMIND_BEFORE_HOURS = int(os.getenv("ACM_REMIND_BEFORE_HOURS", "24"))
 REMIND_TYPES = ("reg_deadline", "contest_time")
+# 多节点提前提醒（小时，逗号分隔，支持小数）。例：24,1,0.167 表示
+# 提前 24 小时、1 小时、10 分钟各提醒一次。每场活动不建独立定时器，
+# 仍由周期扫描按「已进入哪个节点窗口」判定，资源占用与比赛数量无关。
+# 留空则回退为单节点 REMIND_BEFORE_HOURS 的旧行为。
+REMIND_OFFSET_HOURS = tuple(
+    sorted(
+        (float(x) for x in os.getenv("ACM_REMIND_OFFSET_HOURS", "24,1").split(",") if x.strip()),
+        reverse=True,
+    )
+) or (float(REMIND_BEFORE_HOURS),)
+
+# ================= 发布确认（超管私聊） =================
+# 老师发布比赛后，整理结果先私聊推送给超管，超管回「同意/拒绝」才入库并通知群。
+PUBLISH_CONFIRM_ENABLED = os.getenv("ACM_PUBLISH_CONFIRM_ENABLED", "1") != "0"
 
 # ================= 自动周赛（v2） =================
 # 在提前提醒窗口前按模板生成周赛，启动时补最近未来场次；默认不通知全员，

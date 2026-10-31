@@ -21,7 +21,9 @@
 
 import asyncio
 import contextvars
+import json
 import logging
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -41,11 +43,11 @@ from llm import extract_contest
 from reminder import check_general_reminders, check_reminders
 from utils import (
     admin_group_id,
+    can_manage_group,
     extract_url,
     is_allowed_group,
     is_publish_command,
     is_super_admin,
-    is_teacher,
     mentioned_user_ids,
     strip_at,
 )
@@ -91,6 +93,59 @@ def _build_confirm(info: dict) -> str:
         f"形式/地点：{info.get('mode') or '待定'} {info.get('location') or ''}\n"
         "有问题随时 @ 我！"
     )
+
+
+def _build_publish_notice(info: dict, cid: int) -> str:
+    """构造发往各群的新比赛公告（字段全部取自已确认的录入内容）。"""
+    lines = [f"【新比赛发布】#{cid} {info.get('name') or '未知'}"]
+    if info.get("edition"):
+        lines.insert(1, f"届次：{info['edition']}")
+    for label, key in (("报名开始", "official_reg_start"),
+                       ("报名截止", "official_reg_deadline"),
+                       ("比赛时间", "official_time"),
+                       ("赛道", "tracks"),
+                       ("设备要求", "device_req")):
+        value = (info.get(key) or "").strip()
+        if value:
+            lines.append(f"{label}：{value}")
+    if (info.get("summary") or "").strip():
+        lines.append(f"简介：{info['summary'].strip()}")
+    if (info.get("official_site") or "").strip():
+        lines.append(f"官网：{info['official_site'].strip()}")
+    lines.append("请及时查看并提前做好准备~")
+    return "\n".join(lines)
+
+
+def _build_publish_review(pending: dict) -> str:
+    """构造发给超管的待确认申请正文（含全部已整理字段与查重提示）。"""
+    info = json.loads(pending.get("fields_json") or "{}")
+    lines = [f"【待确认发布】#{pending['id']}", f"比赛：{info.get('name') or '未知'}"]
+    for label, key in (("届次", "edition"),
+                       ("报名开始", "official_reg_start"),
+                       ("报名截止", "official_reg_deadline"),
+                       ("比赛时间", "official_time"),
+                       ("赛道", "tracks"),
+                       ("设备要求", "device_req"),
+                       ("简介", "summary"),
+                       ("官网", "official_site")):
+        value = (info.get(key) or "").strip()
+        lines.append(f"{label}：{value or '未提供'}")
+    lines.append(f"来源群：{pending.get('group_id') or '未知'}")
+    lines.append(f"提交人：{pending.get('submitted_by') or '未知'}")
+    if pending.get("duplicate_note"):
+        lines.append(f"⚠ 查重提示：{pending['duplicate_note']}")
+    else:
+        lines.append("查重：未发现名称+届次+比赛时间完全一致的记录")
+    lines.append("")
+    lines.append(f"回复「同意 {pending['id']}」入库并通知各群，或「拒绝 {pending['id']}」丢弃。")
+    return "\n".join(lines)
+
+
+_PUBLISH_DECISION_RE = re.compile(
+    r"^(?P<action>同意|通过|批准|拒绝|驳回|approve|reject|ok|y|n)"
+    r"\s*(?P<pid>\d+)?\s*(?P<note>.*)$",
+    re.IGNORECASE,
+)
 
 
 def _weekly_contest_window(now: datetime):
@@ -196,6 +251,11 @@ class ACMBot:
             content = message.content or ""
             if config.DEBUG_LOG_IDENTITY:
                 logger.info("[私聊][调试] user_id=%s content=%s", uid, content[:50])
+            # 超管私聊回复「同意/通过/拒绝 <编号>」处理待确认的发布申请
+            if is_super_admin(uid):
+                handled = await self._handle_publish_decision(uid, content)
+                if handled:
+                    return
             if content.strip().startswith("/") and is_super_admin(uid):
                 admin_gid = admin_group_id()
                 if not admin_gid:
@@ -212,6 +272,67 @@ class ACMBot:
             await self.client.send_private_msg(uid, f"收到（{uid}）")
         except Exception:
             logger.exception("私聊处理失败")
+
+    async def _handle_publish_decision(self, uid: str, content: str) -> bool:
+        """处理超管私聊的发布审批回复。返回 True 表示已处理并已回复过。
+
+        可接受：`同意` / `同意 3` / `通过 3` / `拒绝 3` / `拒绝 3 原因`。
+        不带编号时，若只有一条待确认申请则直接作用于它，否则列出清单。
+        """
+        match = _PUBLISH_DECISION_RE.match((content or "").strip())
+        if not match:
+            return False
+        approve = match.group("action") in ("同意", "通过", "批准", "approve", "ok", "y")
+        pid_text = match.group("pid")
+        note = (match.group("note") or "").strip()
+        pending = db.list_pending_publications()
+        if not pending:
+            await self.client.send_private_msg(uid, "当前没有待确认的发布申请。")
+            return True
+        if pid_text:
+            pid = int(pid_text)
+        elif len(pending) == 1:
+            pid = pending[0]["id"]
+        else:
+            lines = ["有多条待确认申请，请在回复里带上编号："]
+            for item in pending:
+                lines.append(f"#{item['id']} {item['name'] or '未命名'}｜{item['official_time'] or '时间待定'}")
+            lines.append("例如：同意 3")
+            await self.client.send_private_msg(uid, "\n".join(lines))
+            return True
+        try:
+            if approve:
+                cid, created = db.approve_pending_publication(pid, operator=uid)
+                pending_item = db.get_pending_publication(pid) or {}
+                if created:
+                    await self.client.send_private_msg(
+                        uid, f"已入库：#{cid} {pending_item.get('name') or ''}，正在通知各群。"
+                    )
+                    await self._notify_publish_group(pending_item, cid)
+                else:
+                    await self.client.send_private_msg(
+                        uid, f"该比赛已存在（编号 {cid}），未重复入库、未发送群通知。"
+                    )
+            else:
+                if not db.reject_pending_publication(pid, operator=uid, note=note):
+                    await self.client.send_private_msg(uid, f"申请 #{pid} 已处理过，无需重复操作。")
+                    return True
+                await self.client.send_private_msg(uid, f"已拒绝申请 #{pid}，未入库。")
+        except ValueError as error:
+            await self.client.send_private_msg(uid, f"处理失败：{error}")
+        return True
+
+    async def _notify_publish_group(self, pending_item: dict, cid: int) -> None:
+        """超管同意后向所有允许群发送新比赛通知。"""
+        info = json.loads(pending_item.get("fields_json") or "{}")
+        notice = _build_publish_notice(info, cid)
+        targets = sorted(config.ALLOWED_GROUPS)
+        sent = 0
+        for gid in targets:
+            if await self._send_group(gid, notice):
+                sent += 1
+        if sent < len(targets):
+            logger.warning("比赛 #%s 群通知发送 %s/%s", cid, sent, len(targets))
 
     # ---------- 群消息路由 ----------
 
@@ -255,7 +376,9 @@ class ACMBot:
                     if gate_reply:
                         await self._safe_reply(message, gate_reply)
                     return
-                replies = await commands.handle_non_command_message(text, group_id, member_id)
+                replies = await commands.handle_non_command_message(
+                    text, group_id, member_id, staff=can_manage_group(member_id)
+                )
                 # 五层防护-5：输出过滤（FAQ/模型回答统一二次敏感检查、长度截断、禁超长链接）
                 if replies:
                     replies = [
@@ -319,19 +442,19 @@ class ACMBot:
         commands.handle_non_command_message 与发送前完成。
         """
         # 五层防护-3：用户权限。黑名单命中直接忽略；
-        # 白名单开关开启且已配置白名单成员时，非白名单成员忽略。
-        # 白名单优先取显式 QA_WHITELIST；留空自动复用「老师 ∪ 超管」。
+        # 仅当显式配置了 ACM_QA_WHITELIST 时才限制为白名单成员。
+        # 注意：不要再回退到「老师 ∪ 超管」——那会让配了老师白名单的部署
+        # 变成“只有管理员能提问”，普通成员被静默忽略。
         if config.QA_BLACKLIST and member_id in config.QA_BLACKLIST:
             logger.info("问答已忽略（黑名单成员）: %s", member_id)
             return False, None
-        whitelist = config.QA_WHITELIST or (config.TEACHER_WHITELIST | config.SUPER_ADMIN)
         if (
             config.QA_WHITELIST_ENABLED
-            and whitelist
-            and member_id not in whitelist
+            and config.QA_WHITELIST
+            and member_id not in config.QA_WHITELIST
         ):
             logger.info("问答已忽略（非白名单成员）: %s", member_id)
-            return False, None
+            return False, config.QA_WHITELIST_REPLY
 
         # 五层防护-2：敏感内容拦截（输入侧，llm 层另有双保险）
         if config.QA_SENSITIVE_GATE_ENABLED and content_filter.has_sensitive(text):
@@ -347,8 +470,9 @@ class ACMBot:
 
     async def _handle_publish(self, message: OneBotMessage, text: str,
                               group_id: str, member_id: str):
-        """发布命令：老师权限校验 → 抓取 → 提取 → 校验 → confirmed → 群通知。"""
-        if not is_teacher(member_id):
+        """发布命令：老师/超管权限校验 → 抓取 → 提取 → 校验 → 私聊超管确认。"""
+        # 超管继承老师全部权限（含发布），无需再额外加入老师白名单
+        if not can_manage_group(member_id):
             await self._safe_reply(message, "抱歉，你没有发布比赛信息的权限~")
             return
 
@@ -379,8 +503,58 @@ class ACMBot:
 
         info["source_link"] = url
         try:
-            # 正式比赛、来源和已抓取正文基线一并提交，供后台检测后续变化。
             competition_info = map_competition_info(info)
+        except ValueError as e:
+            await self._safe_reply(message, f"信息校验失败：{e}")
+            return
+
+        # 查重：名称+届次+比赛时间完全一致才判为重复（不看链接，转发消息也能查出）
+        duplicate = db.find_duplicate_competition(competition_info)
+        if duplicate is not None and duplicate.get("status") == "confirmed":
+            await self._safe_reply(
+                message,
+                f"该比赛已存在（编号 {duplicate['id']}，"
+                f"{duplicate['name']} {duplicate.get('official_time') or '时间待定'}），"
+                "本次未重复发布。",
+            )
+            return
+
+        # 超管确认流程：老师发布 → 整理结果私聊超管 → 同意才入库并通知群
+        if config.PUBLISH_CONFIRM_ENABLED and config.SUPER_ADMIN:
+            try:
+                pid = db.create_pending_publication(
+                    competition_info,
+                    group_id=group_id,
+                    source_url=url,
+                    source_text=page,
+                    submitted_by=member_id,
+                    duplicate=duplicate,
+                )
+            except ValueError as e:
+                await self._safe_reply(message, f"提交失败：{e}")
+                return
+            pending = db.get_pending_publication(pid) or {}
+            review = _build_publish_review(pending)
+            sent = 0
+            for admin in sorted(config.SUPER_ADMIN):
+                if await self.client.send_private_msg(admin, review):
+                    sent += 1
+            if sent:
+                await self._safe_reply(
+                    message,
+                    f"已整理完毕并提交超管确认（申请 #{pid}）。"
+                    "超管同意后会自动入库并通知各群。",
+                )
+            else:
+                await self._safe_reply(
+                    message,
+                    f"已整理为申请 #{pid}，但超管私聊推送失败，请提醒超管查看待确认列表。",
+                )
+            logger.info("发布申请 #%s 已提交超管确认：%s", pid, info.get("name"))
+            return
+
+        # 未启用确认流程（或未配置超管）：保持原免审发布
+        try:
             cid, created = create_published_competition_once(
                 competition_info,
                 source_url=url,
@@ -396,20 +570,13 @@ class ACMBot:
             return
 
         logger.info("已免审发布比赛: %s（群 %s）", info.get("name"), group_id)
-        # 被动回复有有效期，先告知已提交存档，再等待各群通知结果。
         display_info = {
             **info,
             "reg_deadline": competition_info.get("official_reg_deadline", ""),
             "contest_time": competition_info.get("official_time", ""),
         }
         await self._safe_reply(message, _build_confirm(display_info) + "\n已免审发布为正式比赛。")
-        notice = (
-            f"【新比赛发布】{info.get('name') or '未知'}\n"
-            f"报名截止：{display_info.get('reg_deadline') or '待定'}\n"
-            f"比赛时间：{display_info.get('contest_time') or '待定'}\n"
-            f"形式：{info.get('mode') or '待定'}｜地点：{info.get('location') or '待定'}\n"
-            f"来源：{url}\n请及时查看并准备报名~"
-        )
+        notice = _build_publish_notice(competition_info, cid)
         targets = sorted(config.ALLOWED_GROUPS)
         sent = 0
         for gid in targets:

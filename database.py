@@ -98,6 +98,28 @@ CREATE TABLE IF NOT EXISTS publication_claims (
 )
 """
 
+# 待超管确认的发布申请：老师发布 → 私聊超管 → 同意入库 / 拒绝丢弃。
+# 存整理好的完整字段与原始来源，超管确认前不写 competitions，群内看不到。
+_PENDING_PUBLICATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS pending_publications (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id        TEXT NOT NULL DEFAULT '',
+    name            TEXT NOT NULL DEFAULT '',
+    edition         TEXT NOT NULL DEFAULT '',
+    official_time   TEXT NOT NULL DEFAULT '',
+    fields_json     TEXT NOT NULL DEFAULT '{}',
+    source_url      TEXT NOT NULL DEFAULT '',
+    source_text     TEXT NOT NULL DEFAULT '',
+    submitted_by    TEXT NOT NULL DEFAULT '',
+    submitted_at    TEXT NOT NULL DEFAULT '',
+    duplicate_id    INTEGER NOT NULL DEFAULT 0,
+    duplicate_note  TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'pending',
+    decided_by      TEXT NOT NULL DEFAULT '',
+    decided_at      TEXT NOT NULL DEFAULT ''
+)
+"""
+
 _COMPETITION_SOURCES_DDL = """
 CREATE TABLE IF NOT EXISTS competition_sources (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -299,6 +321,7 @@ _INDEX_DDL = (
 _ALL_DDL = (
     _MAIN_DDL, _REMIND_DDL,
     _COMPETITIONS_DDL, _WEEKLY_CONTEST_RUNS_DDL, _PUBLICATION_CLAIMS_DDL,
+    _PENDING_PUBLICATIONS_DDL,
     _COMPETITION_SOURCES_DDL, _COMPETITION_VERSIONS_DDL,
     _PENDING_UPDATES_DDL,
     _ORG_EVENTS_DDL,
@@ -1022,6 +1045,41 @@ def _publication_identity(info: dict, canonical_url: str) -> str:
     return json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
 
 
+def find_duplicate_competition(info: dict) -> dict | None:
+    """按「名称 + 届次 + 比赛时间」三者完全一致判定重复。
+
+    与 _publication_identity 不同：本函数不看链接，因此转发来的群消息
+    （通常没有链接）也能查出重复；三者任一不同都不算重复，避免误拒。
+
+    Returns:
+        命中的比赛记录（含 id/name/edition/official_time/status），无则 None。
+    """
+    if not isinstance(info, dict):
+        return None
+    def norm(value) -> str:
+        return " ".join(str(value or "").split()).strip().lower()
+
+    name = norm(info.get("name"))
+    if not name:
+        return None
+    edition = norm(info.get("edition"))
+    contest_time = norm(info.get("official_time"))
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_COMPETITION_COLS} FROM competitions"
+            " WHERE status IN ('confirmed', 'draft')"
+        ).fetchall()
+    for row in rows:
+        record = _row_to_competition(row)
+        if (
+            norm(record.get("name")) == name
+            and norm(record.get("edition")) == edition
+            and norm(record.get("official_time")) == contest_time
+        ):
+            return record
+    return None
+
+
 def _find_legacy_publication(conn: sqlite3.Connection, identity: str,
                              canonical_url: str) -> int | None:
     """给旧库补发布身份；当前资料或初始正式创建版本必须精确匹配。"""
@@ -1064,6 +1122,48 @@ def _find_legacy_publication(conn: sqlite3.Connection, identity: str,
                 except ValueError:
                     continue
     return None
+
+
+def _create_confirmed_from_pending(info: dict, source_url: str, source_text: str,
+                                   operator: str) -> tuple[int, bool]:
+    """超管确认后落库：无来源链接（群消息转发）时按「名称+届次+时间」去重。
+
+    与 create_published_competition_once 的差别：
+    - 不要求 source_url，没有链接也能发布；
+    - 去重口径统一为 find_duplicate_competition（名称+届次+比赛时间），
+      因此转发消息与官网发布的两条同场比赛仍会被判重。
+    """
+    if not isinstance(info, dict):
+        raise ValueError("比赛信息必须是对象")
+    cleaned = _clean_competition_info(info)
+    existing = find_duplicate_competition(cleaned)
+    if existing is not None:
+        return existing["id"], False
+    source_url = _as_str(source_url)
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        # 事务内二次确认，避免并发同意同一条申请造成重复入库。
+        rows = conn.execute(
+            f"SELECT {_COMPETITION_COLS} FROM competitions"
+            " WHERE status IN ('confirmed', 'draft')"
+        ).fetchall()
+        for row in rows:
+            record = _row_to_competition(row)
+            if (str(record.get("name") or "").strip().lower()
+                    == str(cleaned.get("name") or "").strip().lower()
+                    and str(record.get("edition") or "").strip().lower()
+                    == str(cleaned.get("edition") or "").strip().lower()
+                    and str(record.get("official_time") or "").strip().lower()
+                    == str(cleaned.get("official_time") or "").strip().lower()):
+                return record["id"], False
+        cid = _create_competition_on(conn, cleaned, "confirmed", operator)
+        if source_url:
+            sid = add_competition_source(cid, source_url, conn=conn)
+            body_hash = hashlib.sha256((source_text or "").encode("utf-8")).hexdigest()
+            update_source_fetch(
+                sid, body_hash=body_hash, last_status="confirmed", conn=conn,
+            )
+        return cid, True
 
 
 def create_published_competition_once(info: dict, source_url: str, source_text: str,
@@ -1115,6 +1215,134 @@ def create_published_competition(info: dict, source_url: str, source_text: str,
     """兼容原返回值的发布入口，重复发布仍返回同一个比赛 id。"""
     cid, _ = create_published_competition_once(info, source_url, source_text, operator)
     return cid
+
+
+# =====================================================================
+# 待超管确认的发布申请（pending_publications）
+# =====================================================================
+
+_PENDING_PUB_COLS = (
+    "id, group_id, name, edition, official_time, fields_json, source_url,"
+    " source_text, submitted_by, submitted_at, duplicate_id, duplicate_note,"
+    " status, decided_by, decided_at"
+)
+
+
+def _row_to_pending_publication(r: sqlite3.Row) -> dict:
+    return {
+        "id": r[0], "group_id": r[1], "name": r[2], "edition": r[3],
+        "official_time": r[4], "fields_json": r[5], "source_url": r[6],
+        "source_text": r[7], "submitted_by": r[8], "submitted_at": r[9],
+        "duplicate_id": r[10], "duplicate_note": r[11], "status": r[12],
+        "decided_by": r[13], "decided_at": r[14],
+    }
+
+
+def create_pending_publication(info: dict, group_id: str, source_url: str,
+                               source_text: str, submitted_by: str,
+                               duplicate: dict | None = None) -> int:
+    """登记一条待超管确认的发布申请；此时不写 competitions，群内不可见。"""
+    if not isinstance(info, dict):
+        raise ValueError("比赛信息必须是对象")
+
+    def opt_str(value) -> str:
+        """可选字段：缺失/None 视为空串，非字符串仍按严格类型报错。"""
+        return "" if value is None else _as_str(value)
+
+    duplicate_id = int(duplicate["id"]) if duplicate else 0
+    duplicate_note = ""
+    if duplicate:
+        duplicate_note = (
+            f"已存在同名同届次同时间的记录（编号 {duplicate_id}，"
+            f"状态 {duplicate.get('status') or '未知'}）"
+        )
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO pending_publications (group_id, name, edition, official_time,"
+            " fields_json, source_url, source_text, submitted_by, submitted_at,"
+            " duplicate_id, duplicate_note, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+            (
+                opt_str(group_id),
+                opt_str(info.get("name")),
+                opt_str(info.get("edition")),
+                opt_str(info.get("official_time")),
+                json.dumps(info, ensure_ascii=False),
+                opt_str(source_url),
+                opt_str(source_text),
+                opt_str(submitted_by),
+                now_str(),
+                duplicate_id,
+                duplicate_note,
+            ),
+        )
+        return cur.lastrowid
+
+
+def get_pending_publication(pid: int) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            f"SELECT {_PENDING_PUB_COLS} FROM pending_publications WHERE id = ?", (pid,)
+        ).fetchone()
+    return _row_to_pending_publication(row) if row else None
+
+
+def list_pending_publications(status: str = "pending") -> list[dict]:
+    """列出发布申请；status 传空串则返回全部。"""
+    with _connect() as conn:
+        if status:
+            rows = conn.execute(
+                f"SELECT {_PENDING_PUB_COLS} FROM pending_publications"
+                " WHERE status = ? ORDER BY id DESC", (status,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT {_PENDING_PUB_COLS} FROM pending_publications ORDER BY id DESC"
+            ).fetchall()
+    return [_row_to_pending_publication(r) for r in rows]
+
+
+def approve_pending_publication(pid: int, operator: str = "") -> tuple[int, bool]:
+    """超管同意：原子地把申请转成正式比赛并标记已通过。
+
+    Returns:
+        (competition_id, created)：created=False 表示期间已存在相同记录，未重复创建。
+        申请不存在或非 pending 状态时抛 ValueError。
+    """
+    pending = get_pending_publication(pid)
+    if pending is None:
+        raise ValueError(f"发布申请 #{pid} 不存在")
+    if pending["status"] != "pending":
+        raise ValueError(f"发布申请 #{pid} 已是 {pending['status']} 状态")
+    info = json.loads(pending["fields_json"] or "{}")
+    cid, created = _create_confirmed_from_pending(
+        info,
+        source_url=pending["source_url"],
+        source_text=pending["source_text"],
+        operator=f"approve:{operator or pending['submitted_by']}",
+    )
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE pending_publications SET status = 'approved', decided_by = ?,"
+            " decided_at = ? WHERE id = ?", (_as_str(operator), now_str(), pid),
+        )
+        add_audit(operator, pending["group_id"], "approve_publication",
+                  "pending_publication", str(pid), "", f"competition:{cid}", conn=conn)
+    return cid, created
+
+
+def reject_pending_publication(pid: int, operator: str = "", note: str = "") -> bool:
+    """超管拒绝：标记已拒绝，不写任何比赛数据。"""
+    pending = get_pending_publication(pid)
+    if pending is None or pending["status"] != "pending":
+        return False
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE pending_publications SET status = 'rejected', decided_by = ?,"
+            " decided_at = ? WHERE id = ?", (_as_str(operator), now_str(), pid),
+        )
+        add_audit(operator, pending["group_id"], "reject_publication",
+                  "pending_publication", str(pid), "", note or "超管拒绝", conn=conn)
+    return True
 
 
 # =====================================================================
@@ -1854,7 +2082,11 @@ def delivery_dedup_key(group_id: str, obj_type: str, obj_id: int,
 
 
 def _canonical_delivery_key(key: str) -> str:
-    """兼容旧扫描器的冒号键；身份仍由数据库对象字段确定。"""
+    """兼容旧扫描器的冒号键；身份仍由数据库对象字段确定。
+
+    多节点提醒的键形如 `群|类型|id|类型|时间|节点`，末尾节点后缀
+    必须在归一化后原样保留，否则 24h 与 1h 两个节点会被归一成同一个键。
+    """
     parts = key.split("|", 4) if "|" in key else key.split(":", 4)
     if len(parts) != 5:
         return key
@@ -1862,7 +2094,9 @@ def _canonical_delivery_key(key: str) -> str:
         obj_id = int(parts[2])
     except ValueError:
         return key
-    return delivery_dedup_key(parts[0], parts[1], obj_id, parts[3], parts[4])
+    target, sep, offset = parts[4].partition("|")
+    canonical = delivery_dedup_key(parts[0], parts[1], obj_id, parts[3], target)
+    return f"{canonical}{sep}{offset}" if sep else canonical
 
 
 def _migrate_reminder_deliveries(conn: sqlite3.Connection) -> None:

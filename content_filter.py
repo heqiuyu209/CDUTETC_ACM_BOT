@@ -20,6 +20,23 @@ import time
 
 import config
 
+
+def _bigrams(text: str) -> set[str]:
+    """取中文/字母数字字符的二元组，作为轻量相似度特征（无需分词库）。"""
+    cleaned = re.sub(r"[^\w\u4e00-\u9fff]+", "", (text or "").lower())
+    if len(cleaned) < 2:
+        return {cleaned} if cleaned else set()
+    return {cleaned[i:i + 2] for i in range(len(cleaned) - 1)}
+
+
+def text_similarity(a: str, b: str) -> float:
+    """二元组 Dice 系数，取值 0~1；用于本地知识库检索打分。"""
+    sa, sb = _bigrams(a), _bigrams(b)
+    if not sa or not sb:
+        return 0.0
+    return 2.0 * len(sa & sb) / (len(sa) + len(sb))
+
+
 # ----------------------------------------------------------------------
 # 1) 话题范围硬限制：本地意图判断（不调 LLM）
 # ----------------------------------------------------------------------

@@ -28,10 +28,11 @@ def _message(content, group_id="g1", member_id="m1"):
 
 @pytest.fixture
 def bot(monkeypatch):
-    """默认五层全开：白名单 = TEACHER_WHITELIST ∪ SUPER_ADMIN = {"teacher"}。"""
+    """默认五层全开：仅显式 QA_WHITELIST 限制成员，此处设为 {"teacher"}。"""
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
     monkeypatch.setattr(config, "SUPER_ADMIN", set())
+    monkeypatch.setattr(config, "QA_WHITELIST", {"teacher"})
     client = main.ACMBot()
     replies = []
 
@@ -198,7 +199,13 @@ async def test_whitelist_member_allowed(bot, monkeypatch):
 
 
 async def test_whitelist_falls_back_to_all_members_when_unconfigured(bot, monkeypatch):
-    monkeypatch.setattr(config, "TEACHER_WHITELIST", set())
+    """只配了老师白名单、未配问答白名单时，普通成员也必须能问。
+
+    这是曾经的真实故障：白名单回退到「老师 ∪ 超管」，
+    导致配了老师白名单的群只有管理员能和机器人对话。
+    """
+    monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
+    monkeypatch.setattr(config, "SUPER_ADMIN", {"admin"})
     monkeypatch.setattr(config, "QA_WHITELIST", set())
     non_command = AsyncMock(return_value=[{"group_id": "g1", "text": "全员可问。"}])
     monkeypatch.setattr(commands, "handle_non_command_message", non_command)
