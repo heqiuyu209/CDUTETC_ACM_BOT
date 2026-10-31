@@ -33,6 +33,7 @@ from database import (
     validate_delivery_claim,
 )
 from database import list_collections_all as _list_collections_all
+from database import get_competition_notify_groups
 
 logger = logging.getLogger(__name__)
 
@@ -202,14 +203,29 @@ def build_general_reminders(collections: list[dict], competitions: list[dict],
     for c in competitions:
         if c.get("status") != "confirmed":
             continue
+        # 通知范围：该比赛指定了通知群就只发这些群，否则发全部允许群。
+        # 这样「周赛」可以只发集训队群，不打扰新生群。
+        # 纯函数离线测试可能没有数据库，取不到映射时按「全部允许群」处理。
+        try:
+            scoped = get_competition_notify_groups(c["id"])
+        except (sqlite3.Error, OSError):
+            scoped = set()
+        targets = scoped & config.ALLOWED_GROUPS if scoped else set(config.ALLOWED_GROUPS)
+        if not targets:
+            # 指定了通知群但都不在允许列表里：宁可不提醒，也不要退回全群广播
+            if scoped:
+                logger.warning(
+                    "比赛 #%s 的通知群 %s 均不在允许列表中，跳过提醒",
+                    c["id"], ",".join(sorted(scoped)),
+                )
+            continue
         for kind, field in _COMP_FIELDS.items():
             target = _parse_time(c.get(field) or "")
             if target is None:
                 continue
-            delta = target - now
             offset = _due_offset_hours(target - now)
             if offset is not None:
-                for gid in sorted(config.ALLOWED_GROUPS):
+                for gid in sorted(targets):
                     out.append({
                         "group_id": gid,
                         "obj_type": "competition",

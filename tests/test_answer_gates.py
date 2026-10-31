@@ -421,3 +421,141 @@ async def test_capability_question_uses_fixed_text_without_model(monkeypatch):
         assert replies[0]["text"] == commands.CAPABILITY_TEXT
         assert "自动提醒" in replies[0]["text"]
     chat.assert_not_awaited()
+
+
+# ----------------------------------------------------------------------
+# 10) 比赛通知范围：周赛只发集训队群，课程只发本群
+# ----------------------------------------------------------------------
+def _new_competition(name: str, hours_from_now: int) -> int:
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    target = (now + timedelta(hours=hours_from_now)).strftime("%Y-%m-%d %H:%M")
+    info = {
+        "name": name, "edition": "", "official_time": target,
+        "official_reg_deadline": "", "official_site": "", "official_reg_start": "",
+        "tracks": "", "official_rules": "", "device_req": "", "summary": "",
+    }
+    pid = database.create_pending_publication(info, "g1", "", "", "sys")
+    cid, _ = database.approve_pending_publication(pid, "sys")
+    return cid
+
+
+def test_competition_without_scope_notifies_all_groups(memory_db, monkeypatch):
+    import reminder
+
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"TRAIN", "FRESH"})
+    _new_competition("蓝桥杯", 5)
+    comps = database.list_competitions(status="confirmed")
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    items = reminder.build_general_reminders(
+        [], comps, datetime.now(ZoneInfo("Asia/Shanghai"))
+    )
+    assert {item["group_id"] for item in items} == {"TRAIN", "FRESH"}
+
+
+def test_competition_scope_limits_reminder_groups(memory_db, monkeypatch):
+    """周赛限定到集训队群后，新生群不应收到提醒。"""
+    import reminder
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"TRAIN", "FRESH"})
+    cid = _new_competition("ACM 周赛（本周）", 5)
+    database.set_competition_notify_groups(cid, {"TRAIN"}, "admin")
+
+    items = reminder.build_general_reminders(
+        [], database.list_competitions(status="confirmed"),
+        datetime.now(ZoneInfo("Asia/Shanghai")),
+    )
+    assert [item["group_id"] for item in items] == ["TRAIN"]
+
+
+def test_scoped_competition_hidden_from_other_group_qa(memory_db, monkeypatch):
+    """限定群的比赛不进入其它群的问答上下文。"""
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"TRAIN", "FRESH"})
+    cid = _new_competition("ACM 周赛（本周）", 5)
+    database.set_competition_notify_groups(cid, {"TRAIN"}, "admin")
+
+    assert [c["name"] for c in database.list_question_contests("TRAIN")] == ["ACM 周赛（本周）"]
+    assert database.list_question_contests("FRESH") == []
+
+
+def test_scope_pointing_to_unknown_group_sends_nothing(memory_db, monkeypatch):
+    """范围里全是未授权群时宁可不提醒，绝不退回全群广播。"""
+    import reminder
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"TRAIN", "FRESH"})
+    cid = _new_competition("ACM 周赛（本周）", 5)
+    database.set_competition_notify_groups(cid, {"GONE"}, "admin")
+
+    items = reminder.build_general_reminders(
+        [], database.list_competitions(status="confirmed"),
+        datetime.now(ZoneInfo("Asia/Shanghai")),
+    )
+    assert items == []
+
+
+def test_publish_scope_defaults_to_source_group(memory_db, monkeypatch):
+    """发布时默认只把发布群设进范围：两个群各自发布互不干扰。"""
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"TRAIN", "FRESH"})
+    monkeypatch.setattr(config, "PUBLISH_SCOPE_TO_SOURCE", True)
+
+    cid_train = _new_competition("ACM 周赛（本周）", 5)
+    main._apply_publish_scope(cid_train, "TRAIN")
+    cid_fresh = _new_competition("新生赛", 6)
+    main._apply_publish_scope(cid_fresh, "FRESH")
+
+    assert database.get_competition_notify_groups(cid_train) == {"TRAIN"}
+    assert database.get_competition_notify_groups(cid_fresh) == {"FRESH"}
+
+    # 问答上下文同样按群隔离
+    assert [c["name"] for c in database.list_question_contests("TRAIN")] == ["ACM 周赛（本周）"]
+    assert [c["name"] for c in database.list_question_contests("FRESH")] == ["新生赛"]
+
+
+def test_publish_scope_can_be_disabled(memory_db, monkeypatch):
+    """关闭开关后发布不再设范围（保持全群通知）。"""
+    monkeypatch.setattr(config, "PUBLISH_SCOPE_TO_SOURCE", False)
+
+    cid = _new_competition("蓝桥杯", 5)
+    main._apply_publish_scope(cid, "TRAIN")
+    assert database.get_competition_notify_groups(cid) == set()
+
+
+def test_extend_scope_adds_second_group(memory_db, monkeypatch):
+    """同一比赛在另一个群再发布时，只扩展范围，不新建记录。"""
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"TRAIN", "FRESH"})
+    cid = _new_competition("蓝桥杯", 5)
+    database.set_competition_notify_groups(cid, {"TRAIN"}, "admin")
+
+    assert main._extend_scope_with_group(cid, "FRESH") is True
+    assert database.get_competition_notify_groups(cid) == {"TRAIN", "FRESH"}
+    # 重复扩展不再改变
+    assert main._extend_scope_with_group(cid, "FRESH") is False
+
+
+def test_training_reminder_stays_in_its_group(monkeypatch):
+    """课程提醒只发所属群，不跨群。"""
+    import reminder
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"TRAIN", "FRESH"})
+    # 2026-11-01 是周日；课程安排在当天 19:00，落在 24h 提醒窗口内
+    now = datetime(2026, 11, 1, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    session = {
+        "id": 1, "group_id": "FRESH", "title": "新生集训课",
+        "weekday": "周日", "start_time": "19:00", "end_time": "21:00",
+        "location": "机房", "needs_laptop": 0, "software": "",
+        "device_req": "", "training_group": "", "effective_start": "",
+        "effective_end": "", "status": "confirmed",
+    }
+    items = reminder.build_training_reminders([session], now)
+    assert items
+    assert {item["group_id"] for item in items} == {"FRESH"}

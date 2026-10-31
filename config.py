@@ -192,6 +192,9 @@ REMIND_OFFSET_HOURS = tuple(
 # ================= 发布确认（超管私聊） =================
 # 老师发布比赛后，整理结果先私聊推送给超管，超管回「同意/拒绝」才入库并通知群。
 PUBLISH_CONFIRM_ENABLED = os.getenv("ACM_PUBLISH_CONFIRM_ENABLED", "1") != "0"
+# 新发布的比赛默认只通知「发布它的那个群」（1=开启，推荐）。
+# 设为 0 则恢复旧行为：发布即通知所有允许群。
+PUBLISH_SCOPE_TO_SOURCE = os.getenv("ACM_PUBLISH_SCOPE_TO_SOURCE", "1") != "0"
 
 # ================= 自动周赛（v2） =================
 # 在提前提醒窗口前按模板生成周赛，启动时补最近未来场次；默认不通知全员，
@@ -204,6 +207,11 @@ WEEKLY_CONTEST_TEMPLATE = os.getenv(
     "ACM_WEEKLY_CONTEST_TEMPLATE",
     "ACM 周赛（本周）",
 )
+# 周赛只通知哪些群（逗号分隔）。留空 = 通知所有允许群。
+# 典型用法：周赛属于集训队，填集训队群号即可不打扰新生群。
+WEEKLY_CONTEST_GROUPS = {
+    g.strip() for g in os.getenv("ACM_WEEKLY_CONTEST_GROUPS", "").split(",") if g.strip()
+}
 
 # ================= 公共来源低频集中抓取（v2，默认关闭） =================
 # 自动抓取默认关闭：开启后同一来源两次抓取的最小间隔（分钟）由下值控制。

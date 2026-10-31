@@ -41,6 +41,7 @@
 | 发布比赛 | `@机器人 发布 https://example.com/contest` | 老师/超管 | 抓取 → 提取 → 校验 → 查重 → 私聊超管确认 |
 | 待确认申请 | `/待确认列表` | 老师看自己，超管看全部 | 查看等待超管确认的发布申请 |
 | 白名单管理 | `/加群 12345`、`/加老师 10001`、`/群列表` | 超管 | 动态授权群与老师，**立即生效无需重启** |
+| 通知范围 | `/通知群 5 111,222` | 超管 | 限定某场比赛只通知指定群；`全部` 恢复全局 |
 | 修正比赛 | `/修正 3 official_time=2026-12-01 19:00` | 超管 | 纠正已发布比赛字段并通知各群 |
 | 来源待审更新 | `/待审列表`、`/待审批准 3`、`/待审拒绝 3 原因` | 超管 | 处理后台来源更新；部分字段合并，回复仅发起群 |
 | 学校安排 | `/校安排` | 群成员 | 查看公开的学校统一安排 |
@@ -97,11 +98,13 @@ python scripts/export_collection.py --group-id '群openid' --collection-id 1 --o
 | `ACM_PUBLISH_CMD` | 否 | `发布` | 发布命令前缀 |
 | `ACM_GROUP_ACTIVE_MESSAGES_ENABLED` | 否 | `1` | 群主动通知与定时提醒总开关；设 `0` 暂停投递 |
 | `ACM_PUBLISH_CONFIRM_ENABLED` | 否 | `1` | 老师发布后先私聊超管确认，同意才入库并通知群 |
+| `ACM_PUBLISH_SCOPE_TO_SOURCE` | 否 | `1` | 新比赛只通知「发布它的那个群」；设 `0` 恢复全群通知 |
 | `ACM_AUTO_FETCH_ENABLED` | 否 | `0` | 公共来源自动抓取；关闭时仅 `/抓取一次` 可手动触发 |
 | `ACM_WEEKLY_CONTEST_ENABLED` | 否 | `1` | 自动生成周赛记录 |
 | `ACM_WEEKLY_CONTEST_WEEKDAY` | 否 | `6` | 周赛星期（0=周一 … 6=周日） |
 | `ACM_WEEKLY_CONTEST_START` / `_END` | 否 | `19:00` / `21:00` | 周赛起止时间 |
 | `ACM_WEEKLY_CONTEST_TEMPLATE` | 否 | `ACM 周赛（本周）` | 周赛记录名称模板 |
+| `ACM_WEEKLY_CONTEST_GROUPS` | 否 | 空 | 周赛只通知哪些群（逗号分隔）。**留空 = 通知所有允许群**；填集训队群号即可不打扰新生群 |
 | `ACM_LLM_BASE_URL` | 否 | `https://api.deepseek.com/v1` | 大模型接口地址 |
 | `ACM_LLM_MODEL` | 否 | `deepseek-chat` | 模型名 |
 | `ACM_LLM_MAX_INPUT_CHARS` | 否 | `6000` | 单次模型请求输入上限 |

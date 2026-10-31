@@ -24,6 +24,7 @@ import contextvars
 import json
 import logging
 import re
+import sqlite3
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -149,6 +150,43 @@ _PUBLISH_DECISION_RE = re.compile(
     r"\s*(?P<pid>\d+)?\s*(?P<note>.*)$",
     re.IGNORECASE,
 )
+
+
+def _apply_publish_scope(cid: int, group_id: str) -> None:
+    """新发布的比赛默认只通知「发布它的群」。
+
+    这样集训队群发的比赛不会打扰新生群，反之亦然。
+    想通知多个群时用 /通知群 <id> 群号,群号 扩展。
+    ACM_PUBLISH_SCOPE_TO_SOURCE=0 可恢复「发布即通知全部群」的旧行为。
+    """
+    if not config.PUBLISH_SCOPE_TO_SOURCE or not group_id:
+        return
+    try:
+        db.set_competition_notify_groups(cid, {group_id}, operator="publish:scope")
+    except (sqlite3.Error, ValueError) as e:
+        logger.warning("发布通知范围设置失败: %s", e)
+
+
+def _extend_scope_with_group(cid: int, group_id: str) -> bool:
+    """把某个群并入比赛通知范围。返回是否真的新增了群。
+
+    范围原本为空（=全部允许群）时不改动，返回 False。
+    """
+    if not group_id:
+        return False
+    try:
+        scope = db.get_competition_notify_groups(cid)
+    except (sqlite3.Error, ValueError):
+        return False
+    if not scope or group_id in scope:
+        return False
+    scope.add(group_id)
+    try:
+        db.set_competition_notify_groups(cid, scope, operator="publish:extend")
+    except (sqlite3.Error, ValueError) as e:
+        logger.warning("扩展通知范围失败: %s", e)
+        return False
+    return True
 
 # 这些命令不依赖具体群，未配置任何允许群时也要放行（否则无法引导加第一个群）
 _GROUP_FREE_COMMANDS = frozenset(
@@ -322,14 +360,19 @@ class ACMBot:
             if approve:
                 cid, created = db.approve_pending_publication(pid, operator=uid)
                 pending_item = db.get_pending_publication(pid) or {}
+                source_group = pending_item.get("group_id") or ""
                 if created:
+                    _apply_publish_scope(cid, source_group)
                     await self.client.send_private_msg(
-                        uid, f"已入库：#{cid} {pending_item.get('name') or ''}，正在通知各群。"
+                        uid, f"已入库：#{cid} {pending_item.get('name') or ''}，正在通知本群。"
                     )
                     await self._notify_publish_group(pending_item, cid)
                 else:
+                    # 已存在同场比赛：把来源群并入通知范围，不再新建
+                    extended = _extend_scope_with_group(cid, source_group)
+                    hint = "已把该群加入通知范围。" if extended else "该群已在通知范围内。"
                     await self.client.send_private_msg(
-                        uid, f"该比赛已存在（编号 {cid}），未重复入库、未发送群通知。"
+                        uid, f"该比赛已存在（编号 {cid}），未重复入库。{hint}"
                     )
             else:
                 if not db.reject_pending_publication(pid, operator=uid, note=note):
@@ -341,10 +384,14 @@ class ACMBot:
         return True
 
     async def _notify_publish_group(self, pending_item: dict, cid: int) -> None:
-        """超管同意后向所有允许群发送新比赛通知。"""
+        """超管同意后发送新比赛通知：只发给该比赛的通知范围（默认仅来源群）。"""
         info = json.loads(pending_item.get("fields_json") or "{}")
         notice = _build_publish_notice(info, cid)
-        targets = sorted(config.ALLOWED_GROUPS)
+        try:
+            scope = db.get_competition_notify_groups(cid)
+        except (sqlite3.Error, ValueError):
+            scope = set()
+        targets = sorted(scope & config.ALLOWED_GROUPS) if scope else sorted(config.ALLOWED_GROUPS)
         sent = 0
         for gid in targets:
             if await self._send_group(gid, notice):
@@ -552,12 +599,25 @@ class ACMBot:
         # 查重：名称+届次+比赛时间完全一致才判为重复（不看链接，转发消息也能查出）
         duplicate = db.find_duplicate_competition(competition_info)
         if duplicate is not None and duplicate.get("status") == "confirmed":
-            await self._safe_reply(
-                message,
-                f"该比赛已存在（编号 {duplicate['id']}，"
-                f"{duplicate['name']} {duplicate.get('official_time') or '时间待定'}），"
-                "本次未重复发布。",
-            )
+            cid = duplicate["id"]
+            # 同一场比赛在另一个群再次发布：不新建记录，只把本群加入通知范围，
+            # 这样「本群发布的比赛在本群提醒」和「一场公开比赛通知多个群」都满足。
+            scope = db.get_competition_notify_groups(cid)
+            if scope and group_id not in scope:
+                scope.add(group_id)
+                db.set_competition_notify_groups(cid, scope, operator=f"publish:{member_id}")
+                await self._safe_reply(
+                    message,
+                    f"该比赛已存在（编号 {cid}），已把本群加入通知范围，"
+                    "之后的提醒本群也会收到。",
+                )
+            else:
+                await self._safe_reply(
+                    message,
+                    f"该比赛已存在（编号 {cid}，"
+                    f"{duplicate['name']} {duplicate.get('official_time') or '时间待定'}），"
+                    "本群已在其通知范围内，本次未重复发布。",
+                )
             return
 
         # 超管确认流程：老师发布 → 整理结果私聊超管 → 同意才入库并通知群
@@ -607,9 +667,11 @@ class ACMBot:
             return
 
         if not created:
-            await self._safe_reply(message, f"该比赛已存档（编号 {cid}），本次未重复发布或发送群通知。")
+            await self._safe_reply(message, f"该比赛已存档（编号 {cid}），本群已在通知范围内。")
             return
 
+        # 新比赛默认只通知发布它的群
+        _apply_publish_scope(cid, group_id)
         logger.info("已免审发布比赛: %s（群 %s）", info.get("name"), group_id)
         display_info = {
             **info,
@@ -618,7 +680,12 @@ class ACMBot:
         }
         await self._safe_reply(message, _build_confirm(display_info) + "\n已免审发布为正式比赛。")
         notice = _build_publish_notice(competition_info, cid)
-        targets = sorted(config.ALLOWED_GROUPS)
+        # 只发该比赛的通知范围（默认即发布它的群），不再全群广播
+        try:
+            scope = db.get_competition_notify_groups(cid)
+        except (sqlite3.Error, ValueError):
+            scope = set()
+        targets = sorted(scope & config.ALLOWED_GROUPS) if scope else sorted(config.ALLOWED_GROUPS)
         sent = 0
         for gid in targets:
             if await self._send_group(gid, notice):
@@ -715,6 +782,16 @@ class ACMBot:
         except ValueError as e:
             logger.warning("自动周赛生成失败: %s", e)
             return
+        # 周赛通知范围完全由配置决定：每次运行都对齐（含清空），
+        # 这样改 ACM_WEEKLY_CONTEST_GROUPS 后对本周已生成的记录也立即生效。
+        # 注意不要与 ALLOWED_GROUPS 求交后写回：若交集为空会变成「空=全部群」，
+        # 反而把周赛推给所有群。这里按配置原样写入，取不到有效群时宁可不提醒。
+        desired = set(config.WEEKLY_CONTEST_GROUPS)
+        try:
+            if db.get_competition_notify_groups(cid) != desired:
+                db.set_competition_notify_groups(cid, desired, operator="weekly:auto")
+        except (sqlite3.Error, ValueError) as e:
+            logger.warning("周赛通知群设置失败: %s", e)
         if not created:
             logger.info("该周周赛记录已存在，跳过自动生成（比赛 id=%s）", cid)
             return

@@ -80,6 +80,7 @@ _HELP_SUPER = """--- 比赛修正与来源待审（超管） ---
 /加老师 <QQ号> [备注]    添加老师
 /删老师 <QQ号>           移除动态添加的老师
 /群列表                  查看当前生效的群、老师与超管
+/通知群 <比赛id> <群号,群号>  限定该比赛只通知哪些群（全部 恢复）
 --- 私聊管理（超管） ---
 可私聊机器人发送 /FAQ添加 /FAQ删除 /课程添加 /课程取消 等命令，
 作用于默认管理群（ACM_ADMIN_GROUP，留空取首个允许群）。
@@ -610,6 +611,47 @@ def cmd_teacher_list(group_id: str, sender: str, args: str) -> list[dict]:
     return [{"group_id": group_id, "text": roles.describe()}]
 
 
+def cmd_notify_groups(group_id: str, sender: str, args: str) -> list[dict]:
+    """设置某场比赛只通知哪些群（超管）。用于把周赛限制在集训队群。"""
+    if not is_super_admin(sender):
+        return [{"group_id": group_id, "text": "仅超管可设置比赛通知群"}]
+    parts = (args or "").strip().split(None, 1)
+    if not parts:
+        return [{"group_id": group_id,
+                 "text": "用法：/通知群 <比赛id> <群号,群号>\n"
+                         "      /通知群 <比赛id> 全部   （恢复通知所有允许群）\n"
+                         "      /通知群 <比赛id>         （查看当前范围）"}]
+    try:
+        cid = int(parts[0])
+    except ValueError:
+        return [{"group_id": group_id, "text": "比赛 id 应为数字"}]
+    comp = db.get_competition(cid)
+    if comp is None:
+        return [{"group_id": group_id, "text": f"比赛 #{cid} 不存在"}]
+    current = db.get_competition_notify_groups(cid)
+    if len(parts) == 1:
+        scope = "、".join(sorted(current)) if current else "全部允许群"
+        return [{"group_id": group_id,
+                 "text": f"比赛 #{cid}「{comp['name']}」当前通知范围：{scope}"}]
+    spec = parts[1].strip()
+    if spec in ("全部", "all", "0"):
+        db.set_competition_notify_groups(cid, set(), operator=sender)
+        return [{"group_id": group_id,
+                 "text": f"比赛 #{cid} 已恢复为通知全部允许群"}]
+    targets = {g.strip() for g in re.split(r"[,，\s]+", spec) if g.strip()}
+    bad = [g for g in targets if not g.isdigit()]
+    if bad:
+        return [{"group_id": group_id, "text": f"群号应为纯数字：{','.join(bad)}"}]
+    unknown = targets - config.ALLOWED_GROUPS
+    if unknown:
+        return [{"group_id": group_id,
+                 "text": f"这些群未授权，先用 /加群 添加：{','.join(sorted(unknown))}"}]
+    count = db.set_competition_notify_groups(cid, targets, operator=sender)
+    return [{"group_id": group_id,
+             "text": f"比赛 #{cid}「{comp['name']}」将只通知 {count} 个群："
+                     f"{'、'.join(sorted(targets))}"}]
+
+
 def cmd_ask(group_id: str, sender: str, args: str) -> list[dict]:
     """记录未答问题。若 FAQ 已命中（上层先查过），不会走到这里。"""
     question = args.strip()
@@ -772,6 +814,7 @@ async def handle_command(text: str, group_id: str, sender: str) -> list[dict] | 
         "加老师": cmd_teacher_add,
         "删老师": cmd_teacher_remove,
         "老师列表": cmd_teacher_list,
+        "通知群": cmd_notify_groups,
         "提问": cmd_ask,
         "问题列表": cmd_question_list,
         "回答": cmd_answer_question,

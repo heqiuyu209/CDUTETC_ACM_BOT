@@ -142,6 +142,16 @@ CREATE TABLE IF NOT EXISTS runtime_teachers (
 )
 """
 
+# 比赛的通知群范围：有记录 = 只通知这些群；无记录 = 通知全部允许群（默认）。
+# 用于把「周赛」限制在集训队群，避免发到新生群。
+_COMPETITION_NOTIFY_GROUPS_DDL = """
+CREATE TABLE IF NOT EXISTS competition_notify_groups (
+    competition_id  INTEGER NOT NULL,
+    group_id        TEXT NOT NULL,
+    PRIMARY KEY (competition_id, group_id)
+)
+"""
+
 _COMPETITION_SOURCES_DDL = """
 CREATE TABLE IF NOT EXISTS competition_sources (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -346,6 +356,7 @@ _ALL_DDL = (
     _PENDING_PUBLICATIONS_DDL,
     _RUNTIME_WHITELIST_DDL,
     _RUNTIME_TEACHER_DDL,
+    _COMPETITION_NOTIFY_GROUPS_DDL,
     _COMPETITION_SOURCES_DDL, _COMPETITION_VERSIONS_DDL,
     _PENDING_UPDATES_DDL,
     _ORG_EVENTS_DDL,
@@ -572,7 +583,17 @@ def list_question_contests(group_id: str, limit: int = 5) -> list[dict]:
                        official_time AS contest_time, '' AS mode, '' AS location,
                        official_site AS source_link, updated_at AS sort_time,
                        1 AS is_public, id
-                FROM competitions WHERE status = 'confirmed'
+                FROM competitions c WHERE status = 'confirmed'
+                  AND (
+                    NOT EXISTS (
+                        SELECT 1 FROM competition_notify_groups ng
+                        WHERE ng.competition_id = c.id
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM competition_notify_groups ng2
+                        WHERE ng2.competition_id = c.id AND ng2.group_id = ?
+                    )
+                  )
                 UNION ALL
                 SELECT name, reg_deadline, contest_time, mode, location,
                        source_link, created_at AS sort_time, 0 AS is_public, id
@@ -581,7 +602,7 @@ def list_question_contests(group_id: str, limit: int = 5) -> list[dict]:
             ORDER BY sort_time DESC, is_public DESC, id DESC
             LIMIT ?
             """,
-            (group_id, limit),
+            (group_id, group_id, limit),
         ).fetchall()
     return [dict(zip(fields, row)) for row in rows]
 
@@ -759,6 +780,41 @@ def get_competition(cid: int) -> dict | None:
             f"SELECT {_COMPETITION_COLS} FROM competitions WHERE id = ?", (cid,)
         ).fetchone()
     return _row_to_competition(row) if row else None
+
+
+def get_competition_notify_groups(competition_id: int) -> set[str]:
+    """返回该比赛指定的通知群；空集合表示「通知全部允许群」。"""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT group_id FROM competition_notify_groups WHERE competition_id = ?",
+            (competition_id,),
+        ).fetchall()
+    return {r[0] for r in rows}
+
+
+def set_competition_notify_groups(competition_id: int, group_ids,
+                                  operator: str = "") -> int:
+    """设置比赛的通知群范围。传空集合表示恢复为「全部允许群」。
+
+    Returns:
+        实际写入的群数（0 表示已清空为全局）。
+    """
+    groups = {str(g).strip() for g in (group_ids or []) if str(g).strip()}
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "DELETE FROM competition_notify_groups WHERE competition_id = ?",
+            (competition_id,),
+        )
+        for gid in sorted(groups):
+            conn.execute(
+                "INSERT OR IGNORE INTO competition_notify_groups"
+                " (competition_id, group_id) VALUES (?, ?)",
+                (competition_id, gid),
+            )
+        add_audit(operator, "", "set_notify_groups", "competition",
+                  str(competition_id), "", ",".join(sorted(groups)), conn=conn)
+        return len(groups)
 
 
 def list_competitions(status: str | None = None) -> list[dict]:
