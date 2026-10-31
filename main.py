@@ -42,14 +42,14 @@ import roles
 from contest_fields import map_competition_info
 from database import create_published_competition_once, init_db
 from fetcher import FetchError, fetch_text
-from llm import extract_contest
+from llm import extract_contest, normalize_time
 from reminder import check_general_reminders, check_reminders
 from utils import (
     admin_group_id,
     can_manage_group,
     extract_url,
     is_allowed_group,
-    is_publish_command,
+    match_publish_command,
     is_super_admin,
     mentioned_user_ids,
     parse_command,
@@ -118,6 +118,39 @@ def _build_publish_notice(info: dict, cid: int) -> str:
         lines.append(f"官网：{info['official_site'].strip()}")
     lines.append("请及时查看并提前做好准备~")
     return "\n".join(lines)
+
+
+_TIME_FIELD_LABELS = (
+    ("official_reg_start", "报名开始"),
+    ("official_reg_deadline", "报名截止"),
+    ("official_time", "比赛时间"),
+)
+
+
+def _sanitize_publish_times(info: dict) -> tuple[dict, list[str]]:
+    """把解析不了的时间降级为空串，并把原文记进简介，绝不因此拒绝保存。
+
+    校赛常见「下学期开学初」这类表述，数据库只接受 YYYY-MM-DD HH:MM。
+    强行入库会在超管同意时报错，因此在这里先降级：时间留空（=待定），
+    原文写进简介，回执里也提示出来，等日期确定后再 /修正 补。
+    """
+    cleaned = dict(info)
+    notes: list[str] = []
+    for key, label in _TIME_FIELD_LABELS:
+        raw = (cleaned.get(key) or "").strip()
+        if not raw:
+            continue
+        normalized = normalize_time(raw)
+        if normalized is None:
+            notes.append(f"{label}待定：{raw}")
+            cleaned[key] = ""
+        else:
+            cleaned[key] = normalized
+    if notes:
+        existing = (cleaned.get("summary") or "").strip()
+        merged = "；".join(notes)
+        cleaned["summary"] = f"{existing}\n{merged}".strip() if existing else merged
+    return cleaned, notes
 
 
 def _format_remind_offsets() -> str:
@@ -496,7 +529,7 @@ class ACMBot:
             else:
                 allowed_without_at = (
                     text.startswith("/")
-                    or is_publish_command(text, config.PUBLISH_CMD)
+                    or match_publish_command(text, config.PUBLISH_CMD) is not None
                 )
             if not addressed and not allowed_without_at:
                 logger.info(
@@ -507,8 +540,9 @@ class ACMBot:
                 )
                 return
             member_id = self._extract_member_id(message)
-            if is_publish_command(text, config.PUBLISH_CMD):
-                await self._handle_publish(message, text, group_id, member_id)
+            publish_payload = match_publish_command(text, config.PUBLISH_CMD)
+            if publish_payload is not None:
+                await self._handle_publish(message, publish_payload, group_id, member_id)
                 return
             replies = await commands.handle_command(text, group_id, member_id)
             if replies is None:
@@ -648,6 +682,9 @@ class ACMBot:
         except ValueError as e:
             await self._safe_reply(message, f"信息校验失败：{e}")
             return
+
+        # 时间解析不了（如「下学期开学初」）就降级为待定，原文记入简介，不算失败
+        competition_info, _ = _sanitize_publish_times(competition_info)
 
         # 查重：名称+届次+比赛时间完全一致才判为重复（不看链接，转发消息也能查出）
         duplicate = db.find_duplicate_competition(competition_info)

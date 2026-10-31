@@ -211,6 +211,23 @@ def test_publish_receipt_shows_saved_and_missing_fields():
     assert "提醒" in text
 
 
+def test_sanitize_downgrades_fuzzy_time():
+    """「下学期开学初」这类表述要降级为待定并记进简介，不能报错。"""
+    info = {"name": "第二届理工ACM排名赛", "official_time": "下学期开学初",
+            "official_reg_deadline": "", "summary": "两校同台"}
+    cleaned, notes = main._sanitize_publish_times(info)
+    assert cleaned["official_time"] == ""
+    assert "下学期开学初" in cleaned["summary"]
+    assert notes and "比赛时间待定" in notes[0]
+
+
+def test_sanitize_keeps_valid_time():
+    info = {"name": "x", "official_time": "2027-03-01 09:00", "summary": ""}
+    cleaned, notes = main._sanitize_publish_times(info)
+    assert cleaned["official_time"] == "2027-03-01 09:00"
+    assert notes == []
+
+
 def test_publish_receipt_without_time_says_no_reminder():
     text = main._build_publish_receipt(
         {"name": "某比赛", "official_time": ""}, status="待超管确认", ref=3

@@ -43,6 +43,33 @@ def is_publish_command(text: str, cmd: str = "发布") -> bool:
     return not rest or rest[0].isspace() or rest.startswith(("http://", "https://"))
 
 
+# 发布命令的可用写法（老师习惯用斜杠，也习惯叫“添加比赛”）。
+# 顺序按长度从大到小，避免短前缀先命中长命令。
+_PUBLISH_PREFIXES = ("/添加比赛", "添加比赛", "/发布", "发布")
+
+
+def match_publish_command(text: str, cmd: str = "发布") -> str | None:
+    """识别发布命令并返回正文；不是发布命令返回 None。
+
+    支持 `发布 …`、`/发布 …`、`添加比赛 …`、`/添加比赛 …` 四种写法；
+    命令后必须是空白或链接，避免把「发布什么比赛」这类提问当成命令。
+    """
+    s = (text or "").strip()
+    prefixes = list(_PUBLISH_PREFIXES)
+    if cmd and f"/{cmd}" not in prefixes:
+        prefixes = [f"/{cmd}", cmd, *prefixes]
+    for prefix in prefixes:
+        if not s.startswith(prefix):
+            continue
+        rest = s[len(prefix):]
+        if not rest:
+            return ""
+        if not rest[0].isspace() and not rest.startswith(("http://", "https://", "www.")):
+            continue
+        return rest.strip()
+    return None
+
+
 def is_allowed_group(group_id: str | None, allowed_groups: set[str]) -> bool:
     """群是否在服务白名单。未配置白名单 = 不允许任何群。"""
     return bool(group_id) and group_id in allowed_groups
