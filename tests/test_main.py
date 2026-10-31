@@ -195,13 +195,27 @@ async def test_command_route_to_commands(bot, monkeypatch):
     assert "帮助文本" in replies and "第二段" in replies
 
 
-async def test_build_confirm_contains_info(bot):
+def test_publish_receipt_shows_saved_and_missing_fields():
+    """发布回执要让发布者一眼看到「存了什么、缺什么、下一步」。"""
     info = {
-        "name": "蓝桥杯", "reg_deadline": "2026-11-01 10:30",
-        "contest_time": "2026-11-05 09:00", "mode": "线上", "location": "",
+        "name": "蓝桥杯",
+        "official_reg_deadline": "2026-11-01 10:30",
+        "official_time": "2026-11-05 09:00",
+        "official_site": "",
     }
-    text = main._build_confirm(info)
-    assert "蓝桥杯" in text and "2026-11-01 10:30" in text
+    text = main._build_publish_receipt(info, status="待超管确认", ref=12)
+    assert "✅ 已保存：蓝桥杯" in text
+    assert "#12" in text and "待超管确认" in text
+    assert "2026-11-01 10:30" in text
+    assert "暂无信息" in text and "官网" in text
+    assert "提醒" in text
+
+
+def test_publish_receipt_without_time_says_no_reminder():
+    text = main._build_publish_receipt(
+        {"name": "某比赛", "official_time": ""}, status="待超管确认", ref=3
+    )
+    assert "时间未定" in text and "补上比赛时间" in text
 
 
 async def test_integer_onebot_ids_and_cq_mention_route_as_string_identities(bot, monkeypatch):

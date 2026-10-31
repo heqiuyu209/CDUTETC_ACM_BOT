@@ -88,7 +88,7 @@ def _notification_summary(sent: int, total: int) -> str:
 
 
 def _build_confirm(info: dict) -> str:
-    """构造存档成功后的确认回复。"""
+    """旧版确认话术，保留兼容；新流程统一用 _build_publish_receipt。"""
     return (
         "比赛信息已记录~\n"
         f"比赛：{info.get('name') or '未知'}\n"
@@ -120,6 +120,58 @@ def _build_publish_notice(info: dict, cid: int) -> str:
     return "\n".join(lines)
 
 
+def _format_remind_offsets() -> str:
+    """把提醒节点格式化成「24 小时、1 小时」这种可读形式。"""
+    def human(hours: float) -> str:
+        if hours >= 1:
+            return f"{hours:g} 小时"
+        return f"{round(hours * 60):d} 分钟"
+
+    return "、".join(human(h) for h in config.REMIND_OFFSET_HOURS)
+
+
+# 发布回执里展示的字段顺序（名称单独处理）
+_RECEIPT_FIELDS = (
+    ("届次", "edition"),
+    ("报名开始", "official_reg_start"),
+    ("报名截止", "official_reg_deadline"),
+    ("比赛时间", "official_time"),
+    ("赛道", "tracks"),
+    ("设备要求", "device_req"),
+    ("官网", "official_site"),
+    ("简介", "summary"),
+)
+
+
+def _build_publish_receipt(info: dict, *, status: str, ref: int) -> str:
+    """构造发布回执：清楚告诉发布者「存了什么、缺什么、下一步是什么」。
+
+    status 取值「待超管确认」或「已入库」；ref 为申请编号或比赛编号。
+    """
+    filled, missing = [], []
+    for label, key in _RECEIPT_FIELDS:
+        value = (info.get(key) or "").strip()
+        if value:
+            filled.append(f"{label}：{value}")
+        else:
+            missing.append(label)
+
+    lines = [f"✅ 已保存：{info.get('name') or '未命名比赛'}"]
+    lines.append(f"编号：#{ref}（{status}）")
+    lines.extend(filled)
+    if missing:
+        lines.append(f"暂无信息：{'、'.join(missing)}（不影响使用，后续可用 /修正 补充）")
+
+    remind_time = (info.get("official_time") or "").strip()
+    if remind_time:
+        lines.append(
+            f"提醒：比赛开始前 {_format_remind_offsets()}会自动发到群里"
+        )
+    else:
+        lines.append("提醒：时间未定，补上比赛时间后才会自动提醒")
+    return "\n".join(lines)
+
+
 def _build_publish_review(pending: dict) -> str:
     """构造发给超管的待确认申请正文（含全部已整理字段与查重提示）。"""
     info = json.loads(pending.get("fields_json") or "{}")
@@ -134,6 +186,8 @@ def _build_publish_review(pending: dict) -> str:
                        ("官网", "official_site")):
         value = (info.get(key) or "").strip()
         lines.append(f"{label}：{value or '未提供'}")
+    if (info.get("official_time") or "").strip():
+        lines.append(f"提醒计划：开始前 {_format_remind_offsets()}各一次")
     lines.append(f"来源群：{pending.get('group_id') or '未知'}")
     lines.append(f"提交人：{pending.get('submitted_by') or '未知'}")
     if pending.get("duplicate_note"):
@@ -141,7 +195,7 @@ def _build_publish_review(pending: dict) -> str:
     else:
         lines.append("查重：未发现名称+届次+比赛时间完全一致的记录")
     lines.append("")
-    lines.append(f"回复「同意 {pending['id']}」入库并通知各群，或「拒绝 {pending['id']}」丢弃。")
+    lines.append(f"回复「同意 {pending['id']}」入库并通知群，或「拒绝 {pending['id']}」丢弃。")
     return "\n".join(lines)
 
 
@@ -564,28 +618,27 @@ class ACMBot:
             await self._safe_reply(message, "抱歉，你没有发布比赛信息的权限~")
             return
 
-        url = extract_url(text)
-        if not url:
-            await self._safe_reply(
-                message, "请带上比赛链接，例如：发布 https://example.com/contest"
-            )
-            return
+        # 有链接就抓官网正文；没有链接也允许发布——直接把老师发来的文字
+        # 当作信息源，「有什么先存什么」，不强迫补链接。
+        url = extract_url(text) or ""
+        if url:
+            try:
+                page = await fetch_text(url)
+            except FetchError as e:
+                # 抓取失败不中断：退化为按老师原文提取，保证信息不丢
+                logger.warning("链接抓取失败，改为按原文提取: %s", e)
+                page = ""
+                await self._safe_reply(message, f"链接打不开（{e}），我先按你发来的文字保存。")
+        else:
+            page = ""
 
-        try:
-            page = await fetch_text(url)
-        except FetchError as e:
-            await self._safe_reply(
-                message,
-                f"链接抓取失败：{e}。可以换个可访问的链接，或直接把比赛信息发给我~",
-            )
-            return
-
-        info, err = await extract_contest(f"链接正文：{page}\n老师原文补充：{text}")
+        raw_text = f"链接正文：{page}\n老师原文：{text}" if page else f"老师原文：{text}"
+        info, err = await extract_contest(raw_text)
         if err is not None or not info:
             await self._safe_reply(
                 message,
                 f"信息提取失败：{err or '未知原因'}。"
-                "可以直接告诉我：比赛名称、报名截止/比赛时间（YYYY-MM-DD HH:MM）、形式、地点~",
+                "可以再发一次，尽量包含比赛名称和时间；实在没有也能先存个名字~",
             )
             return
 
@@ -643,13 +696,13 @@ class ACMBot:
             if sent:
                 await self._safe_reply(
                     message,
-                    f"已整理完毕并提交超管确认（申请 #{pid}）。"
-                    "超管同意后会自动入库并通知各群。",
+                    _build_publish_receipt(competition_info, status="待超管确认", ref=pid),
                 )
             else:
                 await self._safe_reply(
                     message,
-                    f"已整理为申请 #{pid}，但超管私聊推送失败，请提醒超管查看待确认列表。",
+                    _build_publish_receipt(competition_info, status="待超管确认", ref=pid)
+                    + "\n（超管私聊推送失败，请提醒超管查看 /待确认列表）",
                 )
             logger.info("发布申请 #%s 已提交超管确认：%s", pid, info.get("name"))
             return
@@ -673,12 +726,6 @@ class ACMBot:
         # 新比赛默认只通知发布它的群
         _apply_publish_scope(cid, group_id)
         logger.info("已免审发布比赛: %s（群 %s）", info.get("name"), group_id)
-        display_info = {
-            **info,
-            "reg_deadline": competition_info.get("official_reg_deadline", ""),
-            "contest_time": competition_info.get("official_time", ""),
-        }
-        await self._safe_reply(message, _build_confirm(display_info) + "\n已免审发布为正式比赛。")
         notice = _build_publish_notice(competition_info, cid)
         # 只发该比赛的通知范围（默认即发布它的群），不再全群广播
         try:
@@ -690,7 +737,11 @@ class ACMBot:
         for gid in targets:
             if await self._send_group(gid, notice):
                 sent += 1
-        await self._safe_reply(message, _notification_summary(sent, len(targets)))
+        await self._safe_reply(
+            message,
+            _build_publish_receipt(competition_info, status="已入库", ref=cid)
+            + f"\n通知：已发送到 {sent}/{len(targets)} 个群",
+        )
 
     async def _safe_reply(self, message: OneBotMessage, content: str) -> bool:
         """群内被动回复：普通 QQ 无平台 5 次上限，直接发回原群。"""
