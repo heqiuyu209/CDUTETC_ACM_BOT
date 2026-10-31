@@ -106,6 +106,23 @@ ENV_ADDED_KEYS = _sync_env_keys()
 # 加载项目根目录下的 .env（若存在）。系统环境变量优先，.env 不覆盖已注入的值。
 load_dotenv(ENV_FILE, override=False)
 
+# .env 里写成 `KEY=` 的空值会被 os.getenv 当成「已设置」，从而吃掉代码里的
+# 默认值（曾导致 ACM_DB_PATH 为空 → 连到临时库 → 机器人整体不可用）。
+# 这里统一把空的 ACM_* 变量移除，让默认值生效；对本来默认就是空串的项无影响。
+def _drop_empty_env(environ=None) -> list[str]:
+    """删除值为空的 ACM_* 环境变量，返回被删除的键名。"""
+    target = os.environ if environ is None else environ
+    removed = [
+        key for key in list(target)
+        if key.startswith("ACM_") and not str(target[key]).strip()
+    ]
+    for key in removed:
+        target.pop(key, None)
+    return removed
+
+
+ENV_DROPPED_EMPTY = _drop_empty_env()
+
 # ================= QQ 机器人接入（OneBot/NapCat，必填） =================
 # NapCatQQ 正向 WebSocket 地址，例如 ws://127.0.0.1:3001
 ONEBOT_WS_URL = os.getenv("ACM_ONEBOT_WS_URL", "")
