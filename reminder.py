@@ -3,8 +3,8 @@
 - 业务时间统一为北京时间 Asia/Shanghai（zoneinfo）。
 - 阶段一比赛提醒（contests/reminders 表，兼容保留）：
   去重键 = (群, 比赛, 提醒类型, 目标时间)；比赛时间被修改后键变化，可重新提醒。
-- v2 征集提醒（reminder_deliveries 表）：
-  覆盖「征集报名截止」「公共比赛报名截止/开赛」，
+- v2 通用提醒（reminder_deliveries 表）：
+  覆盖「征集报名截止」「公共比赛报名截止/开赛」「周期课程具体开课实例」，
   去重键含群、对象、提醒类型和目标时间，兼容旧冒号键；
   SQLite 原子领取与租约防止并发发送；成功回执标记 sent，失败有界重试。
 - 按群发送：send_group(group_id, text) 由上层注入，保证提醒发到对象所属群。
@@ -25,9 +25,11 @@ from database import (
     has_reminded,
     list_competitions,
     list_contests,
+    list_training_sessions,
     mark_reminded,
     record_delivery_success,
     reconcile_deliveries,
+    training_occurrence_times,
     validate_delivery_claim,
 )
 from database import list_collections_all as _list_collections_all
@@ -135,7 +137,7 @@ async def check_reminders(send_group) -> int:
 
 
 # ---------------------------------------------------------------------
-# v2 通用提醒：征集报名截止 / 群订阅公共比赛
+# v2 通用提醒：征集报名截止 / 公共比赛 / 群课程开课
 # ---------------------------------------------------------------------
 
 _COLLECTION_LABELS = {"deadline": "报名截止"}
@@ -205,6 +207,35 @@ def _delivery_key(item: dict) -> str:
                               item["remind_type"], item["target_str"])
 
 
+def build_training_reminders(sessions: list[dict], now: datetime) -> list[dict]:
+    """按课程的具体开课日期生成群提醒；每周实例独立去重。"""
+    out = []
+    for session in sessions:
+        group_id = session.get("group_id")
+        if group_id not in config.ALLOWED_GROUPS:
+            continue
+        for target in training_occurrence_times(session, now, REMIND_BEFORE_HOURS):
+            target_str = target.strftime("%Y-%m-%d %H:%M:%S" if target.second else "%Y-%m-%d %H:%M")
+            details = []
+            if session.get("needs_laptop"):
+                details.append("需带电脑")
+            if session.get("software"):
+                details.append(f"软件：{session['software']}")
+            if session.get("device_req"):
+                details.append(f"设备：{session['device_req']}")
+            out.append({
+                "group_id": group_id, "obj_type": "training_session", "obj_id": session["id"],
+                "remind_type": "start_time", "target_str": target_str,
+                "text": (
+                    f"【提醒】课程「{session['title']}」开始：{target_str}\n"
+                    f"地点：{session.get('location') or '待定'}"
+                    + ("\n" + "；".join(details) if details else "")
+                    + "\n请提前做好训练准备！"
+                ),
+            })
+    return out
+
+
 async def check_general_reminders(send_group, now: datetime | None = None,
                                   max_attempts: int = _DELIVERY_MAX_ATTEMPTS) -> int:
     """复核计划、原子领取并发送；成功回执 sent，失败有界重试。
@@ -228,6 +259,10 @@ async def check_general_reminders(send_group, now: datetime | None = None,
     reconcile_deliveries(current_time(), max_attempts=max_attempts,
                          allowed_groups=set(config.ALLOWED_GROUPS))
     items = build_general_reminders(_list_collections_all(), list_competitions(status="confirmed"), current_time())
+    # 按群取课程，不按当前是否已生效过滤；首次开课前同样需要提前提醒。
+    sessions = [session for gid in sorted(config.ALLOWED_GROUPS)
+                for session in list_training_sessions(gid, active_only=False)]
+    items.extend(build_training_reminders(sessions, current_time()))
     sent = 0
     for item in items:
         key = _delivery_key(item)

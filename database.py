@@ -1244,6 +1244,64 @@ _TRAINING_COLS = (
 )
 
 
+def _training_weekday(text: str) -> int | None:
+    names = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+    text = (text or "").strip()
+    if text.startswith("每"):
+        text = text[1:]
+    for prefix in ("星期", "礼拜", "周"):
+        if text.startswith(prefix):
+            return names.get(text[len(prefix):])
+    return None
+
+
+def _training_start_clock(text: str):
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).time()
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def training_occurrence_valid(session: dict, target: datetime) -> bool:
+    """当前课程是否仍包含该具体开课实例；生效边界比较实例时间而非扫描时间。"""
+    target = _delivery_now(target)
+    clock = _training_start_clock(session.get("start_time"))
+    if (session.get("status") != "confirmed" or clock is None
+            or target.weekday() != _training_weekday(session.get("weekday"))
+            or target.time() != clock):
+        return False
+    for field, is_start in (("effective_start", True), ("effective_end", False)):
+        value = session.get(field) or ""
+        if not value:
+            continue
+        bound = _delivery_parse_time(value)
+        if bound is None or (target < bound if is_start else target > bound):
+            return False
+    return True
+
+
+def training_occurrence_times(session: dict, now: datetime, before_hours: int) -> list[datetime]:
+    """展开提醒窗口内尚未开始的每周课程，未知星期/时间不产生猜测计划。"""
+    now = _delivery_now(now)
+    weekday = _training_weekday(session.get("weekday"))
+    clock = _training_start_clock(session.get("start_time"))
+    if weekday is None or clock is None or before_hours <= 0:
+        return []
+    day = now.date() + timedelta(days=(weekday - now.weekday()) % 7)
+    target = datetime.combine(day, clock, tzinfo=TZ)
+    if target <= now:
+        target += timedelta(days=7)
+    until = now + timedelta(hours=before_hours)
+    out = []
+    while target <= until:
+        if training_occurrence_valid(session, target):
+            out.append(target)
+        target += timedelta(days=7)
+    return out
+
+
 def _row_to_training(r: sqlite3.Row) -> dict:
     return {
         "id": r[0], "group_id": r[1], "title": r[2], "weekday": r[3],
@@ -1897,6 +1955,16 @@ def _delivery_invalid_status(conn: sqlite3.Connection, delivery: dict,
             return "cancelled"
         row = conn.execute(f"SELECT status, {field} FROM competitions WHERE id = ?", (delivery["obj_id"],)).fetchone()
         if row is None or row[0] != "confirmed" or _canonical_time(row[1]) != delivery["target_time"]:
+            return "cancelled"
+    elif delivery["obj_type"] == "training_session":
+        if delivery["remind_type"] != "start_time" or not delivery["group_id"]:
+            return "cancelled"
+        row = conn.execute(
+            f"SELECT {_TRAINING_COLS} FROM training_sessions WHERE id = ?", (delivery["obj_id"],),
+        ).fetchone()
+        target = _delivery_parse_time(delivery["target_time"])
+        if (row is None or row[1] != delivery["group_id"] or target is None
+                or not training_occurrence_valid(_row_to_training(row), target)):
             return "cancelled"
     else:
         return "cancelled"
