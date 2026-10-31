@@ -23,51 +23,83 @@ import content_filter
 import crawler
 import database as db
 import llm
+import roles
 from fetcher import FetchError, fetch_text
 from utils import can_manage_group, is_super_admin, parse_command
 
 TZ = ZoneInfo("Asia/Shanghai")
 
-HELP_TEXT = """【CDUTETC ACM 事务助手 · 命令帮助】
---- 比赛资料 ---
-发布 <官网链接>          整理比赛信息后私聊超管确认（老师，@机器人发送）
-/待确认列表              查看自己提交的待确认发布申请（老师/超管）
-/修正 <比赛id> <字段=值 ...>  修正已发布比赛字段（超管）
-  例：/修正 1 time=2026-12-01 19:00 name="ICPC 2026 区域赛"
-/修正 <比赛id> 重新提取 <链接>  重新提取官网信息（超管）
-/待审列表                查看后台来源更新的编号与改动字段（超管）
-/待审批准 <更新id>       合并来源更新的有效字段（超管）
-/待审拒绝 <更新id> [原因]  保留正式资料并拒绝来源更新（超管）
---- 学校安排 ---
+_HELP_HEADER = "【CDUTETC ACM 事务助手 · 命令帮助】"
+
+# 普通成员可见：只放查询、报名、提问类，不放任何管理命令
+_HELP_MEMBER = """--- 学校安排 ---
 /校安排                  查看学校统一安排（仅共享部分）
 --- 课程与训练 ---
 /课程列表                查看本群课程安排
-/课程添加 <标题> [星期几] [开始-结束] [地点]  添加课程（老师/超管）
-/课程取消 <id>           取消课程（老师/超管）
 --- 征集登记 ---
-/征集 <标题> [截止时间] [名额] [字段1,字段2]  发起征集（老师/超管）
-/报名 <征集id> [字段=值 ...]   报名/更新我的登记（群成员）
-/报名 取消 <征集id>      取消我的报名（群成员）
-/征集汇总 <征集id>       查看本群人数和剩余名额（群成员）
-/征集关闭 <征集id>       关闭征集停止报名（老师/超管）
+/报名 <征集id> [字段=值 ...]   报名/更新我的登记
+/报名 取消 <征集id>      取消我的报名
+/征集汇总 <征集id>       查看本群人数和剩余名额
+--- 提问 ---
+直接 @机器人 提问        只回答已录入的 FAQ/课程/校安排/比赛，
+                         查不到会转给老师，不会调用大模型
+/提问 <问题>             记录未答问题，老师稍后回答"""
+
+# 老师/超管可见：发布与管理类
+_HELP_TEACHER = """--- 比赛资料 ---
+发布 <官网链接>          整理比赛信息后私聊超管确认（@机器人发送）
+/待确认列表              查看待确认的发布申请
+--- 课程与训练 ---
+/课程添加 <标题> [星期几] [开始-结束] [地点]  添加课程
+/课程取消 <id>           取消课程
+--- 征集登记 ---
+/征集 <标题> [截止时间] [名额] [字段1,字段2]  发起征集
+/征集关闭 <征集id>       关闭征集停止报名
 --- FAQ 与提问 ---
-/FAQ列表 [关键词]       查看本群 FAQ（老师/超管）
-/FAQ添加 <问题> = <答案> 添加 FAQ 并关闭同群同题未答问题（老师/超管）
-/FAQ删除 <id>            删除 FAQ（老师/超管）
-/提问 <问题>             记录未答问题，老师稍后回答
-/问题列表                查看未答问题（老师/超管）
-（普通成员 @机器人 提问只回答已录入的 FAQ/课程/校安排/比赛，
-  查不到会转人工，不会调用大模型）
+/FAQ列表 [关键词]       查看本群 FAQ
+/FAQ添加 <问题> = <答案> 添加 FAQ 并关闭同群同题未答问题
+/FAQ删除 <id>            删除 FAQ
+/问题列表                查看未答问题
 --- 提醒与抓取 ---
-/提醒状态                查看提醒投递队列状态（老师/超管）
-/抓取状态                查看公共来源抓取状态（老师/超管）
-/抓取一次                立即抓取一次公共来源（老师/超管）
+/提醒状态                查看提醒投递队列状态
+/抓取状态                查看公共来源抓取状态
+/抓取一次                立即抓取一次公共来源"""
+
+# 超管可见：比赛修正、待审更新、私聊管理、白名单管理
+_HELP_SUPER = """--- 比赛修正与来源待审（超管） ---
+/修正 <比赛id> <字段=值 ...>  修正已发布比赛字段
+  例：/修正 1 time=2026-12-01 19:00 name="ICPC 2026 区域赛"
+/修正 <比赛id> 重新提取 <链接>  重新提取官网信息
+/待审列表                查看后台来源更新的编号与改动字段
+/待审批准 <更新id>       合并来源更新的有效字段
+/待审拒绝 <更新id> [原因]  保留正式资料并拒绝来源更新
+--- 白名单管理（超管，立即生效） ---
+/加群 <群号> [备注]      授权新群；被拉进群后按提示取群号
+/删群 <群号>             移除动态添加的群
+/加老师 <QQ号> [备注]    添加老师
+/删老师 <QQ号>           移除动态添加的老师
+/群列表                  查看当前生效的群、老师与超管
 --- 私聊管理（超管） ---
-超管可私聊机器人发送以上 /FAQ添加 /FAQ删除 /课程添加 /课程取消
-等管理命令，作用于默认管理群（ACM_ADMIN_GROUP，留空取首个允许群）。
-超管在私聊回复「同意 <编号>」或「拒绝 <编号>」处理发布确认。
---- 其他 ---
-/帮助                    显示本帮助"""# ---------------------------------------------------------------------
+可私聊机器人发送 /FAQ添加 /FAQ删除 /课程添加 /课程取消 等命令，
+作用于默认管理群（ACM_ADMIN_GROUP，留空取首个允许群）。
+私聊回复「同意 <编号>」或「拒绝 <编号>」处理发布确认。"""
+
+
+def build_help(member_id: str | None) -> str:
+    """按身份拼接帮助：普通成员看不到任何管理命令。"""
+    parts = [_HELP_HEADER, _HELP_MEMBER]
+    if can_manage_group(member_id):
+        parts.append(_HELP_TEACHER)
+    if is_super_admin(member_id):
+        parts.append(_HELP_SUPER)
+    parts.append("--- 其他 ---\n/帮助                    显示本帮助")
+    return "\n".join(parts)
+
+
+# 兼容旧引用：默认按普通成员展示（不含管理命令）
+HELP_TEXT = build_help(None)
+
+# ---------------------------------------------------------------------
 # v2 命令：修正（超管）
 # ---------------------------------------------------------------------
 
@@ -522,6 +554,61 @@ def cmd_faq_delete(group_id: str, sender: str, args: str) -> list[dict]:
     return [{"group_id": group_id, "text": f"已删除 FAQ #{fid}"}]
 
 
+# ---------------------------------------------------------------------
+# 运行时白名单（仅超管）：加群 / 加老师，改完立即生效，无需重启
+# ---------------------------------------------------------------------
+
+def _split_id_note(args: str) -> tuple[str, str]:
+    parts = (args or "").strip().split(None, 1)
+    if not parts:
+        return "", ""
+    return parts[0], parts[1].strip() if len(parts) > 1 else ""
+
+
+def cmd_group_add(group_id: str, sender: str, args: str) -> list[dict]:
+    if not is_super_admin(sender):
+        return [{"group_id": group_id, "text": "仅超管可添加群"}]
+    gid, note = _split_id_note(args)
+    ok, msg = roles.add_group(gid, operator=sender, note=note)
+    return [{"group_id": group_id, "text": msg}]
+
+
+def cmd_group_remove(group_id: str, sender: str, args: str) -> list[dict]:
+    if not is_super_admin(sender):
+        return [{"group_id": group_id, "text": "仅超管可移除群"}]
+    gid, _ = _split_id_note(args)
+    ok, msg = roles.remove_group(gid, operator=sender)
+    return [{"group_id": group_id, "text": msg}]
+
+
+def cmd_group_list(group_id: str, sender: str, args: str) -> list[dict]:
+    if not can_manage_group(sender):
+        return [{"group_id": group_id, "text": "仅老师/超管可查看白名单"}]
+    return [{"group_id": group_id, "text": roles.describe()}]
+
+
+def cmd_teacher_add(group_id: str, sender: str, args: str) -> list[dict]:
+    if not is_super_admin(sender):
+        return [{"group_id": group_id, "text": "仅超管可添加老师"}]
+    uid, note = _split_id_note(args)
+    ok, msg = roles.add_teacher(uid, operator=sender, note=note)
+    return [{"group_id": group_id, "text": msg}]
+
+
+def cmd_teacher_remove(group_id: str, sender: str, args: str) -> list[dict]:
+    if not is_super_admin(sender):
+        return [{"group_id": group_id, "text": "仅超管可移除老师"}]
+    uid, _ = _split_id_note(args)
+    ok, msg = roles.remove_teacher(uid, operator=sender)
+    return [{"group_id": group_id, "text": msg}]
+
+
+def cmd_teacher_list(group_id: str, sender: str, args: str) -> list[dict]:
+    if not can_manage_group(sender):
+        return [{"group_id": group_id, "text": "仅老师/超管可查看白名单"}]
+    return [{"group_id": group_id, "text": roles.describe()}]
+
+
 def cmd_ask(group_id: str, sender: str, args: str) -> list[dict]:
     """记录未答问题。若 FAQ 已命中（上层先查过），不会走到这里。"""
     question = args.strip()
@@ -631,7 +718,7 @@ async def handle_command(text: str, group_id: str, sender: str) -> list[dict] | 
     if cmd is None:
         return [{"group_id": group_id, "text": "无法识别的命令，用 /帮助 查看所有命令"}]
     if cmd in ("help", "帮助"):
-        return [{"group_id": group_id, "text": HELP_TEXT}]
+        return [{"group_id": group_id, "text": build_help(sender)}]
     handlers = {
         "修正": cmd_amend,
         "待审列表": cmd_pending_list,
@@ -649,6 +736,12 @@ async def handle_command(text: str, group_id: str, sender: str) -> list[dict] | 
         "FAQ添加": cmd_faq_add,
         "FAQ删除": cmd_faq_delete,
         "待确认列表": cmd_pub_pending_list,
+        "加群": cmd_group_add,
+        "删群": cmd_group_remove,
+        "群列表": cmd_group_list,
+        "加老师": cmd_teacher_add,
+        "删老师": cmd_teacher_remove,
+        "老师列表": cmd_teacher_list,
         "提问": cmd_ask,
         "问题列表": cmd_question_list,
         "抓取状态": cmd_fetch_status,

@@ -24,6 +24,7 @@ import contextvars
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -36,6 +37,7 @@ import config
 import content_filter
 import crawler
 import database as db
+import roles
 from contest_fields import map_competition_info
 from database import create_published_competition_once, init_db
 from fetcher import FetchError, fetch_text
@@ -49,6 +51,7 @@ from utils import (
     is_publish_command,
     is_super_admin,
     mentioned_user_ids,
+    parse_command,
     strip_at,
 )
 
@@ -147,6 +150,14 @@ _PUBLISH_DECISION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 这些命令不依赖具体群，未配置任何允许群时也要放行（否则无法引导加第一个群）
+_GROUP_FREE_COMMANDS = frozenset(
+    {"加群", "删群", "群列表", "加老师", "删老师", "老师列表", "帮助", "help"}
+)
+
+# 未授权群提示的冷却时间记录：{group_id: 上次提示的 monotonic 时间}
+_unauthorized_notice_at: dict[str, float] = {}
+
 
 def _weekly_contest_window(now: datetime):
     """返回下一场尚未开赛的周赛及其所属周；跨周生成不误建过去场次。"""
@@ -195,6 +206,8 @@ class ACMBot:
             logger.info("机器人已上线（调度器已存在，跳过重复创建）")
             return
         init_db()
+        # 合并 .env 基线与数据库里的动态白名单（超管 /加群 /加老师 添加的条目）
+        roles.refresh()
         tz = ZoneInfo(config.TZ_NAME)
         now = now or datetime.now(tz)
         now = now.replace(tzinfo=tz) if now.tzinfo is None else now.astimezone(tz)
@@ -259,11 +272,16 @@ class ACMBot:
             if content.strip().startswith("/") and is_super_admin(uid):
                 admin_gid = admin_group_id()
                 if not admin_gid:
-                    await self.client.send_private_msg(
-                        uid,
-                        "未配置允许群，无法定位管理群（请设置 ACM_ADMIN_GROUP 或 ACM_ALLOWED_GROUPS）",
-                    )
-                    return
+                    # 引导场景：一个群都没配时，仍要允许超管用 /加群 把第一个群加进来，
+                    # 否则会陷入“没群 → 不能用命令 → 永远加不了群”的死锁。
+                    cmd, _ = parse_command(content)
+                    if cmd not in _GROUP_FREE_COMMANDS:
+                        await self.client.send_private_msg(
+                            uid,
+                            "未配置允许群，无法定位管理群（可用 /加群 <群号> 添加，"
+                            "或设置 ACM_ADMIN_GROUP / ACM_ALLOWED_GROUPS）",
+                        )
+                        return
                 replies = await commands.handle_command(content, admin_gid, uid)
                 for reply in replies or []:
                     if reply.get("text"):
@@ -351,18 +369,41 @@ class ACMBot:
                 )
             if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
                 logger.info("非授权群消息已忽略: %s", group_id)
+                await self._notice_unauthorized_group(message, group_id)
                 return
             targets = mentioned_user_ids(message.content)
-            bot_qq = config.BOT_QQ or str(message.raw.get("self_id") or "")
+            # self_id 是当前连接账号的真实 QQ 号，最可信；ACM_BOT_QQ 只在
+            # 事件没带 self_id 时兜底。顺序反了会导致配错 BOT_QQ 后
+            # 所有 @ 都不被识别、普通提问被静默丢弃。
+            self_id = str(message.raw.get("self_id") or "")
+            bot_qq = self_id or config.BOT_QQ
             addressed = bool(bot_qq) and bot_qq in targets
             # 带 @ 的消息只有指向本机器人时才受理，包括发给他人的命令。
             if targets and not addressed:
+                logger.info(
+                    "群消息 @ 的不是本机器人，已忽略（@目标=%s，本机=%s）",
+                    ",".join(sorted(targets)), bot_qq or "未知",
+                )
                 return
             text = strip_at(message.content)
             if not text:
                 return
-            # 无 @ 时只受理显式操作；自然语言问答必须 @ 本机器人。
-            if not addressed and not (text.startswith("/") or is_publish_command(text, config.PUBLISH_CMD)):
+            # 群内默认必须 @ 本机器人 才响应（含命令），避免抢答他人命令；
+            # ACM_GROUP_REQUIRE_AT=0 时回退为“无 @ 也受理显式命令”。
+            if config.GROUP_REQUIRE_AT:
+                allowed_without_at = False
+            else:
+                allowed_without_at = (
+                    text.startswith("/")
+                    or is_publish_command(text, config.PUBLISH_CMD)
+                )
+            if not addressed and not allowed_without_at:
+                logger.info(
+                    "未 @ 本机器人，已忽略（消息含 @ 段：%s，本机=%s，文本长度 %d）",
+                    "[CQ:at" in (message.content or ""),
+                    bot_qq or "未知",
+                    len(text),
+                )
                 return
             member_id = self._extract_member_id(message)
             if is_publish_command(text, config.PUBLISH_CMD):
@@ -590,6 +631,35 @@ class ACMBot:
         if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
             return False
         return await self.client.send_group_msg(group_id, content)
+
+    async def _notice_unauthorized_group(self, message: OneBotMessage,
+                                         group_id: str) -> None:
+        """未授权群被明确喊话时，回一句带群号的提示，方便管理员取号后授权。
+
+        只在「@ 了机器人」或「发 /命令」时回复，避免被拉进群后对每条闲聊都插话；
+        同一群有冷却时间，防止刷屏。提示本身不提供任何业务功能。
+        """
+        if not config.NOTICE_UNAUTHORIZED_GROUP:
+            return
+        raw = message.content or ""
+        targets = mentioned_user_ids(raw)
+        bot_qq = config.BOT_QQ or str(message.raw.get("self_id") or "")
+        addressed = bool(bot_qq) and bot_qq in targets
+        text = strip_at(raw)
+        if not (addressed or text.startswith("/")):
+            return
+        now = time.monotonic()
+        if now - _unauthorized_notice_at.get(group_id, 0.0) < config.NOTICE_UNAUTHORIZED_INTERVAL:
+            return
+        _unauthorized_notice_at[group_id] = now
+        try:
+            await self.client.send_group_msg(
+                group_id,
+                f"本群尚未授权（群号 {group_id}）。\n"
+                f"请管理员在已授权群或私聊机器人发送：/加群 {group_id}",
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("未授权群提示发送失败: %s", group_id)
 
     # ---------- 定时任务回调 ----------
 

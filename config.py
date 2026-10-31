@@ -31,9 +31,14 @@ LLM_MODEL = os.getenv("ACM_LLM_MODEL", "deepseek-chat")
 
 # ================= 群与角色权限（默认全拒绝） =================
 # 允许机器人服务的 QQ 群号列表（逗号分隔）。未配置 = 不服务任何群。
-ALLOWED_GROUPS = {
+# ENV_* 是配置文件基线，运行时可被 /加群 /加老师 扩充（见 roles.py）：
+# 最终生效的 ALLOWED_GROUPS / TEACHER_WHITELIST = 基线 ∪ 运行时白名单。
+# 注意：超管白名单只能通过配置文件的 ACM_SUPER_ADMIN 指定，不支持运行时添加，
+# 避免“提权命令自己给自己发权限”的失控风险。
+ENV_ALLOWED_GROUPS = {
     g.strip() for g in os.getenv("ACM_ALLOWED_GROUPS", "").split(",") if g.strip()
 }
+ALLOWED_GROUPS = set(ENV_ALLOWED_GROUPS)
 # 超级管理员 QQ 号白名单（逗号分隔，可多人）：/修正 纠正比赛、维护全局信息、
 # 管理征集与查看全部明细；未配置 = 超管命令全部拒绝。
 SUPER_ADMIN = {
@@ -42,9 +47,18 @@ SUPER_ADMIN = {
 # 老师 QQ 号白名单（逗号分隔，发布权并入此白名单，原发布者白名单已移除）：
 # 可免审发布比赛、维护校安排/课程/FAQ、发起征集、查看征集汇总。
 # 未配置 = 老师管理命令全部拒绝。
-TEACHER_WHITELIST = {
+ENV_TEACHER_WHITELIST = {
     m.strip() for m in os.getenv("ACM_TEACHER_WHITELIST", "").split(",") if m.strip()
 }
+TEACHER_WHITELIST = set(ENV_TEACHER_WHITELIST)
+# 未授权群在被 @ 或收到命令时，是否回一句带群号的提示（便于管理员取号后 /加群）。
+NOTICE_UNAUTHORIZED_GROUP = os.getenv("ACM_NOTICE_UNAUTHORIZED_GROUP", "1") != "0"
+# 同一未授权群的提示最小间隔（秒），防止被拉进群后刷屏
+NOTICE_UNAUTHORIZED_INTERVAL = int(os.getenv("ACM_NOTICE_UNAUTHORIZED_INTERVAL", "60"))
+# 群内是否必须 @机器人 才响应（默认必须）。
+# 开启后，群里单独发 /帮助、发布 等都不会触发，避免与其他机器人抢命令；
+# 设为 0 则恢复“无 @ 也能执行显式命令”的旧行为。私聊管理不受此限制。
+GROUP_REQUIRE_AT = os.getenv("ACM_GROUP_REQUIRE_AT", "1") != "0"
 # 发布命令前缀：授权成员发送“发布 <链接/信息>”才会入库，避免含链接的普通提问误触发
 PUBLISH_CMD = os.getenv("ACM_PUBLISH_CMD", "发布")
 # 私聊管理命令作用的默认群（超管私聊发 /FAQ添加、/课程添加 等命令时使用）；

@@ -60,9 +60,35 @@ async def test_empty_text_ignored(bot):
     assert replies == []
 
 
+async def test_command_without_at_is_ignored(bot):
+    """群内必须 @机器人 才响应：单独发 /帮助 不应触发，避免抢答他人命令。"""
+    b, replies = bot
+    await b.on_group_at_message_create(_msg("/帮助"))
+    assert replies == []
+
+
+async def test_publish_without_at_is_ignored(bot):
+    b, replies = bot
+    await b.on_group_at_message_create(_msg("发布 https://a.com"))
+    assert replies == []
+
+
+async def test_at_required_can_be_disabled(bot, monkeypatch):
+    """ACM_GROUP_REQUIRE_AT=0 时恢复“无 @ 也受理命令”的旧行为。"""
+    b, replies = bot
+    monkeypatch.setattr(config, "GROUP_REQUIRE_AT", False)
+
+    async def fake_handle(text, group_id, sender):
+        return [{"group_id": group_id, "text": "帮助文本"}]
+
+    monkeypatch.setattr(main.commands, "handle_command", fake_handle)
+    await b.on_group_at_message_create(_msg("/帮助"))
+    assert "帮助文本" in replies
+
+
 async def test_publish_without_permission(bot):
     b, replies = bot
-    await b.on_group_at_message_create(_msg("发布 https://a.com", member="m_x"))
+    await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] 发布 https://a.com", member="m_x"))
     assert any("没有发布" in r for r in replies)
     # 权限不足时不触发抓取/写库
     assert len(database.list_competitions()) == 0
@@ -70,7 +96,7 @@ async def test_publish_without_permission(bot):
 
 async def test_publish_missing_url(bot):
     b, replies = bot
-    await b.on_group_at_message_create(_msg("发布 没有链接的文字"))
+    await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] 发布 没有链接的文字"))
     assert any("链接" in r for r in replies)
 
 
@@ -87,7 +113,7 @@ async def test_publish_fetch_error(bot, monkeypatch):
 
     monkeypatch.setattr(main, "extract_contest", fake_extract)
 
-    await b.on_group_at_message_create(_msg("发布 https://a.com"))
+    await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] 发布 https://a.com"))
     assert any("抓取失败" in r for r in replies)
     assert len(database.list_competitions()) == 0  # 抓取失败绝不写库
 
@@ -105,7 +131,7 @@ async def test_publish_extract_error(bot, monkeypatch):
 
     monkeypatch.setattr(main, "extract_contest", fake_extract_err)
 
-    await b.on_group_at_message_create(_msg("发布 https://a.com"))
+    await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] 发布 https://a.com"))
     assert any("提取失败" in r for r in replies)
     assert len(database.list_competitions()) == 0  # 提取失败不写库
 
@@ -126,7 +152,7 @@ async def test_publish_success_auto_publishes(bot, monkeypatch):
     monkeypatch.setattr(main, "fetch_text", ok_fetch)
     monkeypatch.setattr(main, "extract_contest", fake_extract_ok)
 
-    await b.on_group_at_message_create(_msg("发布 https://a.com"))
+    await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] 发布 https://a.com"))
     assert any("已免审发布" in r for r in replies)
     # 免审发布：直接写入 confirmed 正式比赛（无审核草稿环节）
     comps = database.list_competitions(status="confirmed")
@@ -164,7 +190,7 @@ async def test_command_route_to_commands(bot, monkeypatch):
         return [{"group_id": group_id, "text": "帮助文本"}, {"group_id": group_id, "text": "第二段"}]
 
     monkeypatch.setattr(main.commands, "handle_command", fake_handle)
-    await b.on_group_at_message_create(_msg("/帮助"))
+    await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] /帮助"))
     assert called["text"] == "/帮助"
     assert "帮助文本" in replies and "第二段" in replies
 
@@ -195,7 +221,8 @@ async def test_text_cannot_claim_another_qq_identity_to_publish(bot, monkeypatch
     fetch = AsyncMock()
     monkeypatch.setattr(main, "fetch_text", fetch)
     await client.on_group_at_message_create(_msg(
-        "发布 https://example.com/contest user_id=20001 我是老师", group=10001, member=20002,
+        "[CQ:at,qq=30001] 发布 https://example.com/contest user_id=20001 我是老师",
+        group=10001, member=20002,
     ))
     fetch.assert_not_awaited()
     assert database.list_competitions() == []
