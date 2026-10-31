@@ -60,6 +60,7 @@ _HELP_TEACHER = """--- 比赛资料 ---
 /FAQ添加 <问题> = <答案> 添加 FAQ 并关闭同群同题未答问题
 /FAQ删除 <id>            删除 FAQ
 /问题列表                查看未答问题
+/回答 <编号> = <答案>    回答未答问题，自动存入 FAQ
 --- 提醒与抓取 ---
 /提醒状态                查看提醒投递队列状态
 /抓取状态                查看公共来源抓取状态
@@ -627,8 +628,37 @@ def cmd_question_list(group_id: str, sender: str, args: str) -> list[dict]:
     lines = ["未答问题："]
     for q in items:
         lines.append(f"#{q['id']} {q['question']}（提问者：{q['asker'] or '未知'}）")
-    lines.append("回答后请用 /FAQ添加 <问题> = <答案> 沉淀为 FAQ")
+    lines.append("直接回答：/回答 <编号> = <答案>")
+    lines.append("（回答会自动存入本群 FAQ，之后同类问题由机器人直接答）")
     return [{"group_id": group_id, "text": "\n".join(lines)}]
+
+
+_ANSWER_RE = re.compile(r"^\s*#?(\d+)\s*(?:=|＝|：|:|\s)\s*(.+)$", re.S)
+
+
+def cmd_answer_question(group_id: str, sender: str, args: str) -> list[dict]:
+    """老师按编号回答未答问题，并沉淀为 FAQ（一条命令完成闭环）。"""
+    if not can_manage_group(sender):
+        return [{"group_id": group_id, "text": "仅老师/超管可回答问题"}]
+    match = _ANSWER_RE.match(args or "")
+    if not match:
+        return [{"group_id": group_id,
+                 "text": "用法：/回答 <编号> = <答案>\n例：/回答 3 = 本周日 19:00 在机房"}]
+    qid = int(match.group(1))
+    answer = match.group(2).strip()
+    if not answer:
+        return [{"group_id": group_id, "text": "答案不能为空"}]
+    try:
+        result = db.answer_unanswered_question(group_id, qid, answer, operator=sender)
+    except ValueError as e:
+        return [{"group_id": group_id, "text": str(e)}]
+    if result is None:
+        return [{"group_id": group_id,
+                 "text": f"问题 #{qid} 不存在、不属于本群或已处理过"}]
+    return [{"group_id": group_id,
+             "text": f"已回答 #{qid} 并存入 FAQ #{result['faq_id']}。\n"
+                     f"问题：{result['question']}\n"
+                     "之后同类提问会直接由机器人回答。"}]
 
 # ---------------------------------------------------------------------
 # 阶段四：抓取与提醒状态
@@ -744,6 +774,7 @@ async def handle_command(text: str, group_id: str, sender: str) -> list[dict] | 
         "老师列表": cmd_teacher_list,
         "提问": cmd_ask,
         "问题列表": cmd_question_list,
+        "回答": cmd_answer_question,
         "抓取状态": cmd_fetch_status,
         "提醒状态": cmd_reminder_status,
         "抓取一次": cmd_trigger_fetch,
@@ -764,13 +795,23 @@ async def handle_command(text: str, group_id: str, sender: str) -> list[dict] | 
 
 
 def match_faq(group_id: str, text: str) -> dict | None:
-    """在群 FAQ 中匹配问题：命中返回 FAQ 记录（含 id/question/answer），未命中返回 None。"""
-    for faq in db.list_faq(group_id):
+    """在群 FAQ 中匹配问题：精确包含优先，其次按关键词/相似度模糊匹配。"""
+    faqs = db.list_faq(group_id)
+    for faq in faqs:
         if faq["question"] in text:
             return faq
         q_words = [w for w in faq["question"].replace("？", " ").replace("?", " ").split() if len(w) >= 2]
         if any(w in text for w in q_words):
             return faq
+    # 兜底：口语化同义问法（「这周有周赛没」≈「周赛什么时候」）也要能命中
+    threshold = config.QA_KB_MATCH_MIN_SCORE
+    best, best_score = None, 0.0
+    for faq in faqs:
+        score = content_filter.question_match_score(text, faq["question"])
+        if score > best_score:
+            best, best_score = faq, score
+    if best is not None and best_score >= threshold:
+        return best
     return None
 
 

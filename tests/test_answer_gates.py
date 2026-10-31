@@ -7,13 +7,26 @@ _safe_reply 收集；限流器可单独注入以控制窗口参数。
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import sqlite3
+
 import pytest
 
 import commands
 import config
 import content_filter
+import database
 import llm
 import main
+
+
+@pytest.fixture
+def memory_db(monkeypatch):
+    """把 database._connect 指向同一个内存库，测试结束即销毁。"""
+    conn = sqlite3.connect(":memory:")
+    monkeypatch.setattr(database, "_connect", lambda: conn)
+    database.init_db()
+    yield conn
+    conn.close()
 
 
 def _message(content, group_id="g1", member_id="m1"):
@@ -332,4 +345,52 @@ async def test_member_weekly_question_answered_without_model(monkeypatch):
     )
     assert "ACM 周赛（本周）" in replies[0]["text"]
     assert "2026-11-01 19:00" in replies[0]["text"]
+    chat.assert_not_awaited()
+
+
+# ----------------------------------------------------------------------
+# 8) 口语问法归一：同一意图共用编号，回答后自动命中 FAQ
+# ----------------------------------------------------------------------
+def test_question_core_strips_particles():
+    for question in ("这周有周赛吗", "这周有周赛没", "周赛有没"):
+        assert content_filter.question_core(question) == "周赛"
+
+
+def test_same_intent_true_for_synonyms():
+    assert content_filter.same_intent("这周有周赛吗", "周赛有没")
+
+
+def test_same_intent_false_for_different_topics():
+    assert not content_filter.same_intent("这周有周赛吗", "这周有课吗")
+    assert not content_filter.same_intent("这周有周赛吗", "食堂几点开饭")
+
+
+def test_synonym_questions_share_one_id(memory_db):
+    """三种口语问法必须复用同一个编号，不能每次新增。"""
+    ids = {
+        database.add_unanswered_question("g1", q, "s1")
+        for q in ("这周有周赛吗", "这周有周赛没", "周赛有没")
+    }
+    assert len(ids) == 1
+    assert len(database.list_unanswered("g1")) == 1
+
+
+async def test_answer_question_closes_and_indexes_faq(memory_db, monkeypatch):
+    """按编号回答后：写入 FAQ、关闭问题，后续同类提问直接命中 FAQ。"""
+    qid = database.add_unanswered_question("g1", "这周有周赛吗", "s1")
+    result = database.answer_unanswered_question("g1", qid, "本周日 19:00 机房", "teacher")
+    assert result is not None and result["faq_id"]
+    assert database.list_unanswered("g1") == []
+
+    chat = AsyncMock(return_value="不应调用")
+    monkeypatch.setattr(llm, "_chat_once", chat)
+    monkeypatch.setattr(commands.db, "list_training_sessions", lambda *a, **k: [])
+    monkeypatch.setattr(commands.db, "list_org_events", lambda *a, **k: [])
+    monkeypatch.setattr(commands.db, "list_question_contests", lambda gid: [])
+    monkeypatch.setattr(config, "QA_MEMBER_KB_ONLY", True)
+
+    replies = await commands.handle_non_command_message(
+        "周赛有没", "g1", "s2", staff=False
+    )
+    assert "本周日 19:00 机房" in replies[0]["text"]
     chat.assert_not_awaited()

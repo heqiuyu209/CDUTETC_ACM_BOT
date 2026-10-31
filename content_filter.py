@@ -86,18 +86,75 @@ def title_keyword_score(question: str, title: str) -> float:
     return best
 
 
+# 口语同义归一：把常见说法映射到记录里更可能出现的写法
+_QUESTION_SYNONYMS = (
+    ("这个星期", "本周"), ("这个礼拜", "本周"),
+    ("这星期", "本周"), ("这礼拜", "本周"), ("这周", "本周"),
+    ("今晚", "今天晚上"), ("明晚", "明天晚上"),
+)
+
+
+def _normalize_question(text: str) -> str:
+    q = text or ""
+    for src, dst in _QUESTION_SYNONYMS:
+        q = q.replace(src, dst)
+    return q
+
+
 def record_match_score(question: str, *fields: str) -> float:
     """综合 Dice 相似度与标题关键词命中，取较高者作为记录匹配分。"""
+    normalized = _normalize_question(question)
     best = 0.0
     for field in fields:
         if not field:
             continue
         best = max(
             best,
-            text_similarity(question, field),
+            text_similarity(normalized, field),
+            title_keyword_score(normalized, field),
             title_keyword_score(question, field),
         )
     return best
+
+
+# 问句里的语气/疑问/时间噪声词。按长度从大到小排列，先删长词避免残留。
+_QUESTION_NOISE = (
+    "这礼拜", "这星期", "这个星期", "这个礼拜", "有没有", "是不是", "能不能",
+    "这周", "本周", "那个", "这个", "请问", "问一下", "有没", "什么", "怎么",
+    "哪些", "哪个", "多少", "如何", "可以", "一下",
+    "吗", "呢", "吧", "啊", "呀", "哦", "嘛", "没", "了", "的", "有", "是",
+    "在", "会", "要", "还", "都", "和", "与",
+)
+
+
+def question_core(text: str) -> str:
+    """抽取问句核心词：去掉标点、空白与语气词。
+
+    「这周有周赛吗」「这周有周赛没」「周赛有没」都会归一成「周赛」，
+    用于判断两个问法是否同一意图——比整句相似度稳定得多。
+    """
+    q = re.sub(r"[\s\W_]+", "", (text or "").lower())
+    for word in _QUESTION_NOISE:
+        q = q.replace(word, "")
+    return q
+
+
+def same_intent(a: str, b: str) -> bool:
+    """两个问法是否指向同一问题：核心词相同或互相包含。"""
+    ca, cb = question_core(a), question_core(b)
+    if not ca or not cb:
+        return False
+    if ca == cb:
+        return True
+    short, long = (ca, cb) if len(ca) <= len(cb) else (cb, ca)
+    return len(short) >= 2 and short in long
+
+
+def question_match_score(question: str, stored: str) -> float:
+    """问句之间的匹配分：同意图直接给满分，否则退回通用记录匹配分。"""
+    if same_intent(question, stored):
+        return 1.0
+    return record_match_score(question, stored)
 
 
 # ----------------------------------------------------------------------

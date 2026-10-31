@@ -30,6 +30,9 @@ from urllib.parse import urlsplit
 
 from config import DB_PATH
 
+import config
+import content_filter
+
 TZ = ZoneInfo("Asia/Shanghai")
 logger = logging.getLogger(__name__)
 
@@ -1727,17 +1730,29 @@ def _row_to_unanswered(r: sqlite3.Row) -> dict:
 
 
 def add_unanswered_question(group_id: str, question: str, asker: str = "") -> int:
+    """记录未答问题；已有语义相同的 open 问题则复用编号，避免重复堆积。
+
+    口语环境下同一意图会有很多说法（「这周有周赛吗」「周赛有没」），
+    只按文本完全一致去重会把它们记成多条，编号迅速膨胀。因此先用
+    关键词/相似度做一次模糊合并。
+    """
     question = _normalize_question(question)
     if not question:
         raise ValueError("问题不能为空")
     with _connect() as conn:
-        # 相同问题合并计数：存在 open 同题则复用（不重复收集）
-        row = conn.execute(
-            "SELECT id FROM unanswered_questions WHERE group_id = ? AND question = ? AND status = 'open'",
-            (group_id, question),
-        ).fetchone()
-        if row:
-            return row[0]
+        rows = conn.execute(
+            "SELECT id, question FROM unanswered_questions"
+            " WHERE group_id = ? AND status = 'open'",
+            (group_id,),
+        ).fetchall()
+        threshold = config.QA_KB_MATCH_MIN_SCORE
+        for qid, stored in rows:
+            if _normalize_question(stored) == question:
+                return qid
+            if content_filter.same_intent(question, stored):
+                return qid
+            if content_filter.question_match_score(question, stored) >= threshold:
+                return qid
         cur = conn.execute(
             "INSERT INTO unanswered_questions (group_id, question, asker, asked_at, status)"
             " VALUES (?, ?, ?, ?, 'open')",
@@ -1764,6 +1779,57 @@ def mark_question_answered(qid: int, faq_id: int = 0) -> bool:
             (faq_id, qid),
         )
         return cur.rowcount > 0
+
+
+def answer_unanswered_question(group_id: str, qid: int, answer: str,
+                               operator: str = "") -> dict | None:
+    """把某条未答问题直接沉淀为 FAQ 并标记已答（单事务）。
+
+    这就是「老师按编号回答」的落库逻辑：写入 group_faq、把该问题置为
+    answered 并回填 faq_id，同时顺带关闭本群其它同题未答问题。
+
+    Returns:
+        {"faq_id": int, "question": str, "asker": str}；问题不存在、
+        不属于本群或已处理时返回 None。
+    """
+    answer = _as_str(answer)
+    if not answer:
+        raise ValueError("答案不能为空")
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT question, asker FROM unanswered_questions"
+            " WHERE id = ? AND group_id = ? AND status = 'open'",
+            (qid, group_id),
+        ).fetchone()
+        if row is None:
+            return None
+        question, asker = row[0], row[1]
+        cur = conn.execute(
+            "INSERT INTO group_faq (group_id, question, answer, source, status, updated_at)"
+            " VALUES (?, ?, ?, ?, 'confirmed', ?)",
+            (group_id, question, answer, _as_str(operator or "老师回答"), now_str()),
+        )
+        fid = cur.lastrowid
+        conn.execute(
+            "UPDATE unanswered_questions SET status = 'answered', faq_id = ? WHERE id = ?",
+            (fid, qid),
+        )
+        target = _normalize_question(question)
+        others = conn.execute(
+            "SELECT id, question FROM unanswered_questions"
+            " WHERE group_id = ? AND status = 'open'",
+            (group_id,),
+        ).fetchall()
+        for other_id, other_question in others:
+            if other_id != qid and _normalize_question(other_question) == target:
+                conn.execute(
+                    "UPDATE unanswered_questions SET status = 'answered', faq_id = ?"
+                    " WHERE id = ?", (fid, other_id),
+                )
+        add_audit(operator, group_id, "answer_question", "unanswered_question",
+                  str(qid), "", question, conn=conn)
+        return {"faq_id": fid, "question": question, "asker": asker}
 
 
 # =====================================================================
