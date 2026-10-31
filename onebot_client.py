@@ -20,6 +20,29 @@ MessageHandler = Callable[["OneBotMessage"], Awaitable[None]]
 ReadyHandler = Callable[[], Awaitable[None]]
 
 
+def _content_from_segments(message) -> str:
+    """把 OneBot 的 message 段数组还原成带 CQ 码的文本。
+
+    NapCat 的 `raw_message` 格式受配置影响，某些设置下不含 `[CQ:at,qq=...]`，
+    只靠它会解析不出 @ 目标。这里从 `message` 段数组重建，保证 @ 一定可见。
+    """
+    if isinstance(message, str):
+        return message
+    if not isinstance(message, list):
+        return ""
+    parts: list[str] = []
+    for seg in message:
+        if not isinstance(seg, dict):
+            continue
+        seg_type = seg.get("type")
+        seg_data = seg.get("data") or {}
+        if seg_type == "text":
+            parts.append(str(seg_data.get("text") or ""))
+        elif seg_type == "at":
+            parts.append(f"[CQ:at,qq={seg_data.get('qq') or ''}]")
+    return "".join(parts)
+
+
 class OneBotMessage:
     """OneBot 消息统一封装，兼容旧业务代码对 message 的字段访问。
 
@@ -37,7 +60,16 @@ class OneBotMessage:
         uid = data.get("user_id")
         self.group_id = str(gid) if gid is not None else ""
         self.user_id = str(uid) if uid is not None else ""
-        self.content = data.get("raw_message") or ""
+        raw_message = data.get("raw_message") or ""
+        rebuilt = _content_from_segments(data.get("message"))
+        # raw_message 缺失，或它没带 @ 但段数组里有 @ 时，采用重建结果；
+        # 否则保留原 raw_message，避免改变既有解析结果。
+        if not raw_message:
+            self.content = rebuilt
+        elif "[CQ:at" not in raw_message and "[CQ:at" in rebuilt:
+            self.content = rebuilt
+        else:
+            self.content = raw_message
 
     def __repr__(self):
         return (
