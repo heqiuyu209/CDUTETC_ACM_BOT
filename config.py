@@ -19,7 +19,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 ONEBOT_WS_URL = os.getenv("ACM_ONEBOT_WS_URL", "")
 # 可选鉴权 token（与 NapCat 配置一致；未开启留空）
 ONEBOT_TOKEN = os.getenv("ACM_ONEBOT_TOKEN", "")
-# 机器人自身 QQ 号（用于识别群内 @ 目标；可选）
+# 机器人自身 QQ 号（用于识别群内 @ 目标；缺省使用 OneBot 事件的 self_id）
 BOT_QQ = os.getenv("ACM_BOT_QQ", "")
 # 普通 QQ 无平台主动消息限制；保留开关以便在需要时暂停提醒投递。
 GROUP_ACTIVE_MESSAGES_ENABLED = os.getenv("ACM_GROUP_ACTIVE_MESSAGES_ENABLED", "1") == "1"
