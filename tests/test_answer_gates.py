@@ -285,3 +285,51 @@ async def test_main_chain_truncates_overlong_output(bot, monkeypatch):
     replies = await _run_chain(bot, "校赛什么时候？", member_id="teacher")
     assert len(replies[0][1]) <= 52  # 50 字符 + 2 个省略号字符
     assert replies[0][1].endswith("……")
+
+
+# ----------------------------------------------------------------------
+# 7) 本地知识库检索：口语问法要能召回，无关问题不能误命中
+# ----------------------------------------------------------------------
+def test_colloquial_question_matches_weekly_contest():
+    """「这周有周赛吗」与记录名 Dice 仅 0.18，必须靠关键词命中召回。"""
+    score = content_filter.record_match_score("这周有周赛吗", "ACM 周赛（本周）", "")
+    assert score >= config.QA_KB_MATCH_MIN_SCORE
+
+
+def test_unrelated_question_does_not_match_contest():
+    for question in ("食堂几点开饭", "今天天气怎么样"):
+        score = content_filter.record_match_score(question, "ACM 周赛（本周）", "")
+        assert score < config.QA_KB_MATCH_MIN_SCORE
+
+
+def test_common_word_does_not_cause_false_match():
+    """「大学」这类泛词不应让「大学什么时候开学」命中学校比赛名。"""
+    score = content_filter.record_match_score(
+        "大学什么时候开学", "成都理工大学ACM排名赛", ""
+    )
+    assert score < config.QA_KB_MATCH_MIN_SCORE
+
+
+async def test_member_weekly_question_answered_without_model(monkeypatch):
+    """普通成员问周赛：命中已录入记录，且不产生模型调用。"""
+    contest = {
+        "name": "ACM 周赛（本周）",
+        "reg_deadline": "",
+        "contest_time": "2026-11-01 19:00",
+        "mode": "",
+        "location": "",
+        "source_link": "",
+    }
+    monkeypatch.setattr(commands.db, "list_question_contests", lambda gid: [contest])
+    monkeypatch.setattr(commands.db, "list_training_sessions", lambda *a, **k: [])
+    monkeypatch.setattr(commands.db, "list_org_events", lambda *a, **k: [])
+    chat = AsyncMock(return_value="不应调用")
+    monkeypatch.setattr(llm, "_chat_once", chat)
+    monkeypatch.setattr(config, "QA_MEMBER_KB_ONLY", True)
+
+    replies = await commands.handle_non_command_message(
+        "这周有周赛吗", "g1", "student", staff=False
+    )
+    assert "ACM 周赛（本周）" in replies[0]["text"]
+    assert "2026-11-01 19:00" in replies[0]["text"]
+    chat.assert_not_awaited()

@@ -37,6 +37,69 @@ def text_similarity(a: str, b: str) -> float:
     return 2.0 * len(sa & sb) / (len(sa) + len(sb))
 
 
+# 标题切词时丢弃的虚词，避免“本周/什么”这类词造成误命中
+_TITLE_STOP_TOKENS = {
+    "什么", "怎么", "请问", "这个", "那个", "我们", "你们", "可以", "时候",
+    "哪些", "哪个", "多少", "如何", "为什", "是不", "不是", "没有", "有没",
+}
+
+
+def _title_tokens(title: str) -> set[str]:
+    """把标题切成可用于关键词命中的词元。
+
+    规则（不依赖分词库）：
+    - 英文/数字连续串作为整体词元（长度 ≥2）；
+    - 中文连续串作为整体词元（长度 ≥2），长度 >3 时再补长度 3 的滑窗子串。
+    这样「ACM 周赛（本周）」→ {acm, 周赛, 本周}，
+    「成都理工大学ACM排名赛」→ {成都理工大学, 成都理, 都理工, ...}，
+    既能命中「周赛」这种短词，又不会因为「大学」这种泛词误命中。
+    """
+    tokens: set[str] = set()
+    for chunk in re.findall(r"[A-Za-z]+|\d+|[\u4e00-\u9fff]+", title or ""):
+        lowered = chunk.lower()
+        if chunk.isascii():
+            if len(chunk) >= 2:
+                tokens.add(lowered)
+            continue
+        if len(chunk) >= 2:
+            tokens.add(lowered)
+        if len(chunk) > 3:
+            for i in range(len(chunk) - 2):
+                tokens.add(chunk[i:i + 3])
+    return {t for t in tokens if t and t not in _TITLE_STOP_TOKENS}
+
+
+def title_keyword_score(question: str, title: str) -> float:
+    """标题关键词命中评分：标题词元出现在问题里即给分，0~0.9。
+
+    用于补 Dice 系数对口语问法的不足。例如「这周有周赛吗」与
+    「ACM 周赛（本周）」的 Dice 只有 0.18，但「周赛」这个标题词元命中，
+    应判为同一条记录。词元越长越可信：2 字 0.6、3 字 0.7、4 字 0.8。
+    """
+    q = (question or "").lower()
+    if not q:
+        return 0.0
+    best = 0.0
+    for token in _title_tokens(title):
+        if token in q:
+            best = max(best, min(0.4 + 0.1 * len(token), 0.9))
+    return best
+
+
+def record_match_score(question: str, *fields: str) -> float:
+    """综合 Dice 相似度与标题关键词命中，取较高者作为记录匹配分。"""
+    best = 0.0
+    for field in fields:
+        if not field:
+            continue
+        best = max(
+            best,
+            text_similarity(question, field),
+            title_keyword_score(question, field),
+        )
+    return best
+
+
 # ----------------------------------------------------------------------
 # 1) 话题范围硬限制：本地意图判断（不调 LLM）
 # ----------------------------------------------------------------------

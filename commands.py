@@ -785,12 +785,11 @@ async def _answer_from_knowledge_base(text: str, group_id: str) -> str | None:
     """
     threshold = config.QA_KB_MATCH_MIN_SCORE
 
-    # 1) 已录入比赛：按名称/时间相似度取分最高者
+    # 1) 已录入比赛：Dice 相似度 + 标题关键词命中取最高（口语问法也能召回）
     best, best_score = None, 0.0
     for comp in db.list_question_contests(group_id):
-        score = max(
-            content_filter.text_similarity(text, comp.get("name") or ""),
-            content_filter.text_similarity(text, comp.get("contest_time") or ""),
+        score = content_filter.record_match_score(
+            text, comp.get("name") or "", comp.get("contest_time") or "",
         )
         if score > best_score:
             best, best_score = comp, score
@@ -807,9 +806,8 @@ async def _answer_from_knowledge_base(text: str, group_id: str) -> str | None:
     # 2) 本群课程安排
     best_t, best_t_score = None, 0.0
     for session in db.list_training_sessions(group_id, active_only=True):
-        score = max(
-            content_filter.text_similarity(text, session.get("title") or ""),
-            content_filter.text_similarity(text, session.get("location") or ""),
+        score = content_filter.record_match_score(
+            text, session.get("title") or "", session.get("location") or "",
         )
         if score > best_t_score:
             best_t, best_t_score = session, score
@@ -833,9 +831,8 @@ async def _answer_from_knowledge_base(text: str, group_id: str) -> str | None:
     # 3) 学校安排（仅可共享给学生的条目）
     best_e, best_e_score = None, 0.0
     for event in db.list_org_events(status="confirmed", shareable_only=True):
-        score = max(
-            content_filter.text_similarity(text, event.get("title") or ""),
-            content_filter.text_similarity(text, event.get("location") or ""),
+        score = content_filter.record_match_score(
+            text, event.get("title") or "", event.get("location") or "",
         )
         if score > best_e_score:
             best_e, best_e_score = event, score
