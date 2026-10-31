@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 import database as db
 import fetcher
 import llm
+from contest_fields import map_competition_info
 from config import AUTO_FETCH_ENABLED, FETCH_MIN_INTERVAL_MINUTES, TZ_NAME
 
 logger = logging.getLogger(__name__)
@@ -75,29 +76,8 @@ def detect_change(source: dict, text: str, etag: str, last_modified: str) -> boo
 
 
 def _map_competition_info(info: dict) -> dict:
-    """映射实际提取的非空字段；省略字段不表示清空已确认信息。"""
-    aliases = {
-        "name": ("name",), "edition": ("edition",),
-        "official_reg_start": ("official_reg_start", "reg_start"),
-        "official_reg_deadline": ("official_reg_deadline", "reg_deadline"),
-        "official_time": ("official_time", "contest_time"),
-        "official_rules": ("official_rules", "raw_note"),
-        "official_site": ("official_site", "source_link"),
-        "tracks": ("tracks",), "device_req": ("device_req",),
-        "summary": ("summary",),
-    }
-    patch = {}
-    for target, fields in aliases.items():
-        for field in fields:
-            value = info.get(field)
-            if value is None:
-                continue
-            if not isinstance(value, str):
-                raise ValueError(f"字段 {field} 类型错误（应为字符串）")
-            if value.strip():
-                patch[target] = value.strip()
-                break
-    return patch
+    """保留兼容入口，统一使用公共比赛字段映射。"""
+    return map_competition_info(info)
 
 
 def _source_is_active(source: dict) -> bool:
