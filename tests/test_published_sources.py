@@ -13,6 +13,7 @@ import crawler
 import database
 import main
 from fetcher import FetchError
+from onebot_client import OneBotMessage
 
 
 URL = "https://contest.example.com/announcement"
@@ -48,13 +49,13 @@ def db_file(monkeypatch, tmp_path):
 
 
 @pytest.fixture
-async def bot(monkeypatch, db_file):
+async def bot(monkeypatch, db_file, onebot_client):
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
     monkeypatch.setattr(config, "PUBLISH_CMD", "发布")
     monkeypatch.setattr(crawler, "AUTO_FETCH_ENABLED", False)
     state = SimpleNamespace(
-        client=main.ACMBot(), replies=[], sent=[], fetched=[], extracted=[]
+        client=main.ACMBot(onebot_client), replies=[], sent=[], fetched=[], extracted=[]
     )
 
     async def reply(message, content):
@@ -74,20 +75,17 @@ async def bot(monkeypatch, db_file):
         return dict(INFO), None
 
     monkeypatch.setattr(state.client, "_safe_reply", reply)
-    monkeypatch.setattr(state.client, "_send_group_log_only", send)
-    # 与已提交的群通知 PR 合并后，上层改用 _send_group。
-    monkeypatch.setattr(state.client, "_send_group", send, raising=False)
+    monkeypatch.setattr(state.client, "_send_group", send)
     monkeypatch.setattr(main, "fetch_text", fetch)
     monkeypatch.setattr(main, "extract_contest", extract)
     return state
 
 
 def _message(group="g1", member="teacher"):
-    return SimpleNamespace(
-        content=f"发布 {URL} 补充：校内截止提前一天",
-        group_openid=group,
-        member_openid=member,
-    )
+    return OneBotMessage({"post_type": "message", "message_type": "group",
+                         "raw_message": f"发布 {URL} 补充：校内截止提前一天",
+                         "group_id": group, "user_id": member, "message_id": 12345,
+                         "self_id": 30001})
 
 
 def _now(hour=9, minute=0):

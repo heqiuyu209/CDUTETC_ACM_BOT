@@ -10,7 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Barrier
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
@@ -209,7 +208,7 @@ async def test_sender_timeout_releases_claim_for_retry(file_db, monkeypatch):
 
 
 @pytest.mark.parametrize("legacy_result", ["timeout", "exception", "no_receipt"])
-async def test_main_job_continues_after_legacy_send_failure(file_db, monkeypatch, legacy_result):
+async def test_main_job_continues_after_legacy_send_failure(file_db, monkeypatch, legacy_result, onebot_client):
     _, key = collection()
     legacy_id = database.save_contest("g1", {"name": "旧比赛", "reg_deadline": TARGET})
     monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
@@ -223,18 +222,18 @@ async def test_main_job_continues_after_legacy_send_failure(file_db, monkeypatch
     monkeypatch.setattr(reminder, "datetime", Clock)
     legacy_calls = []
 
-    async def api_send(**kwargs):
-        if "旧比赛" in kwargs["content"]:
-            legacy_calls.append(kwargs["group_openid"])
+    async def api_send(action, **kwargs):
+        if "旧比赛" in kwargs["message"]:
+            legacy_calls.append(kwargs["group_id"])
             if legacy_result == "timeout":
                 await asyncio.Event().wait()
             if legacy_result == "exception":
                 raise RuntimeError("legacy SDK rejected")
             return None
-        return {"id": "general-sent-id"}
+        return {"status": "ok", "retcode": 0, "data": {"message_id": 12345}}
 
-    client = main.ACMBot()
-    monkeypatch.setattr(client, "api", SimpleNamespace(post_group_message=AsyncMock(side_effect=api_send)))
+    client = main.ACMBot(onebot_client)
+    onebot_client.call_api.side_effect = api_send
     await asyncio.wait_for(client._remind_job(), timeout=2)
     row = database.get_delivery_by_key(key)
     assert (row["status"], row["attempts"]) == ("sent", 1)

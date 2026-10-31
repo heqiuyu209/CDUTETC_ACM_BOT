@@ -5,12 +5,11 @@ from datetime import datetime
 import hashlib
 import json
 import sqlite3
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import pytest
-from botpy.message import GroupMessage
+from onebot_client import OneBotMessage
 
 import commands
 import config
@@ -394,14 +393,14 @@ async def test_pending_permissions_reject_before_any_database_access(db_file, mo
     assert len(replies) == 1 and "仅超管" in replies[0]["text"] and replies[0]["group_id"] == "g1"
 
 
-async def test_real_sdk_pending_commands_only_send_source_group_confirmations(competition, monkeypatch):
-    client = main.ACMBot()
-    api = SimpleNamespace(post_group_message=AsyncMock(return_value={"id": "sent"}), post_c2c_message=AsyncMock())
-    monkeypatch.setattr(client, "api", api)
+async def test_onebot_pending_commands_only_send_source_group_confirmations(competition, onebot_client):
+    api = onebot_client
+    client = main.ACMBot(api)
     uid = database.add_pending_update(competition, {"summary": "私有填充值-private-value"}, change_note="私有原文-private-note", created_by="private-operator")
     async def route(text, msg_id):
-        await client.on_group_at_message_create(GroupMessage(api=api, event_id="event", data={
-            "id": msg_id, "content": text, "group_openid": "g1", "author": {"member_openid": "admin"},
+        await client.on_group_at_message_create(OneBotMessage({
+            "post_type": "message", "message_type": "group", "message_id": msg_id,
+            "raw_message": text, "group_id": "g1", "user_id": "admin", "self_id": 30001,
         }))
     await route("/待审列表", "list-id")
     await route(f"/待审批准 {uid}", "apply-id")
@@ -411,13 +410,12 @@ async def test_real_sdk_pending_commands_only_send_source_group_confirmations(co
     await route(f"/待审拒绝 {uid} 含姓名学号-private-reason", "reject-id")
     assert database.get_competition(competition) == before
     assert database.get_pending_update(competition) is None
-    assert api.post_group_message.await_count == 3
-    calls = [call.kwargs for call in api.post_group_message.await_args_list]
-    assert all(call["group_openid"] == "g1" and "msg_id" in call and call["msg_seq"] == 1 for call in calls)
-    assert [call["msg_id"] for call in calls] == ["list-id", "apply-id", "reject-id"]
-    assert all("private-" not in call["content"] for call in calls)
-    assert "summary" in calls[0]["content"] and "已批准" in calls[1]["content"] and "已拒绝" in calls[2]["content"]
-    api.post_c2c_message.assert_not_awaited()
+    assert api.call_api.await_count == 3
+    calls = [call.kwargs for call in api.call_api.await_args_list]
+    assert all(call["group_id"] == "g1" and "msg_id" not in call and "msg_seq" not in call for call in calls)
+    assert all("private-" not in call["message"] for call in calls)
+    assert "summary" in calls[0]["message"] and "已批准" in calls[1]["message"] and "已拒绝" in calls[2]["message"]
+    api.send_private_msg.assert_not_awaited()
     assert "private-reason" in database.list_audit()[0]["after_json"]
 
 
