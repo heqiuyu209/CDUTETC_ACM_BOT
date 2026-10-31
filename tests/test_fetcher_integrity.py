@@ -47,14 +47,14 @@ def connection(monkeypatch):
 
     async def resolve(host):
         state["hosts"].append(host)
-        return "8.8.8.8"
+        return ["8.8.8.8"]
 
     async def connect(host, ip, port, scheme):
         writer = MemoryWriter()
         state["writers"].append(writer)
         return MemoryReader(state["response"], state["block_size"]), writer
 
-    monkeypatch.setattr(fetcher, "_resolve_public_ip", resolve)
+    monkeypatch.setattr(fetcher, "_resolve_public_ips", resolve)
     monkeypatch.setattr(fetcher, "_connect", connect)
     monkeypatch.setattr(fetcher.config, "FETCH_MAX_BYTES", 1024 * 1024)
     return state
@@ -207,6 +207,6 @@ async def test_request_timeout_covers_dns_and_reading(monkeypatch):
     async def unresolved(host):
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(fetcher, "_resolve_public_ip", unresolved)
+    monkeypatch.setattr(fetcher, "_resolve_public_ips", unresolved)
     with pytest.raises(FetchError, match="超时"):
         await fetcher.fetch_text("https://contest.example.com/news")

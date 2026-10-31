@@ -95,9 +95,9 @@ python scripts/export_collection.py --group-id '群openid' --collection-id 1 --o
 | `ACM_FETCH_ALLOWED_DOMAINS` | 否 | 空 | 可抓取的域名白名单（逗号分隔，小写）；重定向目标同样校验。**强烈建议配置** |
 | `ACM_FETCH_MAX_BYTES` | 否 | `1000000` | 解压后响应体上限（字节） |
 | `ACM_FETCH_MAX_REDIRECTS` | 否 | `3` | 重定向跳数上限 |
-| `ACM_FETCH_TIMEOUT` | 否 | `10` | 连接 / 读取超时（秒） |
+| `ACM_FETCH_TIMEOUT` | 否 | `10` | 每跳 DNS、候选地址连接、读取、清理及正文解析共用的总超时（秒） |
 | `ACM_FETCH_CONCURRENCY` | 否 | `2` | 同时抓取上限 |
-| `ACM_FETCH_TEXT_LIMIT` | 否 | `3000` | 送入模型的正文长度上限（字符） |
+| `ACM_FETCH_TEXT_LIMIT` | 否 | `3000` | 旧配置兼容保留；抓取返回完整有界正文，模型输入由 `ACM_LLM_MAX_INPUT_CHARS` 限制 |
 | `ACM_FETCH_MIN_INTERVAL_MINUTES` | 否 | `60` | 公共来源最小抓取间隔（分钟），低频抓取控制 |
 | `ACM_LLM_MAX_INPUT_CHARS` | 否 | `6000` | 单次模型请求输入上限 |
 | `ACM_LLM_MAX_OUTPUT_TOKENS` | 否 | `2000` | 单次模型请求输出上限 |

@@ -15,15 +15,17 @@
 """
 
 import asyncio
+import codecs
+from contextvars import ContextVar
 import ipaddress
+from html.parser import HTMLParser
+from io import StringIO
 import logging
 import re
 import socket
 import ssl
 import zlib
 from urllib.parse import quote, urljoin, urlparse, urlsplit
-
-from bs4 import BeautifulSoup
 
 import config
 
@@ -37,8 +39,13 @@ _ALLOWED_CTYPES = {
 _UA = "Mozilla/5.0 (compatible; CDUTETC-ACM-Bot/1.0; +https://q.qq.com)"
 _MAX_HEADER_BYTES = 65536
 _HEADER_NAME = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+_CHARSET = re.compile(r"\bcharset\s*=\s*['\"]?([^\s;'\"<>]+)", re.I)
+_PARSE_BLOCK_CHARS = 2048
+_MAX_HTML_TOKEN_CHARS = 16384
+_HIDDEN_TAGS = frozenset(("script", "style", "noscript", "iframe"))
 
 _sem = asyncio.Semaphore(config.FETCH_CONCURRENCY)
+_request_deadline = ContextVar("fetch_request_deadline", default=None)
 
 
 class FetchError(Exception):
@@ -79,8 +86,8 @@ def _parse_url(url: str) -> tuple[str, str, int] | None:
     return parsed.scheme, host, port
 
 
-async def _resolve_public_ip(host: str) -> str:
-    """解析主机名并校验所有地址均为公网；返回第一个可用 IP。
+async def _resolve_public_ips(host: str) -> list[str]:
+    """解析主机名，先校验全部地址，再返回去重后的公网候选列表。
 
     域名白名单（若配置）在此检查；白名单校验在解析之前，避免先做 DNS。
     """
@@ -98,13 +105,19 @@ async def _resolve_public_ip(host: str) -> str:
         try:
             ip = ipaddress.ip_address(info[4][0])
         except ValueError:
-            continue
+            raise FetchError(f"目标主机返回非法地址: {host}") from None
         if not _is_public_ip(ip):
             raise FetchError(f"目标地址非公网，已拒绝连接: {ip}（域名 {host}）")
-        public.append(str(ip))
+        if str(ip) not in public:
+            public.append(str(ip))
     if not public:
         raise FetchError(f"目标主机无可用地址: {host}")
-    return public[0]
+    return public
+
+
+async def _resolve_public_ip(host: str) -> str:
+    """保留旧内部调用的单地址接口；实际请求使用全部已验证候选。"""
+    return (await _resolve_public_ips(host))[0]
 
 
 # ---------- 底层 HTTP/1.1 流式读取 ----------
@@ -114,11 +127,8 @@ async def _connect(host: str, ip: str, port: int, scheme: str):
     """直连已校验 IP；HTTPS 用原始 host 做 SNI 与证书校验。"""
     ctx = ssl.create_default_context() if scheme == "https" else None
     try:
-        return await asyncio.wait_for(
-            asyncio.open_connection(
-                host=ip, port=port, ssl=ctx, server_hostname=host if ctx else None
-            ),
-            timeout=config.FETCH_TIMEOUT,
+        return await asyncio.open_connection(
+            host=ip, port=port, ssl=ctx, server_hostname=host if ctx else None
         )
     except (OSError, asyncio.TimeoutError) as e:
         raise FetchError(f"连接失败（{host}:{port}）: {e}") from e
@@ -308,14 +318,19 @@ def _decompress_gzip(data: bytes) -> bytes:
 async def _request_once(url: str) -> tuple[int, dict[str, str], bytes]:
     """单次请求含 DNS、连接与正文处理的总时间也受超时限制。"""
     try:
-        return await asyncio.wait_for(_request_once_impl(url), timeout=config.FETCH_TIMEOUT)
+        deadline = _request_deadline.get()
+        if deadline is not None:
+            # 公开入口已包住整跳；不再创建同刻取消的第二个超时任务。
+            return await _request_once_impl(url, deadline)
+        deadline = asyncio.get_running_loop().time() + config.FETCH_TIMEOUT
+        return await asyncio.wait_for(_request_once_impl(url, deadline), timeout=config.FETCH_TIMEOUT)
     except asyncio.TimeoutError:
         raise FetchError("链接抓取超时") from None
     except (OSError, UnicodeError) as e:
         raise FetchError(f"链接抓取失败：{type(e).__name__}") from e
 
 
-async def _request_once_impl(url: str) -> tuple[int, dict[str, str], bytes]:
+async def _request_once_impl(url: str, deadline: float) -> tuple[int, dict[str, str], bytes]:
     """对单个 URL 发一次 GET（直连已校验 IP），返回 (status, headers, body)。"""
     parsed = _parse_url(url)
     if parsed is None:
@@ -328,8 +343,21 @@ async def _request_once_impl(url: str) -> tuple[int, dict[str, str], bytes]:
     authority = f"[{host}]" if ":" in host else host
     if port != (443 if scheme == "https" else 80):
         authority += f":{port}"
-    ip = await _resolve_public_ip(host)
-    reader, writer = await _connect(host, ip, port, scheme)
+    ips = await _resolve_public_ips(host)
+    loop = asyncio.get_running_loop()
+    # 每个候选共享剩余总预算；首个不可达地址不能占满所有连接时间。
+    for index, ip in enumerate(ips):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        try:
+            reader, writer = await asyncio.wait_for(
+                _connect(host, ip, port, scheme), remaining / (len(ips) - index)
+            )
+            break
+        except (FetchError, OSError, asyncio.TimeoutError) as error:
+            if index == len(ips) - 1:
+                raise FetchError(f"所有已验证地址连接失败（{host}:{port}）") from error
     try:
         req = (
             f"GET {target} HTTP/1.1\r\n"
@@ -355,28 +383,190 @@ async def _request_once_impl(url: str) -> tuple[int, dict[str, str], bytes]:
     finally:
         writer.close()
         try:
-            await asyncio.wait_for(writer.wait_closed(), timeout=config.FETCH_TIMEOUT)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            await asyncio.wait_for(writer.wait_closed(), timeout=min(remaining, 0.1))
         except Exception:
-            pass
+            transport = getattr(writer, "transport", None)
+            if transport is not None:
+                transport.abort()
 
 
 # ---------- 公开入口 ----------
 
 
-def _extract_text(body: bytes, content_type: str, source_url: str) -> str:
+class _CharsetSniffer(HTMLParser):
+    """只检查有上限的页面前缀，不构建 DOM。"""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.charset = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "meta" or self.charset is not None:
+            return
+        attrs = dict(attrs)
+        if attrs.get("charset"):
+            self.charset = attrs["charset"]
+        elif (attrs.get("http-equiv") or "").lower() == "content-type":
+            match = _CHARSET.search(attrs.get("content") or "")
+            if match:
+                self.charset = match[1]
+
+
+def _decode_body(body: bytes, content_type: str) -> tuple[str, bool]:
     ctype = (content_type or "").split(";")[0].strip().lower()
     if ctype not in _ALLOWED_CTYPES:
         raise FetchError(f"不支持的响应类型: {ctype or '未知'}")
-    text = body.decode("utf-8", errors="replace")
-    if ctype in ("text/html", "application/xhtml+xml"):
-        soup = BeautifulSoup(text, "html.parser")
-        for tag in soup(["script", "style", "noscript", "iframe"]):
-            tag.decompose()
-        text = soup.get_text("\n", strip=True)
-    if len(text) > config.FETCH_TEXT_LIMIT:
-        text = text[: config.FETCH_TEXT_LIMIT]
+    if len(body) > config.FETCH_MAX_BYTES:
+        raise FetchError("响应体超过大小上限")
+    html = ctype in ("text/html", "application/xhtml+xml")
+    # BOM 优先于 HTTP 声明，HTTP 声明优先于 HTML meta。
+    charset = None
+    for bom, name in ((codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32"),
+                      (codecs.BOM_UTF8, "utf-8-sig"), (codecs.BOM_UTF16_LE, "utf-16"),
+                      (codecs.BOM_UTF16_BE, "utf-16")):
+        if body.startswith(bom):
+            charset = name
+            break
+    if charset is None:
+        match = _CHARSET.search(content_type or "")
+        charset = match[1] if match else None
+    if charset is None and html:
+        sniffer = _CharsetSniffer()
+        try:
+            sniffer.feed(body[:8192].decode("latin-1"))
+        except (ValueError, AssertionError):
+            raise FetchError("HTML 字符集声明非法") from None
+        charset = sniffer.charset
+    try:
+        codec = codecs.lookup((charset or "utf-8").strip())
+        if not getattr(codec, "_is_text_encoding", False) or codec.name in ("unicode-escape", "raw-unicode-escape"):
+            raise LookupError
+        return body.decode(codec.name, errors="replace"), html
+    except (LookupError, UnicodeError, ValueError):
+        raise FetchError("不支持的响应字符集") from None
+
+
+class _VisibleTextParser(HTMLParser):
+    """增量提取可见文字；不按标签保存节点，未完成 token 与隐藏嵌套有界。"""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.output = StringIO()
+        self.hidden = []
+        self.separator = ""
+        self.has_text = False
+
+    def _boundary(self):
+        if self.has_text:
+            self.separator = "\n"
+
+    def handle_starttag(self, tag, attrs):
+        if tag in _HIDDEN_TAGS:
+            if len(self.hidden) >= 128:
+                raise FetchError("HTML 隐藏标签嵌套过深")
+            self.hidden.append(tag)
+        if not self.hidden:
+            self._boundary()
+
+    def handle_startendtag(self, tag, attrs):
+        if not self.hidden:
+            self._boundary()
+
+    def handle_endtag(self, tag):
+        if self.hidden and tag == self.hidden[-1]:
+            self.hidden.pop()
+        if not self.hidden:
+            self._boundary()
+
+    def handle_data(self, data):
+        if self.hidden or not data:
+            return
+        # 保留分块间连续文字，仅在实际标签/空白处插入分隔。
+        normalized = re.sub(r"\s+", " ", data)
+        text = normalized.strip()
+        if text:
+            if normalized.startswith(" ") and not self.separator and self.has_text:
+                self.separator = " "
+            if self.has_text:
+                self.output.write(self.separator)
+            self.output.write(text)
+            self.has_text = True
+            self.separator = " " if normalized.endswith(" ") else ""
+        elif self.has_text and not self.separator:
+            self.separator = " "
+
+    def feed_bounded(self, data):
+        try:
+            super().feed(data)
+        except (ValueError, AssertionError):
+            raise FetchError("HTML 标签非法") from None
+        if self.cdata_elem and self.rawdata:
+            # HTMLParser 会积攒整段 script/style，丢弃已确认的隐藏正文，
+            # 只保留可能跨分块的结束标签前缀。
+            tail = self.rawdata[self.rawdata.rfind("<"):] if "<" in self.rawdata else ""
+            match = re.fullmatch(r"<(?:/\s*([A-Za-z]*)\s*)?", tail)
+            if not match or (match[1] and not self.cdata_elem.startswith(match[1].lower())):
+                tail = ""
+            self.rawdata = tail
+        if len(self.rawdata) > _MAX_HTML_TOKEN_CHARS:
+            raise FetchError("HTML 未完成标签超过大小上限")
+
+    def finish(self):
+        self.close()
+        return self.output.getvalue()
+
+
+def _extract_text(body: bytes, content_type: str, source_url: str) -> str:
+    """同步兼容入口；实际抓取使用可让出事件循环的增量解析。"""
+    text, html = _decode_body(body, content_type)
+    if html:
+        parser = _VisibleTextParser()
+        for offset in range(0, len(text), _PARSE_BLOCK_CHARS):
+            parser.feed_bounded(text[offset:offset + _PARSE_BLOCK_CHARS])
+        text = parser.finish()
     logger.info("抓取成功: %s（%d 字符）", source_url, len(text))
     return text
+
+
+async def _extract_text_async(body: bytes, content_type: str, source_url: str, deadline: float) -> str:
+    text, html = _decode_body(body, content_type)
+    loop = asyncio.get_running_loop()
+    if html:
+        parser = _VisibleTextParser()
+        for offset in range(0, len(text), _PARSE_BLOCK_CHARS):
+            if loop.time() >= deadline:
+                raise asyncio.TimeoutError
+            parser.feed_bounded(text[offset:offset + _PARSE_BLOCK_CHARS])
+            await asyncio.sleep(0)
+        text = parser.finish()
+    if loop.time() >= deadline:
+        raise asyncio.TimeoutError
+    logger.info("抓取成功: %s（%d 字符）", source_url, len(text))
+    return text
+
+
+async def _fetch_hop(url: str) -> tuple[int, dict[str, str], str]:
+    """本跳 DNS、连接、读取、清理与文本解析共用一个总超时。"""
+    deadline = asyncio.get_running_loop().time() + config.FETCH_TIMEOUT
+
+    async def run():
+        token = _request_deadline.set(deadline)
+        try:
+            status, headers, body = await _request_once(url)
+            text = ""
+            if status not in (301, 302, 303, 307, 308) and status < 400:
+                text = await _extract_text_async(body, headers.get("content-type", ""), url, deadline)
+            return status, headers, text
+        finally:
+            _request_deadline.reset(token)
+
+    try:
+        return await asyncio.wait_for(run(), timeout=config.FETCH_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise FetchError("链接抓取超时") from None
 
 
 async def fetch_text(url: str) -> str:
@@ -386,7 +576,7 @@ async def fetch_text(url: str) -> str:
         url: 初始链接。
 
     Returns:
-        正文纯文本（已截断到 FETCH_TEXT_LIMIT）。
+        完整正文纯文本（响应体受 FETCH_MAX_BYTES 限制，模型输入另行限长）。
 
     Raises:
         FetchError: 任何抓取失败 / 安全拒绝，带用户可读原因。
@@ -413,7 +603,7 @@ async def fetch_text_with_headers(url: str) -> tuple[str, dict[str, str]]:
             parsed = _parse_url(current)
             if parsed is None:
                 raise FetchError("仅支持无账号密码的 http/https 链接")
-            status, headers, body = await _request_once(current)
+            status, headers, text = await _fetch_hop(current)
             if status in (301, 302, 303, 307, 308):
                 location = headers.get("location")
                 if not location:
@@ -423,6 +613,5 @@ async def fetch_text_with_headers(url: str) -> tuple[str, dict[str, str]]:
                 continue
             if status >= 400:
                 raise FetchError(f"HTTP 状态码 {status}")
-            text = _extract_text(body, headers.get("content-type", ""), current)
             return text, headers
         raise FetchError(f"重定向次数超过上限（{config.FETCH_MAX_REDIRECTS}）")
