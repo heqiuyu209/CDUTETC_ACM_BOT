@@ -31,71 +31,109 @@ TZ = ZoneInfo("Asia/Shanghai")
 
 _HELP_HEADER = "【CDUTETC ACM 事务助手 · 命令帮助】"
 
-# 普通成员可见：只放查询、报名、提问类，不放任何管理命令
-_HELP_MEMBER = """--- 学校安排 ---
-/校安排                  查看学校统一安排（仅共享部分）
---- 课程与训练 ---
-/课程列表                查看本群课程安排
---- 征集登记 ---
-/报名 <征集id> [字段=值 ...]   报名/更新我的登记
-/报名 取消 <征集id>      取消我的报名
-/征集汇总 <征集id>       查看本群人数和剩余名额
---- 提问 ---
-直接 @机器人 提问        只回答已录入的 FAQ/课程/校安排/比赛，
-                         查不到会转给老师，不会调用大模型
-/提问 <问题>             记录未答问题，老师稍后回答"""
+# 帮助文案在群里公开展示，只描述「能做什么」，不写实现细节。
+# 每项格式：(所需身份, 命令, 说明)；身份 1=群成员 2=老师/超管 3=超管。
+_HELP_LEVEL_MEMBER, _HELP_LEVEL_TEACHER, _HELP_LEVEL_SUPER = 1, 2, 3
 
-# 老师/超管可见：发布与管理类
-_HELP_TEACHER = """--- 比赛资料 ---
-发布 <官网链接>          整理比赛信息后私聊超管确认（@机器人发送）
-/待确认列表              查看待确认的发布申请
---- 课程与训练 ---
-/课程添加 <标题> [星期几] [开始-结束] [地点]  添加课程
-/课程取消 <id>           取消课程
---- 征集登记 ---
-/征集 <标题> [截止时间] [名额] [字段1,字段2]  发起征集
-/征集关闭 <征集id>       关闭征集停止报名
---- FAQ 与提问 ---
-/FAQ列表 [关键词]       查看本群 FAQ
-/FAQ添加 <问题> = <答案> 添加 FAQ 并关闭同群同题未答问题
-/FAQ删除 <id>            删除 FAQ
-/问题列表                查看未答问题
-/回答 <编号> = <答案>    回答未答问题，自动存入 FAQ
---- 提醒与抓取 ---
-/提醒状态                查看提醒投递队列状态
-/抓取状态                查看公共来源抓取状态
-/抓取一次                立即抓取一次公共来源"""
+_HELP_SECTIONS = (
+    ("比赛", (
+        (2, "发布 <官网链接>", "把比赛链接发给机器人（需 @机器人）"),
+        (2, "/待确认列表", "查看等待确认的发布"),
+    )),
+    ("学校安排", (
+        (1, "/校安排", "查看学校统一安排"),
+    )),
+    ("课程与训练", (
+        (1, "/课程列表", "查看本群课程安排"),
+        (2, "/课程添加 <标题> [星期几] [开始-结束] [地点]", "添加课程"),
+        (2, "/课程取消 <id>", "取消课程"),
+    )),
+    ("征集登记", (
+        (1, "/报名 <征集id> [字段=值 ...]", "报名或更新我的登记"),
+        (1, "/报名 取消 <征集id>", "取消我的报名"),
+        (1, "/征集汇总 <征集id>", "查看报名人数和剩余名额"),
+        (2, "/征集 <标题> [截止时间] [名额] [字段1,字段2]", "发起征集"),
+        (2, "/征集关闭 <征集id>", "停止报名"),
+    )),
+    ("提问", (
+        (1, "@机器人 提问", "直接问，机器人会尽力回答"),
+        (1, "/提问 <问题>", "记下问题，等老师回复"),
+        (2, "/问题列表", "查看待回答的问题"),
+        (2, "/回答 <编号> = <答案>", "回答指定编号的问题"),
+    )),
+    ("常见问题", (
+        (2, "/FAQ列表 [关键词]", "查看本群常见问题"),
+        (2, "/FAQ添加 <问题> = <答案>", "添加一条常见问题"),
+        (2, "/FAQ删除 <id>", "删除一条常见问题"),
+    )),
+    ("提醒与来源", (
+        (2, "/提醒状态", "查看提醒发送情况"),
+        (2, "/抓取状态", "查看比赛来源更新情况"),
+        (2, "/抓取一次", "立即检查一次比赛来源"),
+    )),
+    ("比赛修正（超管）", (
+        (3, "/修正 <比赛id> <字段=值 ...>", "修正已发布的比赛信息"),
+        (3, "/修正 <比赛id> 重新提取 <链接>", "重新读取官网信息"),
+        (3, "/待审列表", "查看来源更新带来的改动"),
+        (3, "/待审批准 <更新id>", "采纳来源更新"),
+        (3, "/待审拒绝 <更新id> [原因]", "忽略来源更新"),
+    )),
+    ("群与老师管理（超管）", (
+        (3, "/加群 <群号> [备注]", "让机器人在该群工作"),
+        (3, "/删群 <群号>", "取消该群授权"),
+        (3, "/加老师 <QQ号> [备注]", "设置老师身份"),
+        (3, "/删老师 <QQ号>", "取消老师身份"),
+        (3, "/群列表", "查看已授权的群和老师"),
+        (3, "/通知群 <比赛id> <群号,群号>", "设置该比赛通知哪些群"),
+    )),
+)
 
-# 超管可见：比赛修正、待审更新、私聊管理、白名单管理
-_HELP_SUPER = """--- 比赛修正与来源待审（超管） ---
-/修正 <比赛id> <字段=值 ...>  修正已发布比赛字段
-  例：/修正 1 time=2026-12-01 19:00 name="ICPC 2026 区域赛"
-/修正 <比赛id> 重新提取 <链接>  重新提取官网信息
-/待审列表                查看后台来源更新的编号与改动字段
-/待审批准 <更新id>       合并来源更新的有效字段
-/待审拒绝 <更新id> [原因]  保留正式资料并拒绝来源更新
---- 白名单管理（超管，立即生效） ---
-/加群 <群号> [备注]      授权新群；被拉进群后按提示取群号
-/删群 <群号>             移除动态添加的群
-/加老师 <QQ号> [备注]    添加老师
-/删老师 <QQ号>           移除动态添加的老师
-/群列表                  查看当前生效的群、老师与超管
-/通知群 <比赛id> <群号,群号>  限定该比赛只通知哪些群（全部 恢复）
---- 私聊管理（超管） ---
+_HELP_SUPER_FOOTER = """--- 私聊管理（超管） ---
 可私聊机器人发送 /FAQ添加 /FAQ删除 /课程添加 /课程取消 等命令，
-作用于默认管理群（ACM_ADMIN_GROUP，留空取首个允许群）。
+作用于默认管理群。
 私聊回复「同意 <编号>」或「拒绝 <编号>」处理发布确认。"""
 
 
-def build_help(member_id: str | None) -> str:
-    """按身份拼接帮助：普通成员看不到任何管理命令。"""
-    parts = [_HELP_HEADER, _HELP_MEMBER]
-    if can_manage_group(member_id):
-        parts.append(_HELP_TEACHER)
+def _role_level(member_id: str | None) -> int:
     if is_super_admin(member_id):
-        parts.append(_HELP_SUPER)
-    parts.append("--- 其他 ---\n/帮助                    显示本帮助")
-    return "\n".join(parts)
+        return _HELP_LEVEL_SUPER
+    if can_manage_group(member_id):
+        return _HELP_LEVEL_TEACHER
+    return _HELP_LEVEL_MEMBER
+
+
+_HELP_CMD_COLUMN = 30
+
+
+def _display_width(text: str) -> int:
+    """按终端/QQ 显示宽度计数：中日韩字符占 2 列，其余占 1 列。"""
+    return sum(2 if ord(ch) > 127 else 1 for ch in text)
+
+
+def _help_line(cmd: str, desc: str) -> str:
+    """命令与说明对齐；命令过长时说明换到下一行，避免挤压。"""
+    width = _display_width(cmd)
+    if width >= _HELP_CMD_COLUMN:
+        return f"{cmd}\n{' ' * 2}{desc}"
+    return f"{cmd}{' ' * (_HELP_CMD_COLUMN - width)}{desc}"
+
+
+def build_help(member_id: str | None) -> str:
+    """按身份生成帮助：只列出该身份可用的命令，同类命令不重复分节。"""
+    level = _role_level(member_id)
+    lines = [_HELP_HEADER]
+    for title, rows in _HELP_SECTIONS:
+        visible = [(cmd, desc) for need, cmd, desc in rows if need <= level]
+        if not visible:
+            continue
+        lines.append(f"--- {title} ---")
+        for cmd, desc in visible:
+            lines.append(_help_line(cmd, desc))
+    if level >= _HELP_LEVEL_SUPER:
+        lines.append(_HELP_SUPER_FOOTER)
+    lines.append("--- 其他 ---")
+    lines.append(_help_line("/帮助", "显示本帮助"))
+    return "\n".join(lines)
 
 
 # 兼容旧引用：默认按普通成员展示（不含管理命令）
@@ -585,7 +623,7 @@ def cmd_group_remove(group_id: str, sender: str, args: str) -> list[dict]:
 
 def cmd_group_list(group_id: str, sender: str, args: str) -> list[dict]:
     if not can_manage_group(sender):
-        return [{"group_id": group_id, "text": "仅老师/超管可查看白名单"}]
+        return [{"group_id": group_id, "text": "仅老师/超管可查看"}]
     return [{"group_id": group_id, "text": roles.describe()}]
 
 
@@ -607,7 +645,7 @@ def cmd_teacher_remove(group_id: str, sender: str, args: str) -> list[dict]:
 
 def cmd_teacher_list(group_id: str, sender: str, args: str) -> list[dict]:
     if not can_manage_group(sender):
-        return [{"group_id": group_id, "text": "仅老师/超管可查看白名单"}]
+        return [{"group_id": group_id, "text": "仅老师/超管可查看"}]
     return [{"group_id": group_id, "text": roles.describe()}]
 
 
@@ -884,7 +922,7 @@ async def _answer_from_knowledge_base(text: str, group_id: str) -> str | None:
             value = (best.get(key) or "").strip()
             if value:
                 lines.append(f"{label}：{value}")
-        lines.append("（以上为本群已录入信息，详细通知请看群公告）")
+        lines.append("（以上为群内登记的信息，详情以群公告为准）")
         return "\n".join(lines)
 
     # 2) 本群课程安排
@@ -937,17 +975,15 @@ async def _answer_from_knowledge_base(text: str, group_id: str) -> str | None:
     return None
 
 
-# 机器人能力说明：由固定话术回答，不走模型，避免模型臆造「做不到」
+# 机器人能力说明：由固定话术回答，不走模型，避免模型臆造「做不到」。
+# 面向群成员公开，只讲能做什么，不涉及实现细节。
 CAPABILITY_TEXT = """【我能做的事】
-- 问答：比赛、课程、校安排、FAQ 都能查；查不到会自动转给老师
-- 自动提醒：比赛报名截止 / 开赛、征集截止、课程开课，临近时我会主动发到群里
-  （默认提前 24 小时和 1 小时各提醒一次，不需要谁 @ 我）
-- 发布比赛：老师 @我 发「发布 <链接>」→ 我整理后私聊超管确认 → 同意后入库并通知各群
-- 征集报名：老师发起征集，同学用 /报名
-- 课程与 FAQ：老师维护，同学查询
-- 群与老师授权：超管用 /加群 /加老师，立即生效
+- 查信息：比赛、课程、学校安排、常见问题都可以问我
+- 自动提醒：比赛报名截止、开赛，征集截止，课程开课，快到了我会发到群里
+- 报名：群里发起的征集，可以直接用 /报名 参加
+- 发布：老师可以把比赛信息发给我，我会整理好并通知大家
 
-想改提醒时间点，可以找超管调整（提前多久、提醒几次都能配）。"""
+有问题直接 @我 就行。"""
 
 
 async def handle_non_command_message(text: str, group_id: str, sender: str,
