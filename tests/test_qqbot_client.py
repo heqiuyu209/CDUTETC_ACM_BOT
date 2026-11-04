@@ -114,3 +114,23 @@ def test_api_call_failure_is_swallowed():
     import asyncio
 
     assert asyncio.run(client.send_group_msg("g1", "hi")) is False
+
+
+def test_send_private_uses_msg_id_for_passive_reply():
+    """私聊也要优先被动回复，避免消耗主动消息配额。"""
+    client = QQBotClient("appid", "secret")
+    captured = {}
+
+    class _Api:
+        async def post_c2c_message(self, **params):
+            captured.update(params)
+            return {"id": "x"}
+
+    client._client = SimpleNamespace(api=_Api())
+    client._last_c2c_msg_id["USER1"] = "C2C1"
+
+    import asyncio
+
+    assert asyncio.run(client.send_private_msg("USER1", "hi")) is True
+    assert captured["openid"] == "USER1"
+    assert captured["msg_id"] == "C2C1"

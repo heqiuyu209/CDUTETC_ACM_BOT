@@ -120,8 +120,9 @@ class QQBotClient:
         self.private_msg_handler: MessageHandler | None = None
         self.on_ready: ReadyHandler | None = None
         self._client = None
-        # 每个群最近一次收到的消息 id，用于被动回复
-        self._last_msg_id: dict[str, str] = {}
+        # 最近一次收到的消息 id，用于被动回复（被动回复不占主动消息配额）
+        self._last_msg_id: dict[str, str] = {}      # 按 group_openid
+        self._last_c2c_msg_id: dict[str, str] = {}  # 按 user_openid
         self._last_rx = time.monotonic()
 
     # ---------- 生命周期 ----------
@@ -152,6 +153,8 @@ class QQBotClient:
             async def on_c2c_message_create(self, message):
                 adapter._last_rx = time.monotonic()
                 wrapped = wrap_c2c_message(message)
+                if wrapped.id:
+                    adapter._last_c2c_msg_id[wrapped.user_id] = wrapped.id
                 if adapter.private_msg_handler is not None:
                     try:
                         await adapter.private_msg_handler(wrapped)
@@ -204,9 +207,15 @@ class QQBotClient:
         return ok
 
     async def send_private_msg(self, user_id: str, text: str) -> bool:
-        """向用户发私聊（主动消息，受平台配额限制）。"""
+        """向用户发私聊；对方刚发过消息时按被动回复发送，不占主动配额。"""
         if not text:
             return False
-        return await self._post(
-            "post_c2c_message", openid=user_id, msg_type=0, content=text,
-        )
+        params = {"openid": user_id, "msg_type": 0, "content": text}
+        msg_id = self._last_c2c_msg_id.get(user_id)
+        if msg_id:
+            params["msg_id"] = msg_id
+        ok = await self._post("post_c2c_message", **params)
+        if not ok and "msg_id" in params:
+            params.pop("msg_id", None)
+            ok = await self._post("post_c2c_message", **params)
+        return ok
