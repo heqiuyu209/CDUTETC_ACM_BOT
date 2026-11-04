@@ -7,9 +7,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-import commands
-import config
-import database
+from cdutetc import commands
+from cdutetc import config
+from cdutetc import database
 
 
 @pytest.fixture

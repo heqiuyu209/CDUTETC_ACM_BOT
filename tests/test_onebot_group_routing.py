@@ -7,11 +7,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-import config
-import database
-import main
-from onebot_client import OneBotMessage
-from utils import mentioned_user_ids
+from cdutetc import config
+from cdutetc import database
+from cdutetc import main
+from cdutetc.clients.onebot import OneBotMessage
+from cdutetc.utils import mentioned_user_ids
 
 
 def message(content, *, group=123456, user=654321, self_id=111111):

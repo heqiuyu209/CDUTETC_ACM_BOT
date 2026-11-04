@@ -9,7 +9,7 @@ import sqlite3
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import config
+from cdutetc import config
 
 
 def _csv_text(value: str) -> str:

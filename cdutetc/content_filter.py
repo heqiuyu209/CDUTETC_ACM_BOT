@@ -18,7 +18,166 @@ import re
 import threading
 import time
 
-import config
+from cdutetc import config
+
+
+def _bigrams(text: str) -> set[str]:
+    """取中文/字母数字字符的二元组，作为轻量相似度特征（无需分词库）。"""
+    cleaned = re.sub(r"[^\w\u4e00-\u9fff]+", "", (text or "").lower())
+    if len(cleaned) < 2:
+        return {cleaned} if cleaned else set()
+    return {cleaned[i:i + 2] for i in range(len(cleaned) - 1)}
+
+
+def text_similarity(a: str, b: str) -> float:
+    """二元组 Dice 系数，取值 0~1；用于本地知识库检索打分。"""
+    sa, sb = _bigrams(a), _bigrams(b)
+    if not sa or not sb:
+        return 0.0
+    return 2.0 * len(sa & sb) / (len(sa) + len(sb))
+
+
+# 标题切词时丢弃的虚词，避免“本周/什么”这类词造成误命中
+_TITLE_STOP_TOKENS = {
+    "什么", "怎么", "请问", "这个", "那个", "我们", "你们", "可以", "时候",
+    "哪些", "哪个", "多少", "如何", "为什", "是不", "不是", "没有", "有没",
+}
+
+
+def _title_tokens(title: str) -> set[str]:
+    """把标题切成可用于关键词命中的词元。
+
+    规则（不依赖分词库）：
+    - 英文/数字连续串作为整体词元（长度 ≥2）；
+    - 中文连续串作为整体词元（长度 ≥2），长度 >3 时再补长度 3 的滑窗子串。
+    这样「ACM 周赛（本周）」→ {acm, 周赛, 本周}，
+    「成都理工大学ACM排名赛」→ {成都理工大学, 成都理, 都理工, ...}，
+    既能命中「周赛」这种短词，又不会因为「大学」这种泛词误命中。
+    """
+    tokens: set[str] = set()
+    for chunk in re.findall(r"[A-Za-z]+|\d+|[\u4e00-\u9fff]+", title or ""):
+        lowered = chunk.lower()
+        if chunk.isascii():
+            if len(chunk) >= 2:
+                tokens.add(lowered)
+            continue
+        if len(chunk) >= 2:
+            tokens.add(lowered)
+        if len(chunk) > 3:
+            for i in range(len(chunk) - 2):
+                tokens.add(chunk[i:i + 3])
+    return {t for t in tokens if t and t not in _TITLE_STOP_TOKENS}
+
+
+def title_keyword_score(question: str, title: str) -> float:
+    """标题关键词命中评分：标题词元出现在问题里即给分，0~0.9。
+
+    用于补 Dice 系数对口语问法的不足。例如「这周有周赛吗」与
+    「ACM 周赛（本周）」的 Dice 只有 0.18，但「周赛」这个标题词元命中，
+    应判为同一条记录。词元越长越可信：2 字 0.6、3 字 0.7、4 字 0.8。
+    """
+    q = (question or "").lower()
+    if not q:
+        return 0.0
+    best = 0.0
+    for token in _title_tokens(title):
+        if token in q:
+            best = max(best, min(0.4 + 0.1 * len(token), 0.9))
+    return best
+
+
+# 口语同义归一：把常见说法映射到记录里更可能出现的写法
+_QUESTION_SYNONYMS = (
+    ("这个星期", "本周"), ("这个礼拜", "本周"),
+    ("这星期", "本周"), ("这礼拜", "本周"), ("这周", "本周"),
+    ("今晚", "今天晚上"), ("明晚", "明天晚上"),
+)
+
+
+def _normalize_question(text: str) -> str:
+    q = text or ""
+    for src, dst in _QUESTION_SYNONYMS:
+        q = q.replace(src, dst)
+    return q
+
+
+def record_match_score(question: str, *fields: str) -> float:
+    """综合 Dice 相似度与标题关键词命中，取较高者作为记录匹配分。"""
+    normalized = _normalize_question(question)
+    best = 0.0
+    for field in fields:
+        if not field:
+            continue
+        best = max(
+            best,
+            text_similarity(normalized, field),
+            title_keyword_score(normalized, field),
+            title_keyword_score(question, field),
+        )
+    return best
+
+
+# 问句里的语气/疑问/时间噪声词。按长度从大到小排列，先删长词避免残留。
+_QUESTION_NOISE = (
+    "这礼拜", "这星期", "这个星期", "这个礼拜", "有没有", "是不是", "能不能",
+    "这周", "本周", "那个", "这个", "请问", "问一下", "有没", "什么", "怎么",
+    "哪些", "哪个", "多少", "如何", "可以", "一下",
+    "吗", "呢", "吧", "啊", "呀", "哦", "嘛", "没", "了", "的", "有", "是",
+    "在", "会", "要", "还", "都", "和", "与",
+)
+
+
+def question_core(text: str) -> str:
+    """抽取问句核心词：去掉标点、空白与语气词。
+
+    「这周有周赛吗」「这周有周赛没」「周赛有没」都会归一成「周赛」，
+    用于判断两个问法是否同一意图——比整句相似度稳定得多。
+    """
+    q = re.sub(r"[\s\W_]+", "", (text or "").lower())
+    for word in _QUESTION_NOISE:
+        q = q.replace(word, "")
+    return q
+
+
+def same_intent(a: str, b: str) -> bool:
+    """两个问法是否指向同一问题：核心词相同或互相包含。"""
+    ca, cb = question_core(a), question_core(b)
+    if not ca or not cb:
+        return False
+    if ca == cb:
+        return True
+    short, long = (ca, cb) if len(ca) <= len(cb) else (cb, ca)
+    return len(short) >= 2 and short in long
+
+
+def question_match_score(question: str, stored: str) -> float:
+    """问句之间的匹配分：同意图直接给满分，否则退回通用记录匹配分。"""
+    if same_intent(question, stored):
+        return 1.0
+    return record_match_score(question, stored)
+
+
+# 「问机器人能做什么」的措辞特征：情态词 + 能力相关名词同时出现才算。
+_CAPABILITY_MODAL = ("能", "会", "可以", "支持", "有没有", "是否", "能否")
+_CAPABILITY_ACTION = (
+    "自动", "定时", "提醒", "功能", "做什么", "干什么", "干嘛", "会什么",
+)
+
+
+def is_capability_query(text: str) -> bool:
+    """是否在问机器人自身能力（「周赛你能自动提醒吗」「你有什么功能」）。
+
+    这类问题必须用固定话术回答，不能交给模型自由发挥——否则模型会
+    编出「我不能定时提醒」「我没有数据库权限」这类与事实相反的结论。
+    """
+    t = (text or "").lower()
+    if not t:
+        return False
+    return (
+        any(m in t for m in _CAPABILITY_MODAL)
+        and any(a in t for a in _CAPABILITY_ACTION)
+    )
+
 
 # ----------------------------------------------------------------------
 # 1) 话题范围硬限制：本地意图判断（不调 LLM）

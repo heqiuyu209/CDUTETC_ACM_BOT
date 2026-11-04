@@ -8,12 +8,12 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-import config
-import crawler
-import database
-import main
-from fetcher import FetchError
-from onebot_client import OneBotMessage
+from cdutetc import config
+from cdutetc import crawler
+from cdutetc import database
+from cdutetc import main
+from cdutetc.fetcher import FetchError
+from cdutetc.clients.onebot import OneBotMessage
 
 
 URL = "https://contest.example.com/announcement"

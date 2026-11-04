@@ -9,9 +9,9 @@ from zoneinfo import ZoneInfo
 import pytest
 import httpx
 
-import crawler
-import database
-import llm
+from cdutetc import crawler
+from cdutetc import database
+from cdutetc import llm
 
 
 NOW = datetime(2026, 11, 1, 8, tzinfo=ZoneInfo("Asia/Shanghai"))

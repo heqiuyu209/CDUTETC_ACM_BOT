@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 @pytest.fixture
 def onebot_client():
     """OneBot 业务客户端：保留真实发送封装，只替换联网动作和常驻启动。"""
-    from onebot_client import OneBotClient
+    from cdutetc.clients.onebot import OneBotClient
 
     class FakeOneBotClient(OneBotClient):
         def __init__(self):

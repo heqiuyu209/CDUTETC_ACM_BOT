@@ -11,12 +11,12 @@ import sqlite3
 
 import pytest
 
-import commands
-import config
-import content_filter
-import database
-import llm
-import main
+from cdutetc import commands
+from cdutetc import config
+from cdutetc import content_filter
+from cdutetc import database
+from cdutetc import llm
+from cdutetc import main
 
 
 @pytest.fixture
@@ -443,7 +443,7 @@ def _new_competition(name: str, hours_from_now: int) -> int:
 
 
 def test_competition_without_scope_notifies_all_groups(memory_db, monkeypatch):
-    import reminder
+    from cdutetc import reminder
 
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"TRAIN", "FRESH"})
     _new_competition("蓝桥杯", 5)
@@ -459,7 +459,7 @@ def test_competition_without_scope_notifies_all_groups(memory_db, monkeypatch):
 
 def test_competition_scope_limits_reminder_groups(memory_db, monkeypatch):
     """周赛限定到集训队群后，新生群不应收到提醒。"""
-    import reminder
+    from cdutetc import reminder
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
@@ -486,7 +486,7 @@ def test_scoped_competition_hidden_from_other_group_qa(memory_db, monkeypatch):
 
 def test_scope_pointing_to_unknown_group_sends_nothing(memory_db, monkeypatch):
     """范围里全是未授权群时宁可不提醒，绝不退回全群广播。"""
-    import reminder
+    from cdutetc import reminder
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
@@ -542,7 +542,7 @@ def test_extend_scope_adds_second_group(memory_db, monkeypatch):
 
 def test_training_reminder_stays_in_its_group(monkeypatch):
     """课程提醒只发所属群，不跨群。"""
-    import reminder
+    from cdutetc import reminder
     from datetime import datetime
     from zoneinfo import ZoneInfo
 

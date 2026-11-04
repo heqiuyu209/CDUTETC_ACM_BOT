@@ -10,9 +10,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-import config
-import database
-import main
+from cdutetc import config
+from cdutetc import database
+from cdutetc import main
 
 
 BEIJING = ZoneInfo("Asia/Shanghai")

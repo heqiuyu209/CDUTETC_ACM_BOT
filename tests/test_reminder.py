@@ -5,8 +5,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-import reminder
-from config import REMIND_BEFORE_HOURS, TZ_NAME
+from cdutetc import reminder
+from cdutetc.config import REMIND_BEFORE_HOURS, TZ_NAME
 
 TZ = ZoneInfo(TZ_NAME)
 

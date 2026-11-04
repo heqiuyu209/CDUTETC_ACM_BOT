@@ -5,7 +5,7 @@
 
 import pytest
 
-from llm import (
+from cdutetc.llm import (
     _limit_contests,
     normalize_time,
     parse_contest_result,

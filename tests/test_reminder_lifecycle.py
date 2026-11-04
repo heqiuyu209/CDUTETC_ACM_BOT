@@ -15,11 +15,11 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-import commands
-import config
-import database
-import main
-import reminder
+from cdutetc import commands
+from cdutetc import config
+from cdutetc import database
+from cdutetc import main
+from cdutetc import reminder
 
 NOW = datetime(2026, 11, 1, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
 TARGET = "2026-11-01 23:59"

@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from onebot_client import OneBotClient
+from cdutetc.clients.onebot import OneBotClient
 
 
 class _FakeWS:

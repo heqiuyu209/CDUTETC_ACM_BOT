@@ -6,11 +6,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-import config
-import database
-import llm
-import main
-from onebot_client import OneBotMessage
+from cdutetc import config
+from cdutetc import database
+from cdutetc import llm
+from cdutetc import main
+from cdutetc.clients.onebot import OneBotMessage
 
 
 @pytest.fixture

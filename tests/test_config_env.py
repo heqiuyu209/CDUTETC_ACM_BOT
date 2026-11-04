@@ -7,7 +7,7 @@ DB_PATH 变成空串 → sqlite3.connect("") 打开临时库 → 每个连接都
 
 import os
 
-import config
+from cdutetc import config
 
 
 def test_drop_empty_env_removes_blank_acm_keys():

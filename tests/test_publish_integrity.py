@@ -5,13 +5,13 @@ from unittest.mock import AsyncMock
 import sqlite3
 
 import pytest
-from onebot_client import OneBotMessage
+from cdutetc.clients.onebot import OneBotMessage
 
-import commands
-import config
-import database as db
-import main
-from utils import is_publish_command
+from cdutetc import commands
+from cdutetc import config
+from cdutetc import database as db
+from cdutetc import main
+from cdutetc.utils import is_publish_command
 
 
 @pytest.mark.parametrize("text", [

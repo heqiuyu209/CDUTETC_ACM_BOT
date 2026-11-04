@@ -7,10 +7,10 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-import commands
-import config
-import database
-import reminder
+from cdutetc import commands
+from cdutetc import config
+from cdutetc import database
+from cdutetc import reminder
 
 RAW = "2026-11-01 9:00"
 TARGET = "2026-11-01 09:00"

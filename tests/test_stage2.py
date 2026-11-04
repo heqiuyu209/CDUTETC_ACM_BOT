@@ -5,7 +5,7 @@ import sqlite3
 
 import pytest
 
-import database
+from cdutetc import database
 
 
 @pytest.fixture

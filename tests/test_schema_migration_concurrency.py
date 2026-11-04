@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-import database
+from cdutetc import database
 
 
 def old_database(path):
@@ -34,7 +34,7 @@ def test_two_independent_processes_initialize_old_schema_without_duplicate_alter
 import json, sqlite3, sys, time
 from contextlib import closing
 from pathlib import Path
-import database
+from cdutetc import database
 
 path, ready, go = map(Path, sys.argv[1:])
 class CheckedConnection(sqlite3.Connection):

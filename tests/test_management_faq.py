@@ -6,14 +6,14 @@ from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from onebot_client import OneBotMessage
+from cdutetc.clients.onebot import OneBotMessage
 import pytest
 
-import commands
-import config
-import database
-import main
-import utils
+from cdutetc import commands
+from cdutetc import config
+from cdutetc import database
+from cdutetc import main
+from cdutetc import utils
 
 
 @pytest.fixture

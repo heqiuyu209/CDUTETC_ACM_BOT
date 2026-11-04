@@ -6,8 +6,8 @@ always_addressed=True —— 否则 main 的「必须 @才响应」判断会把�
 
 from types import SimpleNamespace
 
-import qqbot_client
-from qqbot_client import QQBotClient, wrap_c2c_message, wrap_group_at_message
+from cdutetc.clients import qqbot
+from cdutetc.clients.qqbot import QQBotClient, wrap_c2c_message, wrap_group_at_message
 
 
 def test_group_message_maps_fields():

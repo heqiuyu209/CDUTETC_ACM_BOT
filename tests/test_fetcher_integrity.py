@@ -7,8 +7,8 @@ import tracemalloc
 
 import pytest
 
-import fetcher
-from fetcher import FetchError
+from cdutetc import fetcher
+from cdutetc.fetcher import FetchError
 
 
 class MemoryReader:

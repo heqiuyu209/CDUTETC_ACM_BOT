@@ -9,12 +9,12 @@ import subprocess
 import sys
 
 import pytest
-from onebot_client import OneBotMessage
+from cdutetc.clients.onebot import OneBotMessage
 
-import commands
-import config
-import database
-import main
+from cdutetc import commands
+from cdutetc import config
+from cdutetc import database
+from cdutetc import main
 from scripts.export_collection import export_collection
 
 

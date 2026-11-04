@@ -3,7 +3,7 @@
 对应修复点：权限默认全拒绝 + 白名单放行；身份只认事件字段。
 """
 
-from utils import (
+from cdutetc.utils import (
     can_publish,
     contains_link,
     extract_url,

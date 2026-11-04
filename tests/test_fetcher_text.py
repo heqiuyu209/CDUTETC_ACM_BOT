@@ -11,11 +11,11 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-import crawler
-import database
-import fetcher
-import llm
-from fetcher import FetchError
+from cdutetc import crawler
+from cdutetc import database
+from cdutetc import fetcher
+from cdutetc import llm
+from cdutetc.fetcher import FetchError
 
 
 URL = "https://contest.example.com/news"

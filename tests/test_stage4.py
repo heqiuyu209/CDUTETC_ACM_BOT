@@ -9,8 +9,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-import crawler
-import database
+from cdutetc import crawler
+from cdutetc import database
 
 TZ = ZoneInfo("Asia/Shanghai")
 

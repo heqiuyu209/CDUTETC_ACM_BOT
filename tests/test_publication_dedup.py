@@ -10,14 +10,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-import crawler
-import config
-import database
-import llm
-import main
-from contest_fields import map_competition_info
-from llm import validate_contest_info
-from onebot_client import OneBotMessage
+from cdutetc import crawler
+from cdutetc import config
+from cdutetc import database
+from cdutetc import llm
+from cdutetc import main
+from cdutetc.contest_fields import map_competition_info
+from cdutetc.llm import validate_contest_info
+from cdutetc.clients.onebot import OneBotMessage
 
 
 URL = "https://contest.example.com/announcement?track=acm"

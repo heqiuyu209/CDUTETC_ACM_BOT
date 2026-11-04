@@ -9,14 +9,14 @@ from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import pytest
-from onebot_client import OneBotMessage
+from cdutetc.clients.onebot import OneBotMessage
 
-import commands
-import config
-import crawler
-import database
-import main
-from fetcher import FetchError
+from cdutetc import commands
+from cdutetc import config
+from cdutetc import crawler
+from cdutetc import database
+from cdutetc import main
+from cdutetc.fetcher import FetchError
 
 
 OLD_URL = "https://contest.example.com/old"

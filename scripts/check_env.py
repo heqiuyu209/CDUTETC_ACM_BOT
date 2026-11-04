@@ -123,7 +123,7 @@ def report_file(path: Path) -> int:
 
 
 def report_project() -> int:
-    import config
+    from cdutetc import config
 
     print("=" * 58)
     print("CDUTETC ACM 事务助手 · 配置体检")
