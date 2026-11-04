@@ -9,6 +9,7 @@ from utils import (
     extract_url,
     is_allowed_group,
     is_publish_command,
+    match_publish_command,
     strip_at,
 )
 
@@ -61,3 +62,16 @@ def test_can_publish_default_deny():
 def test_can_publish_whitelist_pass():
     assert can_publish("m1", {"m1"}) is True
     assert can_publish("m2", {"m1"}) is False
+
+
+def test_publish_command_accepts_chinese_punctuation():
+    """中文输入法下「/添加比赛，xxx」不带空格也要能识别。"""
+    assert match_publish_command("/添加比赛，15分钟过后参加蓝桥杯") == "15分钟过后参加蓝桥杯"
+    assert match_publish_command("添加比赛：今晚八点训练赛") == "今晚八点训练赛"
+    assert match_publish_command("/发布，蓝桥杯下周开始") == "蓝桥杯下周开始"
+
+
+def test_publish_command_rejects_question_like_text():
+    """带命令词但其实是提问的，不能被当成发布。"""
+    assert match_publish_command("发布什么比赛") is None
+    assert match_publish_command("添加比赛信息怎么弄") is None

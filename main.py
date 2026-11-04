@@ -38,6 +38,7 @@ import config
 import content_filter
 import crawler
 import database as db
+import llm
 import roles
 from contest_fields import map_competition_info
 from database import create_published_competition_once, init_db
@@ -551,6 +552,18 @@ class ACMBot:
                 return
             replies = await commands.handle_command(text, group_id, member_id)
             if replies is None:
+                # 老师/超管用自然语言描述比赛（没带「发布」）时，先让模型判断意图，
+                # 判为「在发布比赛」就直接走发布流程，不必死记命令格式。
+                if (
+                    config.NL_INTENT_ENABLED
+                    and not text.startswith("/")
+                    and can_manage_group(member_id)
+                ):
+                    intent = await llm.classify_intent(text)
+                    if intent == "add_contest":
+                        logger.info("识别为发布比赛意图，转发布流程")
+                        await self._handle_publish(message, text, group_id, member_id)
+                        return
                 # 非命令消息进入问答链路前，先过五层防护入口闸门
                 allowed, gate_reply = self._qa_gate(member_id, text)
                 if not allowed:

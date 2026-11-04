@@ -105,6 +105,54 @@ def validate_contest_info(info) -> tuple[dict | None, str | None]:
     return cleaned, None
 
 
+def _load_json_object(content: str) -> dict | None:
+    """从模型输出里取出 JSON 对象；容忍 ```json 代码块包裹，失败返回 None。"""
+    if not isinstance(content, str) or not content.strip():
+        return None
+    s = content.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    try:
+        data = json.loads(s)
+    except (ValueError, RecursionError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+async def classify_intent(text: str) -> str:
+    """判断老师这句话是不是在「发布一场比赛」。
+
+    Returns:
+        "add_contest" 或 "other"。任何异常/无法判定一律 "other"，
+        宁可不动作，也不要误把普通提问当成发布。
+    """
+    text = (text or "").strip()
+    if not text:
+        return "other"
+    system = (
+        "你是意图分类器，只输出 JSON 对象，不要解释。\n"
+        '输出格式：{"intent":"add_contest"} 或 {"intent":"other"}\n'
+        "判为 add_contest 的条件：这句话在陈述某场比赛/训练赛的信息"
+        "（名称、时间、报名、形式、地点、要求等），像是在通知大家。\n"
+        "以下一律判为 other：\n"
+        "- 提问（什么时候、在哪、有没有、怎么报名等）\n"
+        "- 查询、闲聊、寒暄\n"
+        "- 要求修改或删除已存在的比赛\n"
+        "- 只是提到“比赛”这个词但没有具体信息"
+    )
+    try:
+        raw = await _chat_once(system, text[: config.LLM_MAX_INPUT_CHARS], json_mode=True)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("意图分类调用失败: %s", type(e).__name__)
+        return "other"
+    data = _load_json_object(raw)
+    if data is None:
+        return "other"
+    intent = str(data.get("intent") or "").strip().lower()
+    return "add_contest" if intent == "add_contest" else "other"
+
+
 def parse_contest_result(content: str) -> tuple[dict | None, str | None]:
     """解析模型输出文本为比赛信息。空内容/非法 JSON/校验失败均返回错误。"""
     if not isinstance(content, str):

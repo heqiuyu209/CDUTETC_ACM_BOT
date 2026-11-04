@@ -47,12 +47,17 @@ def is_publish_command(text: str, cmd: str = "发布") -> bool:
 # 顺序按长度从大到小，避免短前缀先命中长命令。
 _PUBLISH_PREFIXES = ("/添加比赛", "添加比赛", "/发布", "发布")
 
+# 命令词后面允许出现的分隔符：空白与各种标点。
+# 中文输入法下「/添加比赛，15分钟…」很常见，不能因为它没空格就拒绝。
+_CMD_SEPARATORS = " \t\u3000,，.。:：、;；!！?？~～"
+
 
 def match_publish_command(text: str, cmd: str = "发布") -> str | None:
     """识别发布命令并返回正文；不是发布命令返回 None。
 
-    支持 `发布 …`、`/发布 …`、`添加比赛 …`、`/添加比赛 …` 四种写法；
-    命令后必须是空白或链接，避免把「发布什么比赛」这类提问当成命令。
+    支持 `发布 …`、`/发布 …`、`添加比赛 …`、`/添加比赛 …` 四种写法，
+    命令词后允许空白或中英文标点做分隔（兼容中文输入法习惯）。
+    命令词后紧跟其它文字时不认，避免把「发布什么比赛」这类提问当命令。
     """
     s = (text or "").strip()
     prefixes = list(_PUBLISH_PREFIXES)
@@ -64,9 +69,10 @@ def match_publish_command(text: str, cmd: str = "发布") -> str | None:
         rest = s[len(prefix):]
         if not rest:
             return ""
-        if not rest[0].isspace() and not rest.startswith(("http://", "https://", "www.")):
-            continue
-        return rest.strip()
+        if (rest[0] in _CMD_SEPARATORS
+                or rest.startswith(("http://", "https://", "www."))):
+            return rest.strip(_CMD_SEPARATORS).strip()
+        continue
     return None
 
 
