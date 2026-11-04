@@ -15,6 +15,7 @@ import logging
 
 import config
 import database as db
+from utils import is_valid_account_id
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +44,8 @@ def add_group(group_id: str, operator: str = "", note: str = "") -> tuple[bool, 
         return False, "群号不能为空"
     if gid in config.ENV_ALLOWED_GROUPS:
         return False, f"群 {gid} 已在配置文件中，无需重复添加"
-    if not gid.isdigit():
-        return False, "群号应为纯数字"
+    if not is_valid_account_id(gid):
+        return False, "群号格式不对（应为数字群号或官方机器人 openid）"
     if not db.add_runtime_group(gid, operator=operator, note=note):
         return False, f"群 {gid} 已在允许列表中"
     refresh()
@@ -69,8 +70,8 @@ def add_teacher(user_id: str, operator: str = "", note: str = "") -> tuple[bool,
         return False, "QQ 号不能为空"
     if uid in config.ENV_TEACHER_WHITELIST:
         return False, f"{uid} 已在配置文件中，无需重复添加"
-    if not uid.isdigit():
-        return False, "QQ 号应为纯数字"
+    if not is_valid_account_id(uid):
+        return False, "账号格式不对（应为数字 QQ 号或官方机器人 openid）"
     if not db.add_runtime_teacher(uid, operator=operator, note=note):
         return False, f"{uid} 已是老师"
     refresh()

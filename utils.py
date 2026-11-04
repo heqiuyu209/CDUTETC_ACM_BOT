@@ -76,6 +76,22 @@ def match_publish_command(text: str, cmd: str = "发布") -> str | None:
     return None
 
 
+def is_valid_account_id(value: str | None) -> bool:
+    """群/人标识是否合法。
+
+    兼容两种接入协议：
+    - OneBot（NapCat）：QQ 群号 / QQ 号，纯数字；
+    - QQ 官方机器人：group_openid / member_openid，十六进制字母数字混排。
+    因此不能只判断 isdigit，否则官方机器人的 openid 会被误判为非法。
+    """
+    if not value:
+        return False
+    text = str(value).strip()
+    if not text or len(text) > 64:
+        return False
+    return all(ch.isalnum() or ch in "_-" for ch in text)
+
+
 def is_allowed_group(group_id: str | None, allowed_groups: set[str]) -> bool:
     """群是否在服务白名单。未配置白名单 = 不允许任何群。"""
     return bool(group_id) and group_id in allowed_groups

@@ -9,6 +9,7 @@ from utils import (
     extract_url,
     is_allowed_group,
     is_publish_command,
+    is_valid_account_id,
     match_publish_command,
     strip_at,
 )
@@ -75,3 +76,21 @@ def test_publish_command_rejects_question_like_text():
     """带命令词但其实是提问的，不能被当成发布。"""
     assert match_publish_command("发布什么比赛") is None
     assert match_publish_command("添加比赛信息怎么弄") is None
+
+
+def test_valid_account_id_accepts_openid():
+    """官方机器人的 openid 是十六进制混排，不能按纯数字拒绝。"""
+    assert is_valid_account_id("A0EF5D2DFBA4B3CC76E3C70C47971FDE")
+    assert is_valid_account_id("DCF4F26867BD71753336F962C626F3FD")
+
+
+def test_valid_account_id_accepts_qq_number():
+    assert is_valid_account_id("585830366")
+    assert is_valid_account_id("2097187372")
+
+
+def test_valid_account_id_rejects_bad_input():
+    assert not is_valid_account_id("")
+    assert not is_valid_account_id("   ")
+    assert not is_valid_account_id("带 空格")
+    assert not is_valid_account_id("x" * 70)

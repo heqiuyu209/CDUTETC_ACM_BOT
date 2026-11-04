@@ -25,7 +25,7 @@ import database as db
 import llm
 import roles
 from fetcher import FetchError, fetch_text
-from utils import can_manage_group, is_super_admin, parse_command
+from utils import can_manage_group, is_super_admin, is_valid_account_id, parse_command
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -677,9 +677,9 @@ def cmd_notify_groups(group_id: str, sender: str, args: str) -> list[dict]:
         return [{"group_id": group_id,
                  "text": f"比赛 #{cid} 已恢复为通知全部允许群"}]
     targets = {g.strip() for g in re.split(r"[,，\s]+", spec) if g.strip()}
-    bad = [g for g in targets if not g.isdigit()]
+    bad = [g for g in targets if not is_valid_account_id(g)]
     if bad:
-        return [{"group_id": group_id, "text": f"群号应为纯数字：{','.join(bad)}"}]
+        return [{"group_id": group_id, "text": f"群号格式不对：{','.join(bad)}"}]
     unknown = targets - config.ALLOWED_GROUPS
     if unknown:
         return [{"group_id": group_id,
