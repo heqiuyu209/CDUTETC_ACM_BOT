@@ -222,8 +222,8 @@ def _build_publish_review(pending: dict) -> str:
         lines.append(f"{label}：{value or '未提供'}")
     if (info.get("official_time") or "").strip():
         lines.append(f"提醒计划：开始前 {_format_remind_offsets()}各一次")
-    lines.append(f"来源群：{pending.get('group_id') or '未知'}")
-    lines.append(f"提交人：{pending.get('submitted_by') or '未知'}")
+    lines.append(f"来源群：{db.describe_account('group', pending.get('group_id') or '')}")
+    lines.append(f"提交人：{db.describe_account('user', pending.get('submitted_by') or '')}")
     if pending.get("duplicate_note"):
         lines.append(f"⚠ 查重提示：{pending['duplicate_note']}")
     else:

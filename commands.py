@@ -84,6 +84,9 @@ _HELP_SECTIONS = (
         (3, "/加老师 <QQ号> [备注]", "设置老师身份"),
         (3, "/删老师 <QQ号>", "取消老师身份"),
         (3, "/群列表", "查看已授权的群和老师"),
+        (3, "/命名群 <标识> <名称>", "给群起名字，提示里显示名字而不是 openid"),
+        (3, "/命名人 <标识> <名称>", "给人起名字"),
+        (3, "/命名列表", "查看已命名的群和人"),
         (3, "/通知群 <比赛id> <群号,群号>", "设置该比赛通知哪些群"),
     )),
 )
@@ -649,6 +652,51 @@ def cmd_teacher_list(group_id: str, sender: str, args: str) -> list[dict]:
     return [{"group_id": group_id, "text": roles.describe()}]
 
 
+def cmd_label_group(group_id: str, sender: str, args: str) -> list[dict]:
+    return _label_with_kind("group", group_id, sender, args)
+
+
+def cmd_label_user(group_id: str, sender: str, args: str) -> list[dict]:
+    return _label_with_kind("user", group_id, sender, args)
+
+
+def _label_with_kind(kind: str, group_id: str, sender: str, args: str) -> list[dict]:
+    if not is_super_admin(sender):
+        return [{"group_id": group_id, "text": "仅超管可设置名称"}]
+    parts = (args or "").strip().split(None, 1)
+    if len(parts) < 2:
+        cmd = "命名群" if kind == "group" else "命名人"
+        return [{"group_id": group_id,
+                 "text": f"用法：/{cmd} <标识> <名称>\n例：/{cmd} A0EF5D2D… 集训队群"}]
+    account_id, label = parts[0].strip(), parts[1].strip()
+    if not is_valid_account_id(account_id):
+        return [{"group_id": group_id, "text": "标识格式不对"}]
+    try:
+        db.set_account_label(kind, account_id, label, operator=sender)
+    except ValueError as e:
+        return [{"group_id": group_id, "text": str(e)}]
+    what = "群" if kind == "group" else "账号"
+    short = f"{account_id[:8]}…" if len(account_id) > 12 else account_id
+    return [{"group_id": group_id, "text": f"已命名{what} {short} 为「{label}」"}]
+
+
+def cmd_label_list(group_id: str, sender: str, args: str) -> list[dict]:
+    if not can_manage_group(sender):
+        return [{"group_id": group_id, "text": "仅老师/超管可查看"}]
+    items = db.list_account_labels()
+    if not items:
+        return [{"group_id": group_id,
+                 "text": "还没有命名记录。\n"
+                         "用法：/命名群 <标识> <名称>、/命名人 <标识> <名称>"}]
+    lines = ["已命名的标识："]
+    for item in items:
+        kind = "群" if item["kind"] == "group" else "人"
+        aid = item["account_id"]
+        short = f"{aid[:8]}…{aid[-4:]}" if len(aid) > 14 else aid
+        lines.append(f"[{kind}] {item['label']}  ←  {short}")
+    return [{"group_id": group_id, "text": "\n".join(lines)}]
+
+
 def cmd_notify_groups(group_id: str, sender: str, args: str) -> list[dict]:
     """设置某场比赛只通知哪些群（超管）。用于把周赛限制在集训队群。"""
     if not is_super_admin(sender):
@@ -849,6 +897,9 @@ async def handle_command(text: str, group_id: str, sender: str) -> list[dict] | 
         "加群": cmd_group_add,
         "删群": cmd_group_remove,
         "群列表": cmd_group_list,
+        "命名群": cmd_label_group,
+        "命名人": cmd_label_user,
+        "命名列表": cmd_label_list,
         "加老师": cmd_teacher_add,
         "删老师": cmd_teacher_remove,
         "老师列表": cmd_teacher_list,

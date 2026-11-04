@@ -152,6 +152,18 @@ CREATE TABLE IF NOT EXISTS competition_notify_groups (
 )
 """
 
+# 标识别名：官方机器人只给 openid（一串哈希），管理员可给它起个名字，
+# 之后所有展示（待确认发布、群列表等）都用名字，避免看不懂。
+_ACCOUNT_LABELS_DDL = """
+CREATE TABLE IF NOT EXISTS account_labels (
+    kind        TEXT NOT NULL,
+    account_id  TEXT NOT NULL,
+    label       TEXT NOT NULL DEFAULT '',
+    updated_at  TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (kind, account_id)
+)
+"""
+
 _COMPETITION_SOURCES_DDL = """
 CREATE TABLE IF NOT EXISTS competition_sources (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -357,6 +369,7 @@ _ALL_DDL = (
     _RUNTIME_WHITELIST_DDL,
     _RUNTIME_TEACHER_DDL,
     _COMPETITION_NOTIFY_GROUPS_DDL,
+    _ACCOUNT_LABELS_DDL,
     _COMPETITION_SOURCES_DDL, _COMPETITION_VERSIONS_DDL,
     _PENDING_UPDATES_DDL,
     _ORG_EVENTS_DDL,
@@ -2992,3 +3005,86 @@ def remove_runtime_teacher(user_id: str, operator: str = "") -> bool:
             add_audit(operator, "", "remove_teacher", "runtime_whitelist", uid,
                       "", "", conn=conn)
         return bool(cur.rowcount)
+
+
+# =====================================================================
+# 标识别名（account_labels）：把 openid 映射成可读名字
+# =====================================================================
+
+_LABEL_KINDS = ("group", "user")
+
+
+def set_account_label(kind: str, account_id: str, label: str,
+                      operator: str = "") -> bool:
+    """给群/人设置可读别名。kind 取 group 或 user。"""
+    kind = _as_str(kind).lower()
+    account_id = _as_str(account_id)
+    label = _as_str(label)
+    if kind not in _LABEL_KINDS:
+        raise ValueError("别名类型只能是 group 或 user")
+    if not account_id:
+        raise ValueError("标识不能为空")
+    if not label:
+        raise ValueError("名称不能为空")
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO account_labels (kind, account_id, label, updated_at)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(kind, account_id) DO UPDATE SET"
+            " label = excluded.label, updated_at = excluded.updated_at",
+            (kind, account_id, label, now_str()),
+        )
+        add_audit(operator, account_id if kind == "group" else "", "set_label",
+                  kind, account_id, "", label, conn=conn)
+    return True
+
+
+def get_account_label(kind: str, account_id: str) -> str:
+    """取别名；没有则返回空串。"""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT label FROM account_labels WHERE kind = ? AND account_id = ?",
+            (_as_str(kind).lower(), _as_str(account_id)),
+        ).fetchone()
+    return row[0] if row else ""
+
+
+def remove_account_label(kind: str, account_id: str, operator: str = "") -> bool:
+    with _connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM account_labels WHERE kind = ? AND account_id = ?",
+            (_as_str(kind).lower(), _as_str(account_id)),
+        )
+        if cur.rowcount:
+            add_audit(operator, "", "remove_label", kind, account_id, "", "",
+                      conn=conn)
+        return bool(cur.rowcount)
+
+
+def list_account_labels(kind: str | None = None) -> list[dict]:
+    with _connect() as conn:
+        if kind:
+            rows = conn.execute(
+                "SELECT kind, account_id, label, updated_at FROM account_labels"
+                " WHERE kind = ? ORDER BY updated_at DESC", (_as_str(kind).lower(),),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT kind, account_id, label, updated_at FROM account_labels"
+                " ORDER BY kind, updated_at DESC"
+            ).fetchall()
+    return [
+        {"kind": r[0], "account_id": r[1], "label": r[2], "updated_at": r[3]}
+        for r in rows
+    ]
+
+
+def describe_account(kind: str, account_id: str) -> str:
+    """把标识渲染成「名字（前8位…后4位）」；没有别名时只显示缩写。"""
+    account_id = _as_str(account_id)
+    label = get_account_label(kind, account_id)
+    if len(account_id) > 14:
+        short = f"{account_id[:8]}…{account_id[-4:]}"
+    else:
+        short = account_id
+    return f"{label}（{short}）" if label else short
