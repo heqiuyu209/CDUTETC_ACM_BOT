@@ -511,7 +511,12 @@ class ACMBot:
             # 所有 @ 都不被识别、普通提问被静默丢弃。
             self_id = str(message.raw.get("self_id") or "")
             bot_qq = self_id or config.BOT_QQ
-            addressed = bool(bot_qq) and bot_qq in targets
+            # 官方机器人的群消息本身就只在 @机器人 时推送，接入层会置
+            # always_addressed；OneBot 则要靠 CQ 码解析，两条路径都支持。
+            addressed = (
+                getattr(message, "always_addressed", False)
+                or (bool(bot_qq) and bot_qq in targets)
+            )
             # 带 @ 的消息只有指向本机器人时才受理，包括发给他人的命令。
             if targets and not addressed:
                 logger.info(
@@ -799,7 +804,10 @@ class ACMBot:
         raw = message.content or ""
         targets = mentioned_user_ids(raw)
         bot_qq = config.BOT_QQ or str(message.raw.get("self_id") or "")
-        addressed = bool(bot_qq) and bot_qq in targets
+        addressed = (
+            getattr(message, "always_addressed", False)
+            or (bool(bot_qq) and bot_qq in targets)
+        )
         text = strip_at(raw)
         if not (addressed or text.startswith("/")):
             return
@@ -890,24 +898,40 @@ class ACMBot:
         await crawler.run_fetch(send_group=self._send_group)
 
 
+def _build_client():
+    """按 ACM_BOT_PROTOCOL 创建接入客户端；两种协议接口完全一致。"""
+    if config.BOT_PROTOCOL == "qqbot":
+        from qqbot_client import QQBotClient
+
+        return QQBotClient(
+            appid=config.QQBOT_APPID,
+            secret=config.QQBOT_SECRET,
+            idle_timeout=config.WS_IDLE_TIMEOUT_SECONDS,
+        )
+    return OneBotClient(
+        ws_url=config.ONEBOT_WS_URL,
+        token=config.ONEBOT_TOKEN,
+        idle_timeout=config.WS_IDLE_TIMEOUT_SECONDS,
+    )
+
+
 def run_bot() -> None:
-    """启动入口：配置检查 → 创建 OneBot 客户端 → 常驻连接。"""
+    """启动入口：配置检查 → 按协议创建客户端 → 常驻连接。"""
     if config.ENV_CREATED:
+        need = ("ACM_QQBOT_APPID、ACM_QQBOT_SECRET"
+                if config.BOT_PROTOCOL == "qqbot" else "ACM_ONEBOT_WS_URL")
         logger.warning(
             "未找到 .env，已按 .env.example 生成：%s\n"
-            "请填写 ACM_ONEBOT_WS_URL、ACM_LLM_API_KEY、ACM_ALLOWED_GROUPS、"
+            "请填写 %s、ACM_LLM_API_KEY、ACM_ALLOWED_GROUPS、"
             "ACM_SUPER_ADMIN、ACM_TEACHER_WHITELIST 后重新启动。",
-            config.ENV_FILE,
+            config.ENV_FILE, need,
         )
     config.check_config()
     empty = config.describe_empty_config()
     if empty:
         logger.warning("以下配置留空，对应功能不会生效: %s", ", ".join(empty))
-    client = OneBotClient(
-        ws_url=config.ONEBOT_WS_URL,
-        token=config.ONEBOT_TOKEN,
-        idle_timeout=config.WS_IDLE_TIMEOUT_SECONDS,
-    )
+    logger.info("接入协议：%s", config.BOT_PROTOCOL)
+    client = _build_client()
     ACMBot(client)
     try:
         asyncio.run(client.start())

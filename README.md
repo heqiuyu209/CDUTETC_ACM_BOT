@@ -8,7 +8,9 @@
 
 成都理工大学工程技术学院 ACM 集训队 QQ 群机器人：老师发布比赛链接 → 自动抓取、提取、存档；公共比赛资料统一管理，群订阅隔离；活动登记（报名/设备借用/出勤）自动统计；定时提醒与可选公共来源抓取（主动通知默认关闭）。
 
-技术栈：Python 3.10+ / OneBot（NapCat 正向 WebSocket）/ SQLite / OpenAI 兼容大模型 API / APScheduler。
+技术栈：Python 3.10+ / 双接入协议（OneBot-NapCat 或个人 QQ ｜ QQ 开放平台官方机器人） / SQLite / OpenAI 兼容大模型 API / APScheduler。
+
+> 接入协议由 `ACM_BOT_PROTOCOL` 切换：`onebot`（默认，功能完整，需偶尔扫码）或 `qqbot`（官方机器人，稳定不扫码，主动消息受平台配额限制）。业务逻辑完全一致。
 
 ## 功能总览（四阶段）
 
@@ -84,6 +86,9 @@ python scripts/export_collection.py --group-id '群openid' --collection-id 1 --o
 
 | 变量 | 必填 | 默认 | 说明 |
 |------|------|------|------|
+| `ACM_BOT_PROTOCOL` | 否 | `onebot` | 接入协议：`onebot`（NapCat）或 `qqbot`（QQ 开放平台官方机器人） |
+| `ACM_QQBOT_APPID` | qqbot 必填 | - | 官方机器人 AppID |
+| `ACM_QQBOT_SECRET` | qqbot 必填 | - | 官方机器人 AppSecret |
 | `ACM_ONEBOT_WS_URL` | **是** | - | OneBot/NapCat 正向 WebSocket 地址，如 `ws://127.0.0.1:3001` |
 | `ACM_LLM_API_KEY` | **是** | - | 大模型 API Key（OpenAI 兼容） |
 | `ACM_ONEBOT_TOKEN` | 否 | 空 | OneBot 鉴权 token，与 NapCat 配置一致 |

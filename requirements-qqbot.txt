@@ -1,0 +1,4 @@
+# 官方机器人（QQ 开放平台）额外依赖
+# 只在 ACM_BOT_PROTOCOL=qqbot 时需要；纯 OneBot/NapCat 部署无需安装。
+-r requirements.txt
+qq-botpy>=1.2.1,<2.0.0
