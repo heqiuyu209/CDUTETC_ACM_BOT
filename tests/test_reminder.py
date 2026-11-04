@@ -80,7 +80,7 @@ def _soon_deadline(hours: int = 10) -> str:
 
 
 async def test_check_reminders_marks_only_on_success(monkeypatch):
-    contests = [_contest(1, "g1", deadline=_soon_deadline(10))]
+    contests = [_contest(1, "g1", deadline=_soon_deadline(10), ctime="")]
     monkeypatch.setattr(reminder, "list_contests", lambda: contests)
     monkeypatch.setattr(reminder, "has_reminded", lambda *k: False)
     marked = []
@@ -95,7 +95,7 @@ async def test_check_reminders_marks_only_on_success(monkeypatch):
 
 
 async def test_check_reminders_success_path(monkeypatch):
-    contests = [_contest(1, "g1", deadline=_soon_deadline(10))]
+    contests = [_contest(1, "g1", deadline=_soon_deadline(10), ctime="")]
     monkeypatch.setattr(reminder, "list_contests", lambda: contests)
     monkeypatch.setattr(reminder, "has_reminded", lambda *k: False)
     marked = []
@@ -110,7 +110,7 @@ async def test_check_reminders_success_path(monkeypatch):
 
 
 async def test_check_reminders_skips_old_groupless(monkeypatch):
-    contests = [_contest(1, "", deadline=_soon_deadline(10))]
+    contests = [_contest(1, "", deadline=_soon_deadline(10), ctime="")]
     monkeypatch.setattr(reminder, "list_contests", lambda: contests)
 
     async def ok_send(group_id, text):
@@ -121,7 +121,7 @@ async def test_check_reminders_skips_old_groupless(monkeypatch):
 
 
 async def test_check_reminders_skips_reminded(monkeypatch):
-    contests = [_contest(1, "g1", deadline=_soon_deadline(10))]
+    contests = [_contest(1, "g1", deadline=_soon_deadline(10), ctime="")]
     monkeypatch.setattr(reminder, "list_contests", lambda: contests)
     monkeypatch.setattr(reminder, "has_reminded", lambda *k: True)
     marked = []

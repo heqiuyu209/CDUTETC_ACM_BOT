@@ -220,7 +220,16 @@ class OneBotClient:
             group_id=int(group_id) if group_id.isdigit() else group_id,
             message=text,
         )
-        if resp is None or resp.get("status") != "ok" or resp.get("retcode") not in (0, None):
+        data = resp.get("data") if isinstance(resp, dict) else None
+        message_id = data.get("message_id") if isinstance(data, dict) else None
+        valid_message_id = (
+            isinstance(message_id, int) and not isinstance(message_id, bool) and message_id > 0
+        ) or (
+            isinstance(message_id, str) and bool(message_id.strip()) and message_id.strip() != "0"
+        )
+        if (not isinstance(resp, dict) or resp.get("status") != "ok"
+                or type(resp.get("retcode")) is not int or resp.get("retcode") != 0
+                or not valid_message_id):
             logger.warning("群消息发送失败: %s", resp)
             return False
         return True

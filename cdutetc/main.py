@@ -88,18 +88,6 @@ def _notification_summary(sent: int, total: int) -> str:
     )
 
 
-def _build_confirm(info: dict) -> str:
-    """旧版确认话术，保留兼容；新流程统一用 _build_publish_receipt。"""
-    return (
-        "比赛信息已记录~\n"
-        f"比赛：{info.get('name') or '未知'}\n"
-        f"报名截止：{info.get('reg_deadline') or '待定'}\n"
-        f"比赛时间：{info.get('contest_time') or '待定'}\n"
-        f"形式/地点：{info.get('mode') or '待定'} {info.get('location') or ''}\n"
-        "有问题随时 @ 我！"
-    )
-
-
 def _build_publish_notice(info: dict, cid: int) -> str:
     """构造发往各群的新比赛公告（字段全部取自已确认的录入内容）。"""
     lines = [f"【新比赛发布】#{cid} {info.get('name') or '未知'}"]
@@ -795,7 +783,7 @@ class ACMBot:
         await self._safe_reply(
             message,
             _build_publish_receipt(competition_info, status="已入库", ref=cid)
-            + f"\n通知：已发送到 {sent}/{len(targets)} 个群",
+            + "\n" + _notification_summary(sent, len(targets)),
         )
 
     async def _safe_reply(self, message: OneBotMessage, content: str) -> bool:
@@ -847,10 +835,6 @@ class ACMBot:
             logger.info("主动群消息未启用，跳过群 %s 的通知", group_id)
             return False
         return await self.client.send_group_msg(group_id, text)
-
-    async def _send_group_log_only(self, group_id: str, text: str) -> bool:
-        """兼容旧回调名；发送行为由主动消息开关控制。"""
-        return await self._send_group(group_id, text)
 
     async def _remind_job(self):
         """周期检查提醒：比赛临近 + 征集登记截止 + 训练开始。"""

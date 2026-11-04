@@ -75,7 +75,7 @@ async def test_next_week_has_new_identity_but_same_week_and_restart_are_deduplic
     restart = subprocess.run([
         sys.executable, "-c",
         "import asyncio,json,sys; from datetime import datetime; from zoneinfo import ZoneInfo; "
-        "import database,config,reminder; database.DB_PATH=sys.argv[1]; "
+        "from cdutetc import database,config,reminder; database.DB_PATH=sys.argv[1]; "
         "config.ALLOWED_GROUPS={'123456'}; database.init_db(); "
         "sender=__import__('unittest.mock',fromlist=['AsyncMock']).AsyncMock(return_value=True); "
         "sent=asyncio.run(reminder.check_general_reminders(sender,now=datetime(2026,11,8,18,59,tzinfo=ZoneInfo('Asia/Shanghai')))); "

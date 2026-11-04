@@ -31,6 +31,9 @@ def bot(memory_db, monkeypatch, onebot_client):
     # 以保持原有“普通成员可连续提问”的覆盖（两层的专门行为由 test_answer_gates 覆盖）
     monkeypatch.setattr(config, "QA_WHITELIST_ENABLED", False)
     monkeypatch.setattr(config, "QA_RATE_LIMIT_ENABLED", False)
+    monkeypatch.setattr(config, "QA_MEMBER_KB_ONLY", True)
+    monkeypatch.setattr(config, "GROUP_REQUIRE_AT", True)
+    monkeypatch.setattr(config, "NL_INTENT_ENABLED", False)
     client = main.ACMBot(onebot_client)
     replies = []
 
@@ -42,7 +45,7 @@ def bot(memory_db, monkeypatch, onebot_client):
     return client, replies
 
 
-def _message(content, group_id="g1", member_id="student"):
+def _message(content, group_id="g1", member_id="teacher"):
     return OneBotMessage({"post_type": "message", "message_type": "group",
                          "raw_message": f"[CQ:at,qq=30001] {content}",
                          "group_id": group_id, "user_id": member_id,
@@ -66,7 +69,7 @@ def _prompt_contests(chat_call):
     return json.JSONDecoder().raw_decode(archive)[0]
 
 
-async def test_published_competition_reaches_qa_model_in_allowed_groups(bot, monkeypatch):
+async def test_teacher_published_competition_reaches_qa_model_in_allowed_groups(bot, monkeypatch):
     client, replies = bot
     fetch = AsyncMock(return_value="校赛官网正文")
     chat = AsyncMock(side_effect=[
@@ -76,7 +79,7 @@ async def test_published_competition_reaches_qa_model_in_allowed_groups(bot, mon
             "contest_time": "2026-11-20 09:00",
         }, ensure_ascii=False),
         "报名截止是 2026-11-10 23:59。",
-        "比赛时间是 2026-11-20 09:00。",
+        "没有可用的本群比赛信息。",
     ])
     monkeypatch.setattr(main, "fetch_text", fetch)
     monkeypatch.setattr(llm, "_chat_once", chat)
@@ -103,9 +106,9 @@ async def test_published_competition_reaches_qa_model_in_allowed_groups(bot, mon
         "source_link": "https://example.com/contest",
     }]
     assert _prompt_contests(chat.await_args_list[1]) == expected
-    assert _prompt_contests(chat.await_args_list[2]) == expected
+    assert _prompt_contests(chat.await_args_list[2]) == []
     assert ("g1", "报名截止是 2026-11-10 23:59。") in replies
-    assert ("g2", "比赛时间是 2026-11-20 09:00。") in replies
+    assert ("g2", "没有可用的本群比赛信息。") in replies
 
 
 async def test_long_published_source_keeps_core_fields_and_next_competition(bot, monkeypatch):
@@ -242,6 +245,19 @@ def test_question_context_orders_updates_and_limits_stably(memory_db, monkeypatc
 def test_question_context_empty_group_or_nonpositive_limit_returns_empty(memory_db, group_id, limit):
     database.create_competition(_public(), status="confirmed")
     assert database.list_question_contests(group_id, limit=limit) == []
+
+
+async def test_member_question_prefers_local_kb_without_model(bot, monkeypatch):
+    client, replies = bot
+    database.create_competition(_public(), status="confirmed")
+    database.add_faq("g1", "本群校赛报名", "本群知识库答案")
+    chat = AsyncMock(return_value="模型不应调用")
+    monkeypatch.setattr(llm, "_chat_once", chat)
+
+    await client.on_group_at_message_create(_message("本群校赛报名在哪里？", member_id="student"))
+
+    chat.assert_not_awaited()
+    assert replies == [("g1", "Q：本群校赛报名\nA：本群知识库答案")]
 
 
 async def test_faq_match_still_skips_qa_model(bot, monkeypatch):

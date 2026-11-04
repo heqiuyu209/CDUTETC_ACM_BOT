@@ -1,4 +1,4 @@
-"""离线测试公共配置：确保项目根目录可 import（config/database 等为顶层模块）。"""
+"""离线测试公共配置：确保项目根目录中的 cdutetc 包可 import。"""
 
 import os
 import sys

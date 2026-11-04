@@ -50,6 +50,12 @@ botpy.log
 .vscode/
 *.iml
 
+# 临时验证目录
+.backup-pre-refactor/
+.review-stub/
+.review-tmp/
+.old-verify/
+
 # 系统文件
 .DS_Store
 Thumbs.db

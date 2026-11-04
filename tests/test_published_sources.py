@@ -53,6 +53,8 @@ async def bot(monkeypatch, db_file, onebot_client):
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
     monkeypatch.setattr(config, "PUBLISH_CMD", "发布")
+    monkeypatch.setattr(config, "NL_INTENT_ENABLED", False)
+    monkeypatch.setattr(config, "GROUP_REQUIRE_AT", True)
     monkeypatch.setattr(crawler, "AUTO_FETCH_ENABLED", False)
     state = SimpleNamespace(
         client=main.ACMBot(onebot_client), replies=[], sent=[], fetched=[], extracted=[]
@@ -83,7 +85,7 @@ async def bot(monkeypatch, db_file, onebot_client):
 
 def _message(group="g1", member="teacher"):
     return OneBotMessage({"post_type": "message", "message_type": "group",
-                         "raw_message": f"发布 {URL} 补充：校内截止提前一天",
+                         "raw_message": f"[CQ:at,qq=30001] 发布 {URL} 补充：校内截止提前一天",
                          "group_id": group, "user_id": member, "message_id": 12345,
                          "self_id": 30001})
 
@@ -121,8 +123,8 @@ async def test_publish_registers_page_baseline_even_when_monitoring_disabled(bot
     assert source["last_status"] == "confirmed"
     assert source["last_error"] == ""
     assert len(database.list_competition_versions(competition["id"])) == 1
-    assert any("已免审发布" in reply for reply in bot.replies)
-    assert {group for group, _ in bot.sent} == {"g1", "g2"}
+    assert any("已保存" in reply for reply in bot.replies)
+    assert {group for group, _ in bot.sent} == {"g1"}
     assert (await crawler.run_fetch(now=_now()))[0]["kind"] == "disabled"
 
 
@@ -139,21 +141,35 @@ async def test_failed_publish_leaves_no_source_or_competition(bot, db_file, monk
         raise FetchError("模拟抓取失败")
 
     async def fail_extract(text):
+        bot.extracted.append(text)
         return None, "模拟提取失败"
 
     async def invalid_info(text):
-        return {**INFO, "contest_time": "日期非法"}, None
+        bot.extracted.append(text)
+        return {**INFO, "name": ""}, None
 
     if failure == "fetch":
         monkeypatch.setattr(main, "fetch_text", fail_fetch)
     else:
+        async def fetch_page(url):
+            bot.fetched.append(url)
+            return PAGE
+
         monkeypatch.setattr(main, "extract_contest", fail_extract if failure == "extract" else invalid_info)
+        monkeypatch.setattr(main, "fetch_text", fetch_page)
     await bot.client.on_group_at_message_create(_message())
-    _assert_no_records(db_file[0])
-    assert bot.sent == []
-    assert not any("已免审发布" in reply or "比赛信息已记录" in reply for reply in bot.replies)
     if failure == "fetch":
-        assert bot.extracted == []
+        assert len(database.list_competitions(status="confirmed")) == 1
+        assert len(database.list_sources()) == 1
+        assert database.list_sources()[0]["url"] == URL
+        assert bot.extracted
+        assert any("链接打不开" in reply for reply in bot.replies)
+        return
+    _assert_no_records(db_file[0])
+    assert bot.fetched == [URL]
+    assert bot.extracted
+    assert not any("已保存" in reply or "比赛信息已记录" in reply for reply in bot.replies)
+    assert any("比赛名称" in reply or "提取" in reply for reply in bot.replies)
 
 
 @pytest.mark.parametrize("operation", ["INSERT", "UPDATE"])
@@ -167,7 +183,7 @@ async def test_source_write_failure_rolls_back_publication(bot, db_file, operati
     _assert_no_records(db_file[0])
     assert bot.sent == []
     assert bot.replies
-    assert not any("已免审发布" in reply or "比赛信息已记录" in reply for reply in bot.replies)
+    assert not any("已保存" in reply or "比赛信息已记录" in reply for reply in bot.replies)
 
 
 @pytest.mark.parametrize(
@@ -175,7 +191,6 @@ async def test_source_write_failure_rolls_back_publication(bot, db_file, operati
     [
         ({"name": ""}, URL, PAGE),
         ({"name": "校赛", "official_time": "日期非法"}, URL, PAGE),
-        ({"name": "校赛"}, "", PAGE),
         ({"name": "校赛"}, None, PAGE),
         ({"name": "校赛"}, URL, 123),
     ],

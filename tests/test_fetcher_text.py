@@ -36,6 +36,7 @@ def page(monkeypatch):
 async def test_tail_change_creates_pending_update_and_hashes_complete_text(page, monkeypatch, tmp_path):
     monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "source.db"))
     monkeypatch.setattr(crawler, "AUTO_FETCH_ENABLED", True)
+    monkeypatch.setattr(database, "now_str", lambda: "2026-11-01 08:00:00")
     monkeypatch.setattr(fetcher.config, "FETCH_TEXT_LIMIT", 3000)
     database.init_db()
     prefix = "<p>比赛公告</p><p>" + "A" * 3500 + "</p><p>报名截止："
@@ -72,8 +73,9 @@ async def test_model_input_limit_is_independent_of_fetch_output(page, monkeypatc
     monkeypatch.setattr(llm.config, "LLM_MAX_INPUT_CHARS", 120)
     calls = []
 
-    async def chat(system, user):
+    async def chat(system, user, json_mode=False):
         calls.append(user)
+        assert json_mode is True
         return '{"name":"离线校赛"}'
 
     monkeypatch.setattr(llm, "_chat_once", chat)
@@ -278,7 +280,7 @@ async def test_dns_connect_read_and_writer_cleanup_share_one_timeout(monkeypatch
     writer = Writer()
 
     async def resolve(host):
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.01)
         return ["8.8.8.8"]
 
     class SlowReader(Reader):
@@ -287,7 +289,7 @@ async def test_dns_connect_read_and_writer_cleanup_share_one_timeout(monkeypatch
             await asyncio.Event().wait()
 
     async def connect(host, ip, port, scheme):
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.01)
         return SlowReader(b""), writer
 
     async def wait_closed():

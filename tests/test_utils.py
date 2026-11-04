@@ -3,12 +3,12 @@
 对应修复点：权限默认全拒绝 + 白名单放行；身份只认事件字段。
 """
 
+from cdutetc import config
 from cdutetc.utils import (
-    can_publish,
     contains_link,
     extract_url,
     is_allowed_group,
-    is_publish_command,
+    is_teacher,
     is_valid_account_id,
     match_publish_command,
     strip_at,
@@ -34,11 +34,11 @@ def test_contains_link():
     assert contains_link("普通提问") is False
 
 
-def test_is_publish_command():
-    assert is_publish_command("发布 https://a.com") is True
-    assert is_publish_command("发布 比赛信息文本") is True
-    assert is_publish_command("发个链接") is False
-    assert is_publish_command("这个比赛怎么报名", cmd="发布") is False
+def test_match_publish_command():
+    assert match_publish_command("发布 https://a.com") == "https://a.com"
+    assert match_publish_command("发布 比赛信息文本") == "比赛信息文本"
+    assert match_publish_command("发个链接") is None
+    assert match_publish_command("这个比赛怎么报名", cmd="发布") is None
 
 
 def test_is_allowed_group_default_deny():
@@ -53,16 +53,17 @@ def test_is_allowed_group_whitelist_pass():
     assert is_allowed_group("g1", {"g1", "g2"}) is True
 
 
-def test_can_publish_default_deny():
-    # 未配置白名单 = 不允许任何人发布
-    assert can_publish("m1", set()) is False
-    assert can_publish(None, {"m1"}) is False
-    assert can_publish("", {"m1"}) is False
+def test_is_teacher_default_deny(monkeypatch):
+    monkeypatch.setattr(config, "TEACHER_WHITELIST", set())
+    assert is_teacher("m1") is False
+    assert is_teacher(None) is False
+    assert is_teacher("") is False
 
 
-def test_can_publish_whitelist_pass():
-    assert can_publish("m1", {"m1"}) is True
-    assert can_publish("m2", {"m1"}) is False
+def test_is_teacher_whitelist_pass(monkeypatch):
+    monkeypatch.setattr(config, "TEACHER_WHITELIST", {"m1"})
+    assert is_teacher("m1") is True
+    assert is_teacher("m2") is False
 
 
 def test_publish_command_accepts_chinese_punctuation():

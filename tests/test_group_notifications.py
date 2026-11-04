@@ -37,6 +37,9 @@ async def bot(memory_db, monkeypatch, onebot_client):
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
     monkeypatch.setattr(config, "SUPER_ADMIN", {"admin"})
     monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "GROUP_REQUIRE_AT", False)
+    monkeypatch.setattr(config, "PUBLISH_CONFIRM_ENABLED", False)
+    monkeypatch.setattr(config, "NL_INTENT_ENABLED", False)
     client = main.ACMBot(onebot_client)
     monkeypatch.setattr(client, "_safe_reply", AsyncMock(wraps=client._safe_reply))
     return client, onebot_client
@@ -66,7 +69,7 @@ def _source_text(client, api):
 
 
 def _assert_sent_ratio(text, sent, total):
-    assert re.search(rf"{sent}/{total}\s*个目标群", text), text
+    assert re.search(rf"{sent}/{total}\s*个(?:目标)?群", text), text
 
 
 def test_active_message_environment_defaults_enabled_and_only_accepts_one(monkeypatch):
@@ -107,9 +110,12 @@ async def test_active_send_requires_confirmed_response_and_correct_target(bot, r
 
 
 @pytest.mark.parametrize("response", [
-    None, {}, {"status": "ok", "retcode": 0, "data": {}},
+    None, {}, [], "bad",
+    {"status": "ok", "retcode": 0, "data": {}},
     {"status": "ok", "retcode": 0, "data": {"message_id": 0}},
     {"status": "failed", "retcode": 400, "data": {"message_id": 12345}},
+    {"status": "ok", "retcode": False, "data": {"message_id": 12345}},
+    {"status": "ok", "retcode": 0.0, "data": {"message_id": 12345}},
     {"status": "ok", "data": {"message_id": 12345}},
     {"status": "ok", "retcode": 0, "data": {"message_id": True}},
     {"status": "ok", "retcode": 0, "data": {"message_id": "0"}},
@@ -242,6 +248,7 @@ async def test_amend_without_any_active_receipt_reports_unconfirmed_delivery(bot
 
 async def test_publish_notifies_all_allowed_groups_and_reports_real_results(bot, monkeypatch):
     client, api = bot
+    monkeypatch.setattr(config, "PUBLISH_SCOPE_TO_SOURCE", False)
     monkeypatch.setattr(main, "fetch_text", AsyncMock(return_value="比赛官网正文"))
     monkeypatch.setattr(main, "extract_contest", AsyncMock(return_value=({
         "name": "新校赛", "reg_deadline": "2026-11-10 23:59",
@@ -262,13 +269,13 @@ async def test_publish_notifies_all_allowed_groups_and_reports_real_results(bot,
     assert [call["group_id"] for call in _active_calls(client, api)] == ["g1", "g2", "g3"]
     assert all("event_id" not in call for call in _active_calls(client, api))
     calls = [call.kwargs for call in api.call_api.await_args_list]
-    assert calls[0]["group_id"] == "g1" and "已记录" in calls[0]["message"]
-    assert all(call["message"].startswith("【新比赛发布】") for call in calls[1:-1])
+    assert [call["group_id"] for call in calls[:-1]] == ["g1", "g2", "g3"]
+    assert all(call["message"].startswith("【新比赛发布】") for call in calls[:-1])
     assert all("msg_id" not in call for call in calls)
-    assert calls[-1]["group_id"] == "g1" and "群通知" in calls[-1]["message"]
-    assert len(_reply_calls(client, api)) == 2
+    assert calls[-1]["group_id"] == "g1" and "已入库" in calls[-1]["message"]
+    assert len(_reply_calls(client, api)) == 1
     text = _source_text(client, api)
-    assert "已记录" in text
+    assert "已入库" in text
     _assert_sent_ratio(text, 2, 3)
     assert re.search(r"其余\s*1\s*个群未确认发送", text)
 

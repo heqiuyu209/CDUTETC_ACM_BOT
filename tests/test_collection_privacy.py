@@ -57,7 +57,7 @@ async def bot(file_db, monkeypatch, onebot_client):
 def _message(cid, member, group="g1"):
     return OneBotMessage({
         "post_type": "message", "message_type": "group", "message_id": 12345,
-        "raw_message": f"/征集汇总 {cid}", "group_id": group, "user_id": member, "self_id": 30001,
+        "raw_message": f"[CQ:at,qq=30001] /征集汇总 {cid}", "group_id": group, "user_id": member, "self_id": 30001,
     })
 
 

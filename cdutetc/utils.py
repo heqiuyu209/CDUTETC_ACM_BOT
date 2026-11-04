@@ -35,21 +35,13 @@ def contains_link(content: str) -> bool:
     return bool(_LINK_PATTERN.search(content))
 
 
-def is_publish_command(text: str, cmd: str = "发布") -> bool:
-    """完整命令词后须为空、空白或 HTTP 链接，避免误认普通提问。"""
-    if not cmd or not text.startswith(cmd):
-        return False
-    rest = text[len(cmd):]
-    return not rest or rest[0].isspace() or rest.startswith(("http://", "https://"))
-
-
 # 发布命令的可用写法（老师习惯用斜杠，也习惯叫“添加比赛”）。
 # 顺序按长度从大到小，避免短前缀先命中长命令。
 _PUBLISH_PREFIXES = ("/添加比赛", "添加比赛", "/发布", "发布")
 
 # 命令词后面允许出现的分隔符：空白与各种标点。
 # 中文输入法下「/添加比赛，15分钟…」很常见，不能因为它没空格就拒绝。
-_CMD_SEPARATORS = " \t\u3000,，.。:：、;；!！?？~～"
+_CMD_SEPARATORS = " \t\r\n\u3000,，.。:：、;；!！?？~～"
 
 
 def match_publish_command(text: str, cmd: str = "发布") -> str | None:
@@ -97,14 +89,6 @@ def is_allowed_group(group_id: str | None, allowed_groups: set[str]) -> bool:
     return bool(group_id) and group_id in allowed_groups
 
 
-def can_publish(member_id: str | None, whitelist: set[str]) -> bool:
-    """成员是否有发布权限。未配置白名单 = 不允许任何人发布。
-
-    身份一律来自 SDK 事件对象（member_openid），禁止相信消息正文中的身份声明。
-    """
-    return bool(member_id) and member_id in whitelist
-
-
 def parse_command(text: str) -> tuple[str | None, str]:
     """解析命令文本为 (命令名, 剩余参数)。
 
@@ -126,11 +110,6 @@ def parse_command(text: str) -> tuple[str | None, str]:
     if cmd.lower() in ("help", "帮助"):
         return "帮助", args
     return cmd, args
-
-
-def is_admin(member_id: str | None) -> bool:
-    """兼容别名：管理员即超级管理员。默认全拒绝。"""
-    return is_super_admin(member_id)
 
 
 def is_super_admin(member_id: str | None) -> bool:

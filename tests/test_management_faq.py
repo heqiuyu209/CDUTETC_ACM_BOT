@@ -38,8 +38,8 @@ def db(tmp_path, monkeypatch):
 
 def message(api, text, member, group="g1"):
     return OneBotMessage({
-        "message_id": 1, "group_id": group, "raw_message": text,
-        "message_type": "group", "user_id": member,
+        "message_id": 1, "group_id": group, "raw_message": f"[CQ:at,qq=30001] {text}",
+        "message_type": "group", "user_id": member, "self_id": "30001",
     })
 
 
@@ -110,11 +110,24 @@ async def test_admin_destructive_operations_still_filter_group(db):
 def test_faq_closes_only_same_group_whitespace_normalized_exact_questions(db):
     matching = database.add_unanswered_question("g1", "  怎么\t安装  VSCode？ \n", "student")
     assert database.add_unanswered_question("g1", "怎么 安装 VSCode？", "another") == matching
-    unrelated = database.add_unanswered_question("g1", "怎么 安装 VSCode？还要配置什么", "student")
-    case_different = database.add_unanswered_question("g1", "怎么 安装 vscode？", "student")
-    punctuation_different = database.add_unanswered_question("g1", "怎么 安装 VSCode?", "student")
-    other_group = database.add_unanswered_question("g2", "怎么 安装 VSCode？", "student")
-    # 旧数据未规范空白；收尾仍须识别完全同题，而不修改历史题面。
+    with database._connect() as conn:
+        unrelated = conn.execute(
+            "INSERT INTO unanswered_questions (group_id, question, asker, asked_at) VALUES ('g1', ?, 'student', '')",
+            ("怎么 安装 VSCode？还要配置什么",),
+        ).lastrowid
+        case_different = conn.execute(
+            "INSERT INTO unanswered_questions (group_id, question, asker, asked_at) VALUES ('g1', ?, 'student', '')",
+            ("怎么 安装 vscode？",),
+        ).lastrowid
+        punctuation_different = conn.execute(
+            "INSERT INTO unanswered_questions (group_id, question, asker, asked_at) VALUES ('g1', ?, 'student', '')",
+            ("怎么 安装 VSCode?",),
+        ).lastrowid
+        other_group = conn.execute(
+            "INSERT INTO unanswered_questions (group_id, question, asker, asked_at) VALUES ('g2', ?, 'student', '')",
+            ("怎么 安装 VSCode？",),
+        ).lastrowid
+    # 直接插入模拟语义去重上线前已存在的历史行，专测 FAQ 仅关闭规范化后精确同题。
     with database._connect() as conn:
         legacy = conn.execute(
             "INSERT INTO unanswered_questions (group_id, question, asker, asked_at) VALUES ('g1', ?, 'legacy', '')",
@@ -128,9 +141,20 @@ def test_faq_closes_only_same_group_whitespace_normalized_exact_questions(db):
     assert all(q["faq_id"] == faq_id for q in database.list_unanswered("g1", "answered"))
 
 
+def test_unanswered_question_ingestion_merges_semantically_similar_questions(db):
+    first = database.add_unanswered_question("g1", "怎么报名？")
+    assert database.add_unanswered_question("g1", "怎么报名？要组队吗") == first
+    assert [q["id"] for q in database.list_unanswered("g1")] == [first]
+
+
 def test_repeated_faq_addition_does_not_relink_answered_or_close_similar_question(db):
     qid = database.add_unanswered_question("g1", "怎么报名？")
-    similar = database.add_unanswered_question("g1", "怎么报名？要组队吗")
+    # 模拟语义合并上线前的独立历史题，专门验证重复 FAQ 不扩大关闭范围。
+    with database._connect() as conn:
+        similar = conn.execute(
+            "INSERT INTO unanswered_questions (group_id, question, asker, asked_at) VALUES ('g1', ?, 'student', '')",
+            ("怎么报名？要组队吗",),
+        ).lastrowid
     first = database.add_faq("g1", "怎么报名？", "联系老师")
     second = database.add_faq("g1", "怎么报名？", "找老师报名")
     assert second != first  # 保留现有添加 FAQ 的语义。

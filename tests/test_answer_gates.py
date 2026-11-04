@@ -4,7 +4,6 @@
 _safe_reply 收集；限流器可单独注入以控制窗口参数。
 """
 
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import sqlite3
@@ -17,6 +16,7 @@ from cdutetc import content_filter
 from cdutetc import database
 from cdutetc import llm
 from cdutetc import main
+from cdutetc.clients.onebot import OneBotMessage
 
 
 @pytest.fixture
@@ -30,13 +30,11 @@ def memory_db(monkeypatch):
 
 
 def _message(content, group_id="g1", member_id="m1"):
-    return SimpleNamespace(
-        content=content,
-        group_openid=group_id,
-        group_id=group_id,
-        user_id=member_id,
-        author=SimpleNamespace(member_openid=member_id),
-    )
+    return OneBotMessage({
+        "post_type": "message", "message_type": "group", "message_id": 1,
+        "raw_message": f"[CQ:at,qq=30001] {content}",
+        "group_id": group_id, "user_id": member_id, "self_id": 30001,
+    })
 
 
 @pytest.fixture
@@ -46,6 +44,15 @@ def bot(monkeypatch):
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
     monkeypatch.setattr(config, "SUPER_ADMIN", set())
     monkeypatch.setattr(config, "QA_WHITELIST", {"teacher"})
+    monkeypatch.setattr(config, "QA_WHITELIST_ENABLED", True)
+    monkeypatch.setattr(config, "QA_BLACKLIST", set())
+    monkeypatch.setattr(config, "NL_INTENT_ENABLED", False)
+    monkeypatch.setattr(config, "QA_SENSITIVE_GATE_ENABLED", True)
+    monkeypatch.setattr(config, "QA_PROBLEM_GATE_ENABLED", True)
+    monkeypatch.setattr(config, "QA_TOPIC_GATE_ENABLED", True)
+    monkeypatch.setattr(config, "QA_RATE_LIMIT_ENABLED", True)
+    monkeypatch.setattr(config, "QA_RATE_LIMIT_MAX_CALLS", 3)
+    monkeypatch.setattr(config, "QA_RATE_LIMIT_SECONDS", 10)
     client = main.ACMBot()
     replies = []
 
@@ -193,12 +200,12 @@ async def test_blacklist_member_ignored_without_reply(bot, monkeypatch):
     non_command.assert_not_awaited()
 
 
-async def test_non_whitelist_member_ignored_without_reply(bot, monkeypatch):
+async def test_non_whitelist_member_gets_permission_hint_without_qa(bot, monkeypatch):
     non_command = AsyncMock(return_value=[{"group_id": "g1", "text": "不应调用"}])
     monkeypatch.setattr(commands, "handle_non_command_message", non_command)
 
     replies = await _run_chain(bot, "校赛什么时候？", member_id="student")
-    assert replies == []
+    assert replies == [("g1", config.QA_WHITELIST_REPLY)]
     non_command.assert_not_awaited()
 
 

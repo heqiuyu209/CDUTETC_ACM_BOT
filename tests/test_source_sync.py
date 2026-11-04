@@ -400,7 +400,7 @@ async def test_onebot_pending_commands_only_send_source_group_confirmations(comp
     async def route(text, msg_id):
         await client.on_group_at_message_create(OneBotMessage({
             "post_type": "message", "message_type": "group", "message_id": msg_id,
-            "raw_message": text, "group_id": "g1", "user_id": "admin", "self_id": 30001,
+            "raw_message": f"[CQ:at,qq=30001] {text}", "group_id": "g1", "user_id": "admin", "self_id": 30001,
         }))
     await route("/待审列表", "list-id")
     await route(f"/待审批准 {uid}", "apply-id")

@@ -1219,12 +1219,10 @@ def _find_legacy_publication(conn: sqlite3.Connection, identity: str,
 
 def _create_confirmed_from_pending(info: dict, source_url: str, source_text: str,
                                    operator: str) -> tuple[int, bool]:
-    """超管确认后落库：无来源链接（群消息转发）时按「名称+届次+时间」去重。
+    """无链接发布及超管确认落库：按「名称+届次+时间」原子去重。
 
-    与 create_published_competition_once 的差别：
-    - 不要求 source_url，没有链接也能发布；
-    - 去重口径统一为 find_duplicate_competition（名称+届次+比赛时间），
-      因此转发消息与官网发布的两条同场比赛仍会被判重。
+    不要求 source_url，因此群消息转发与官网发布的同场比赛仍可判重；
+    免审发布缺少链接时也复用此路径，不注册空地址监控来源。
     """
     if not isinstance(info, dict):
         raise ValueError("比赛信息必须是对象")
@@ -1266,12 +1264,12 @@ def create_published_competition_once(info: dict, source_url: str, source_text: 
     持久发布身份独立于后续手工修正；写事务内完成查重、来源和版本创建。
     """
     source_url = _as_str(source_url)
-    if not source_url:
-        raise ValueError("来源 URL 不能为空")
     if not isinstance(source_text, str):
         raise ValueError("来源正文必须是字符串")
     if not isinstance(info, dict):
         raise ValueError("比赛信息必须是对象")
+    if not source_url:
+        return _create_confirmed_from_pending(info, "", source_text, operator)
     cleaned = _clean_competition_info({**info, "official_site": source_url})
     canonical_url = _canonical_publication_url(source_url)
     identity = _publication_identity(cleaned, canonical_url)
@@ -2233,8 +2231,10 @@ def _row_to_delivery(r: sqlite3.Row) -> dict:
 
 
 def delivery_dedup_key(group_id: str, obj_type: str, obj_id: int,
-                       remind_type: str, target_time: str) -> str:
-    return f"{group_id}|{obj_type}|{obj_id}|{remind_type}|{_canonical_time(target_time)}"
+                       remind_type: str, target_time: str,
+                       offset_hours: float | None = None) -> str:
+    key = f"{group_id}|{obj_type}|{obj_id}|{remind_type}|{_canonical_time(target_time)}"
+    return f"{key}|{offset_hours:g}" if offset_hours is not None else key
 
 
 def _canonical_delivery_key(key: str) -> str:
@@ -2273,27 +2273,39 @@ def _migrate_reminder_deliveries(conn: sqlite3.Connection) -> None:
                 "INSERT OR IGNORE INTO reminder_success_receipts (dedup_key, lease_token, sent_at) VALUES (?, ?, ?)",
                 (canonical, token, sent_at),
             )
+    conn.execute("DROP INDEX IF EXISTS idx_delivery_identity")
     rows = conn.execute(f"SELECT {_DELIVERY_COLS} FROM reminder_deliveries ORDER BY id").fetchall()
     grouped: dict[tuple, list[dict]] = {}
     for row in rows:
         delivery = _row_to_delivery(row)
         delivery["target_time"] = _canonical_time(delivery["target_time"])
+        key = _canonical_delivery_key(delivery["dedup_key"])
+        parts = key.split("|", 5)
+        offset_suffix = parts[5] if len(parts) == 6 else ""
         identity = tuple(delivery[k] for k in ("group_id", "obj_type", "obj_id", "remind_type", "target_time"))
-        grouped.setdefault(identity, []).append(delivery)
+        grouped.setdefault((*identity, offset_suffix), []).append(delivery)
     rank = {"sent": 6, "sending": 5, "pending": 4, "failed": 3, "expired": 2, "cancelled": 1}
-    for identity, deliveries in grouped.items():
+    for identity_with_offset, deliveries in grouped.items():
+        identity, offset_suffix = identity_with_offset[:5], identity_with_offset[5]
         winner = max(deliveries, key=lambda d: (rank.get(d["status"], 0), d["attempts"], -d["id"]))
         for delivery in deliveries:
             if delivery["id"] != winner["id"]:
                 conn.execute("DELETE FROM reminder_deliveries WHERE id = ?", (delivery["id"],))
         key = delivery_dedup_key(*identity)
+        if offset_suffix:
+            key = f"{key}|{offset_suffix}"
         conn.execute(
             "UPDATE reminder_deliveries SET dedup_key = ?, target_time = ?, attempts = ? WHERE id = ?",
             (key, identity[4], max(d["attempts"] for d in deliveries), winner["id"]),
         )
+    identity_key = "group_id || '|' || obj_type || '|' || obj_id || '|' || remind_type || '|' || target_time"
+    offset_expr = f"substr(dedup_key, length({identity_key}) + 2)"
+    offset_prefix = f"substr(dedup_key, 1, length({identity_key}) + 1) = {identity_key} || '|'"
     conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_identity ON reminder_deliveries"
-        " (group_id, obj_type, obj_id, remind_type, target_time)"
+        f"CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_identity ON reminder_deliveries"
+        f" (group_id, obj_type, obj_id, remind_type, target_time,"
+        f" CASE WHEN {offset_prefix} AND {offset_expr} <> '' AND {offset_expr} NOT GLOB '*[^0-9.]*'"
+        f" THEN CAST({offset_expr} AS REAL) ELSE '' END)"
     )
     # 成功事实独立提交；状态投影写入失败时，查询仍显示已发送并保留去重。
     conn.execute("""CREATE VIEW IF NOT EXISTS reminder_delivery_states AS
@@ -2399,17 +2411,35 @@ def reconcile_deliveries(now: datetime | None = None, *, max_attempts: int = 3,
 def claim_delivery(group_id: str, obj_type: str, obj_id: int, remind_type: str,
                    target_time: str, *, now: datetime | None = None,
                    max_attempts: int = 3, lease_seconds: int = 120,
-                   allowed_groups: set[str] | None = None) -> str | None:
+                   allowed_groups: set[str] | None = None,
+                   offset_hours: float | None = None) -> str | None:
     """同一写事务复核对象并领取；计数在领取时递增，进程中断也消耗尝试。"""
     if max_attempts < 1 or lease_seconds < 1:
         raise ValueError("提醒尝试次数和发送租约必须大于零")
     now = _delivery_now(now)
     target_time = _canonical_time(target_time)
-    key = delivery_dedup_key(group_id, obj_type, obj_id, remind_type, target_time)
+    key = delivery_dedup_key(group_id, obj_type, obj_id, remind_type, target_time, offset_hours)
+    legacy_key = delivery_dedup_key(group_id, obj_type, obj_id, remind_type, target_time)
     if allowed_groups is not None and group_id not in allowed_groups:
         return None
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        if key != legacy_key:
+            legacy = conn.execute(
+                "SELECT status FROM reminder_deliveries WHERE dedup_key = ?", (legacy_key,),
+            ).fetchone()
+            receipt = conn.execute(
+                "SELECT sent_at FROM reminder_success_receipts WHERE dedup_key = ?", (legacy_key,),
+            ).fetchone()
+            if (legacy and legacy[0] == "sent") or receipt:
+                if receipt and not legacy:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO reminder_deliveries"
+                        " (group_id, obj_type, obj_id, remind_type, target_time, status, sent_at, dedup_key)"
+                        " VALUES (?, ?, ?, ?, ?, 'sent', ?, ?)",
+                        (group_id, obj_type, obj_id, remind_type, target_time, receipt[0], legacy_key),
+                    )
+                return None
         conn.execute(
             "INSERT OR IGNORE INTO reminder_deliveries (group_id, obj_type, obj_id, remind_type, target_time, dedup_key)"
             " VALUES (?, ?, ?, ?, ?, ?)", (group_id, obj_type, obj_id, remind_type, target_time, key),
@@ -2516,10 +2546,11 @@ def finish_delivery(dedup_key: str, token: str, ok: bool, *, error: str = "",
 
 
 def ensure_delivery(group_id: str, obj_type: str, obj_id: int,
-                    remind_type: str, target_time: str) -> bool:
-    """登记一条待发送提醒（幂等：同去重键只建一次）。返回是否新创建。"""
+                    remind_type: str, target_time: str,
+                    offset_hours: float | None = None) -> bool:
+    """登记一条待发送提醒；offset为空时沿用旧去重身份。"""
     target_time = _canonical_time(target_time)
-    key = delivery_dedup_key(group_id, obj_type, obj_id, remind_type, target_time)
+    key = delivery_dedup_key(group_id, obj_type, obj_id, remind_type, target_time, offset_hours)
     with _connect() as conn:
         cur = conn.execute(
             "INSERT OR IGNORE INTO reminder_deliveries (group_id, obj_type, obj_id,"

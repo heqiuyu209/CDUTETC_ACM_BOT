@@ -27,6 +27,9 @@ def bot(monkeypatch, onebot_client):
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"m1"})
     monkeypatch.setattr(config, "PUBLISH_CMD", "发布")
     monkeypatch.setattr(config, "BOT_QQ", "")
+    monkeypatch.setattr(config, "GROUP_REQUIRE_AT", True)
+    monkeypatch.setattr(config, "PUBLISH_CONFIRM_ENABLED", False)
+    monkeypatch.setattr(config, "NL_INTENT_ENABLED", False)
 
     # 隔离真实 DB：发布流程会写公共比赛（competitions 表），
     # 若不隔离 _connect 会真实写入项目目录的 contests.db。
@@ -94,28 +97,49 @@ async def test_publish_without_permission(bot):
     assert len(database.list_competitions()) == 0
 
 
-async def test_publish_missing_url(bot):
+async def test_publish_without_url_saves_text_without_fetching(bot, monkeypatch):
     b, replies = bot
-    await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] 发布 没有链接的文字"))
-    assert any("链接" in r for r in replies)
+    fetch = AsyncMock()
+    extract = AsyncMock(return_value=({"name": "纯文字校赛"}, None))
+    monkeypatch.setattr(main, "fetch_text", fetch)
+    monkeypatch.setattr(main, "extract_contest", extract)
+
+    await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] 发布 纯文字校赛"))
+
+    fetch.assert_not_awaited()
+    extract.assert_awaited_once_with("老师原文：纯文字校赛")
+    comps = database.list_competitions(status="confirmed")
+    assert len(comps) == 1 and comps[0]["name"] == "纯文字校赛"
+    assert comps[0]["official_site"] == ""
+    assert any("已保存：纯文字校赛" in r and "已入库" in r for r in replies)
 
 
-async def test_publish_fetch_error(bot, monkeypatch):
+async def test_publish_fetch_error_falls_back_to_original_text(bot, monkeypatch):
     b, replies = bot
+    fetch = AsyncMock(side_effect=FetchError("目标地址非公网"))
+    extract = AsyncMock(return_value=({"name": "降级校赛"}, None))
+    monkeypatch.setattr(main, "fetch_text", fetch)
+    monkeypatch.setattr(main, "extract_contest", extract)
 
-    async def fail_fetch(url):
-        raise FetchError("目标地址非公网")
+    await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] 发布 降级校赛 https://a.com"))
 
-    monkeypatch.setattr(main, "fetch_text", fail_fetch)
+    fetch.assert_awaited_once_with("https://a.com")
+    extract.assert_awaited_once_with("老师原文：降级校赛 https://a.com")
+    assert any("链接打不开" in r for r in replies)
+    comps = database.list_competitions(status="confirmed")
+    assert len(comps) == 1 and comps[0]["official_site"] == "https://a.com"
 
-    async def fake_extract(text):
-        return None, None
 
-    monkeypatch.setattr(main, "extract_contest", fake_extract)
+async def test_publish_fetch_and_extract_failure_does_not_write(bot, monkeypatch):
+    b, replies = bot
+    monkeypatch.setattr(main, "fetch_text", AsyncMock(side_effect=FetchError("目标地址非公网")))
+    monkeypatch.setattr(main, "extract_contest", AsyncMock(return_value=(None, None)))
 
     await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] 发布 https://a.com"))
-    assert any("抓取失败" in r for r in replies)
-    assert len(database.list_competitions()) == 0  # 抓取失败绝不写库
+
+    assert any("链接打不开" in r for r in replies)
+    assert any("提取失败" in r for r in replies)
+    assert database.list_competitions() == []
 
 
 async def test_publish_extract_error(bot, monkeypatch):
@@ -136,9 +160,11 @@ async def test_publish_extract_error(bot, monkeypatch):
     assert len(database.list_competitions()) == 0  # 提取失败不写库
 
 
-async def test_publish_success_auto_publishes(bot, monkeypatch):
-    """v2 免审发布：老师发布直接创建 confirmed 正式比赛并尝试全员通知。"""
+@pytest.mark.parametrize("publisher", ["m1", "admin"])
+async def test_publish_success_auto_publishes(bot, monkeypatch, publisher):
+    """关闭确认流程时，老师和未加入教师白名单的超管均可免审发布。"""
     b, replies = bot
+    monkeypatch.setattr(config, "SUPER_ADMIN", {"admin"})
 
     async def ok_fetch(url):
         return "正文内容"
@@ -152,8 +178,10 @@ async def test_publish_success_auto_publishes(bot, monkeypatch):
     monkeypatch.setattr(main, "fetch_text", ok_fetch)
     monkeypatch.setattr(main, "extract_contest", fake_extract_ok)
 
-    await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] 发布 https://a.com"))
-    assert any("已免审发布" in r for r in replies)
+    await b.on_group_at_message_create(_msg(
+        "[CQ:at,qq=30001] 发布 https://a.com", member=publisher,
+    ))
+    assert any("已保存：校赛" in r and "已入库" in r for r in replies)
     # 免审发布：直接写入 confirmed 正式比赛（无审核草稿环节）
     comps = database.list_competitions(status="confirmed")
     assert len(comps) == 1
@@ -169,13 +197,15 @@ async def test_addressed_link_question_does_not_publish(bot, monkeypatch):
 
     seen = {}
 
-    async def fake_non_command(text, group_id, sender):
+    async def fake_non_command(text, group_id, sender, *, staff=False):
         seen["text"] = text
+        seen["staff"] = staff
         return [{"group_id": group_id, "text": "收到，已记录为问题"}]
 
     monkeypatch.setattr(main.commands, "handle_non_command_message", fake_non_command)
     await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] 看看这个 https://a.com/contest"))
     assert seen.get("text", "").startswith("看看这个")
+    assert seen["staff"] is True
     assert any("已记录为问题" in r for r in replies)
     assert len(database.list_competitions()) == 0  # 普通链接消息不发布不写库
 
@@ -283,9 +313,13 @@ def test_run_bot_checks_config_then_constructs_and_starts_onebot(monkeypatch, on
     monkeypatch.setattr(config, "check_config", check)
     monkeypatch.setattr(config, "ONEBOT_WS_URL", "ws://127.0.0.1:3001")
     monkeypatch.setattr(config, "ONEBOT_TOKEN", "synthetic-token")
+    monkeypatch.setattr(config, "WS_IDLE_TIMEOUT_SECONDS", 47.0)
+    monkeypatch.setattr(config, "BOT_PROTOCOL", "onebot")
     monkeypatch.setattr(main, "OneBotClient", factory)
     main.run_bot()
     check.assert_called_once_with()
-    factory.assert_called_once_with(ws_url="ws://127.0.0.1:3001", token="synthetic-token")
+    factory.assert_called_once_with(
+        ws_url="ws://127.0.0.1:3001", token="synthetic-token", idle_timeout=47.0,
+    )
     onebot_client.start.assert_awaited_once_with()
     assert callable(onebot_client.group_msg_handler) and callable(onebot_client.on_ready)

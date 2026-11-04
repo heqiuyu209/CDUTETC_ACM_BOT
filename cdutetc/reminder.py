@@ -246,12 +246,9 @@ def _delivery_key(item: dict) -> str:
     # 不带群号会导致多群订阅时只有第一个群收到。
     # 键还必须包含提醒节点：同一目标时间要按 24h/1h 等多个节点各发一次，
     # 不带节点会让第一个节点发完就把后续节点一起吞掉。
-    base = delivery_dedup_key(item["group_id"], item["obj_type"], item["obj_id"],
-                              item["remind_type"], item["target_str"])
-    offset = item.get("offset_hours")
-    if offset is None:
-        return base
-    return f"{base}|{offset:g}"
+    return delivery_dedup_key(item["group_id"], item["obj_type"], item["obj_id"],
+                              item["remind_type"], item["target_str"],
+                              item.get("offset_hours"))
 
 
 def build_training_reminders(sessions: list[dict], now: datetime) -> list[dict]:
@@ -316,7 +313,7 @@ async def check_general_reminders(send_group, now: datetime | None = None,
         token = claim_delivery(
             item["group_id"], item["obj_type"], item["obj_id"], item["remind_type"], item["target_str"],
             now=current_time(), max_attempts=max_attempts, lease_seconds=_DELIVERY_LEASE_SECONDS,
-            allowed_groups=set(config.ALLOWED_GROUPS),
+            allowed_groups=set(config.ALLOWED_GROUPS), offset_hours=item.get("offset_hours"),
         )
         if token is None or not validate_delivery_claim(
             key, token, now=current_time(), allowed_groups=set(config.ALLOWED_GROUPS),

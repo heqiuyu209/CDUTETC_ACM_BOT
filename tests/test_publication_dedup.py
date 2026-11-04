@@ -241,6 +241,38 @@ def test_amended_fields_do_not_create_claims_for_another_name_or_session(db_file
     assert publish(info) == (first, False)
 
 
+def test_url_less_publication_is_idempotent_without_empty_source(db_file):
+    cid, created = database.create_published_competition_once(
+        INFO, "", PAGE, operator="publish:teacher"
+    )
+    assert created is True
+    assert database.get_competition(cid)["official_site"] == ""
+    assert database.list_sources(cid) == []
+    assert database.create_published_competition_once(
+        INFO, "", "另一份正文", operator="publish:teacher"
+    ) == (cid, False)
+    assert database.list_sources(cid) == []
+    assert counts(db_file[0]) == (1, 1, 0, 0)
+
+
+def test_same_url_less_publication_is_atomic_across_independent_connections(db_file):
+    gate = Barrier(2)
+
+    def worker():
+        gate.wait(timeout=10)
+        return database.create_published_competition_once(
+            INFO, "", PAGE, operator="publish:teacher"
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(worker) for _ in range(2)]
+        results = [future.result(timeout=15) for future in futures]
+    assert results[0][0] == results[1][0]
+    assert sorted(created for _, created in results) == [False, True]
+    assert database.list_sources(results[0][0]) == []
+    assert counts(db_file[0]) == (1, 1, 0, 0)
+
+
 def test_claim_insert_failure_rolls_back_competition_source_and_baseline(db_file):
     with sqlite3.connect(db_file[0]) as conn:
         conn.execute("CREATE TRIGGER fail_claim BEFORE INSERT ON publication_claims "
@@ -318,7 +350,8 @@ async def test_onebot_publish_twice_preserves_fields_without_second_notification
 
     def message(mid):
         return OneBotMessage({"post_type": "message", "message_type": "group", "group_id": "g1",
-                              "user_id": "teacher", "message_id": mid, "raw_message": f"发布 {URL}"})
+                              "user_id": "teacher", "message_id": mid, "self_id": 30001,
+                              "raw_message": f"[CQ:at,qq=30001] 发布 {URL}"})
 
     await bot.on_group_at_message_create(message("first"))
     record = database.list_competitions(status="confirmed")[0]
@@ -332,13 +365,13 @@ async def test_onebot_publish_twice_preserves_fields_without_second_notification
         assert record[field] == value
     first_calls = list(onebot.send_group_msg.await_args_list)
     notices = [call.args for call in first_calls if "【新比赛发布】" in call.args[1]]
-    assert [group for group, content in notices] == ["g1", "g2", "g3"]
+    assert [group for group, content in notices] == ["g1"]
     assert all(expected["official_reg_deadline"] in content and expected["official_time"] in content
                for group, content in notices)
-    assert "已记录" in first_calls[0].args[1] and "群通知" in first_calls[-1].args[1]
+    assert any("已保存" in call.args[1] for call in first_calls)
 
     await bot.on_group_at_message_create(message("second"))
     assert database.list_competitions(status="confirmed") == [record]
     assert counts(db_file[0]) == (1, 1, 1, 1)
     added = onebot.send_group_msg.await_args_list[len(first_calls):]
-    assert len(added) == 1 and added[0].args[0] == "g1" and "已存档" in added[0].args[1]
+    assert len(added) == 1 and added[0].args[0] == "g1" and "未重复发布" in added[0].args[1]
