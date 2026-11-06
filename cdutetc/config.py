@@ -277,9 +277,10 @@ QA_PROBLEM_EXTRA_WORDS = {
 QA_SOCIAL_CHAT_ENABLED = os.getenv("ACM_QA_SOCIAL_CHAT_ENABLED", "1") != "0"
 QA_SOCIAL_CHAT_USE_LLM = os.getenv("ACM_QA_SOCIAL_CHAT_USE_LLM", "0") == "1"
 
-# --- 7) 普通成员队务问答范围：只答已录入内容，不调模型 ---
+# --- 7) 普通成员队务问答范围：只答已录入内容 ---
 # 开启后普通成员（非老师/超管）的提问只匹配 FAQ / 课程 / 校安排 / 已录入比赛：
-# 命中则按库内内容作答，未命中直接转人工收集为未答问题，绝不调用大模型。
+# 命中则按库内内容作答，未命中收集为未答问题；默认不调用模型。
+# 可选 FAQ 模型只从本群候选中选编号，不生成队务答案。
 # 这样既不会出现“我没有数据库权限”这类模型臆造的管理端话术，
 # 也把普通成员提问的 token 成本降为 0。老师/超管不受此限制。
 QA_MEMBER_KB_ONLY = os.getenv("ACM_QA_MEMBER_KB_ONLY", "1") != "0"

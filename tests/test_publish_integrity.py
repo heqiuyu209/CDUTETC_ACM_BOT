@@ -15,6 +15,26 @@ from cdutetc.errors import DeliveryMode, DeliveryResult
 from cdutetc.utils import match_publish_command
 
 
+async def test_confirmation_enabled_without_admin_stops_before_fetch_or_write(monkeypatch):
+    monkeypatch.setattr(config, "PUBLISH_CONFIRM_ENABLED", True)
+    monkeypatch.setattr(config, "SUPER_ADMIN", set())
+    monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
+    fetch = AsyncMock()
+    extract = AsyncMock()
+    monkeypatch.setattr(main, "fetch_text", fetch)
+    monkeypatch.setattr(main, "extract_contest", extract)
+    def no_database(*args, **kwargs):
+        pytest.fail("缺少审核人时不能读写发布记录")
+    monkeypatch.setattr(db, "_connect", no_database)
+    bot = main.ACMBot()
+    reply = AsyncMock(return_value=True)
+    monkeypatch.setattr(bot, "_safe_reply", reply)
+    await bot._handle_publish(SimpleNamespace(), "https://example.com", "g1", "teacher")
+    fetch.assert_not_awaited()
+    extract.assert_not_awaited()
+    assert "发布审核人" in reply.await_args.args[1]
+
+
 @pytest.mark.parametrize("text", [
     "发布的这个校赛为什么报名时间不同？ https://contest.example.com",
     "发布会什么时候开始？ https://contest.example.com",
@@ -73,6 +93,7 @@ def test_custom_command_requires_its_own_boundary():
 
 @pytest.mark.parametrize("separator", ["", " ", "\n", "\u3000"])
 async def test_onebot_explicit_url_publication_keeps_documented_syntax(monkeypatch, separator):
+    monkeypatch.setattr(config, "PUBLISH_CONFIRM_ENABLED", False)
     conn = sqlite3.connect(":memory:")
     monkeypatch.setattr(db, "_connect", lambda: conn)
     db.init_db()

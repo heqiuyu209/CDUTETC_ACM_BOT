@@ -255,7 +255,7 @@ async def check_reminders(send_group) -> int:
 
 def build_general_reminders(collections: list[dict], competitions: list[dict],
                             now: datetime) -> list[dict]:
-    """计算通用提醒清单（纯函数，便于离线测试）。
+    """结合当前群范围计算通用提醒清单。
 
     覆盖两类对象：
     - 征集（群级）：deadline 已进入某个提醒节点窗口 → 提醒对应群；
@@ -293,11 +293,12 @@ def build_general_reminders(collections: list[dict], competitions: list[dict],
             continue
         # 通知范围：该比赛指定了通知群就只发这些群，否则发全部允许群。
         # 这样「周赛」可以只发集训队群，不打扰新生群。
-        # 纯函数离线测试可能没有数据库，取不到映射时按「全部允许群」处理。
+        # 读取失败不能退回全群广播；该比赛留待下轮，其余对象继续。
         try:
             scoped = get_competition_notify_groups(c["id"])
         except (sqlite3.Error, OSError):
-            scoped = set()
+            logger.warning("比赛 #%s 的通知范围无法读取，跳过本轮提醒", c["id"])
+            continue
         targets = scoped & config.ALLOWED_GROUPS if scoped else set(config.ALLOWED_GROUPS)
         if not targets:
             # 指定了通知群但都不在允许列表里：宁可不提醒，也不要退回全群广播

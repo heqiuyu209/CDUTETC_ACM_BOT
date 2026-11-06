@@ -51,6 +51,7 @@ def db_file(monkeypatch, tmp_path):
 
 @pytest.fixture
 async def bot(monkeypatch, db_file, onebot_client):
+    monkeypatch.setattr(config, "PUBLISH_CONFIRM_ENABLED", False)
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
     monkeypatch.setattr(config, "PUBLISH_CMD", "发布")

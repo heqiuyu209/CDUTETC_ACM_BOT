@@ -1,6 +1,7 @@
 """多节点在跨重启、旧成功历史和主入口中的可观察投递行为。"""
 
 from datetime import datetime, timedelta
+import sqlite3
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
@@ -92,3 +93,19 @@ async def test_delayed_start_message_uses_actual_countdown(db):
     assert await reminder.check_contest_start_reminders(sender, now=TARGET - timedelta(minutes=29)) == 1
     assert "约29分钟" in sender.await_args.args[1]
     assert "30分钟" not in sender.await_args.args[1]
+
+
+async def test_unreadable_scope_never_broadcasts_and_other_objects_continue(db, monkeypatch):
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2"})
+    target = TARGET.strftime("%Y-%m-%d %H:%M")
+    cid = database.create_competition({"name": "仅限g1的比赛", "official_reg_deadline": target}, status="confirmed")
+    database.set_competition_notify_groups(cid, {"g1"})
+    database.create_collection("g2", "另一群正常报名", deadline=target)
+    def unavailable(*args):
+        raise sqlite3.OperationalError("scope unavailable")
+    monkeypatch.setattr(reminder, "get_competition_notify_groups", unavailable)
+    sender = AsyncMock(return_value=True)
+    assert await reminder.check_general_reminders(sender, now=TARGET - timedelta(hours=1)) == 1
+    sender.assert_awaited_once()
+    assert sender.await_args.args[0] == "g2"
+    assert "仅限g1" not in sender.await_args.args[1]

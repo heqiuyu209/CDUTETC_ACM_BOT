@@ -693,6 +693,9 @@ class ACMBot:
         if not can_manage_group(member_id):
             await self._safe_reply(message, "抱歉，你没有发布比赛信息的权限~")
             return
+        if config.PUBLISH_CONFIRM_ENABLED and not config.SUPER_ADMIN:
+            await self._safe_reply(message, "还没配置发布审核人，暂时无法提交比赛，请联系管理员补齐。 [validation]")
+            return
 
         # 有链接就抓官网正文；没有链接也允许发布——直接把老师发来的文字
         # 当作信息源，「有什么先存什么」，不强迫补链接。
@@ -753,7 +756,7 @@ class ACMBot:
             return
 
         # 超管确认流程：老师发布 → 整理结果私聊超管 → 同意才入库并通知群
-        if config.PUBLISH_CONFIRM_ENABLED and config.SUPER_ADMIN:
+        if config.PUBLISH_CONFIRM_ENABLED:
             try:
                 pid = db.create_pending_publication(
                     competition_info,
@@ -786,7 +789,7 @@ class ACMBot:
             logger.info("发布申请 #%s 已提交超管确认：%s", pid, info.get("name"))
             return
 
-        # 未启用确认流程（或未配置超管）：保持原免审发布
+        # 显式关闭确认流程时直接发布。
         try:
             cid, created = create_published_competition_once(
                 competition_info,

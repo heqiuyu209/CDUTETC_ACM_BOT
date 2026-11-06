@@ -24,6 +24,7 @@ def memory_db(monkeypatch):
 
 @pytest.fixture
 def bot(memory_db, monkeypatch, onebot_client):
+    monkeypatch.setattr(config, "PUBLISH_CONFIRM_ENABLED", False)
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
     monkeypatch.setattr(config, "BOT_QQ", "")

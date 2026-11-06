@@ -330,6 +330,7 @@ def test_optional_field_types_are_validated_before_storage(field):
 
 @pytest.mark.parametrize("official_aliases", [False, True])
 async def test_onebot_publish_twice_preserves_fields_without_second_notification(db_file, monkeypatch, official_aliases):
+    monkeypatch.setattr(config, "PUBLISH_CONFIRM_ENABLED", False)
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2", "g3"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
     monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
