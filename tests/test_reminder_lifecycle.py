@@ -245,6 +245,38 @@ async def test_main_job_continues_after_legacy_send_failure(file_db, monkeypatch
     assert database.get_delivery_by_key(key)["attempts"] == 1
 
 
+async def test_main_job_isolates_legacy_scan_failure(file_db, monkeypatch):
+    general = AsyncMock(return_value=1)
+    monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
+
+    async def broken_legacy(_sender):
+        raise sqlite3.OperationalError("legacy table unavailable")
+
+    monkeypatch.setattr(main, "check_reminders", broken_legacy)
+    monkeypatch.setattr(main, "check_general_reminders", general)
+    client = main.ACMBot(AsyncMock())
+
+    await client._remind_job()
+
+    general.assert_awaited_once()
+
+
+async def test_main_job_isolates_general_scan_failure(file_db, monkeypatch):
+    legacy = AsyncMock(return_value=1)
+    monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
+
+    async def broken_general(_sender):
+        raise sqlite3.OperationalError("delivery table unavailable")
+
+    monkeypatch.setattr(main, "check_reminders", legacy)
+    monkeypatch.setattr(main, "check_general_reminders", broken_general)
+    client = main.ACMBot(AsyncMock())
+
+    await client._remind_job()
+
+    legacy.assert_awaited_once()
+
+
 async def test_legacy_callback_exception_does_not_skip_later_legacy_item(file_db, monkeypatch):
     first = database.save_contest("g1", {"name": "发送失败比赛", "reg_deadline": TARGET})
     second = database.save_contest("g1", {"name": "后续比赛", "reg_deadline": TARGET})

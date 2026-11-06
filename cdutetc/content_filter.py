@@ -179,6 +179,20 @@ def is_capability_query(text: str) -> bool:
     )
 
 
+# 只接受完整的简短社交表达，不用「包含你好」放行整段任意指令。
+_SOCIAL_CHAT_RE = re.compile(
+    r"(?:(?:你好|您好|嗨|哈喽|早上好|早安|中午好|下午好|晚上好|晚安|"
+    r"在吗|谢谢|多谢|辛苦了|再见|拜拜|hello|hi|hey|thanks|thankyou)"
+    r"[呀啊哦呢啦哈~～!！?？,，。.、\s]*)+", re.IGNORECASE,
+)
+
+
+def is_social_chat(text: str) -> bool:
+    """完整、短小的寒暄才进入无资料闲聊；混合队务问题仍按知识库处理。"""
+    t = (text or "").strip()
+    return bool(t and len(t) <= 60 and _SOCIAL_CHAT_RE.fullmatch(t))
+
+
 # ----------------------------------------------------------------------
 # 1) 话题范围硬限制：本地意图判断（不调 LLM）
 # ----------------------------------------------------------------------

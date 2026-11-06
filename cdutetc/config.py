@@ -273,7 +273,10 @@ QA_PROBLEM_EXTRA_WORDS = {
     w.strip() for w in os.getenv("ACM_QA_PROBLEM_EXTRA_WORDS", "").split(",") if w.strip()
 }
 
-# --- 7) 普通成员问答范围：只答已录入内容，不调模型 ---
+# 简短寒暄可调用轻量模型回复；不携带群资料，不改变队务知识库限制。
+QA_SOCIAL_CHAT_ENABLED = os.getenv("ACM_QA_SOCIAL_CHAT_ENABLED", "1") != "0"
+
+# --- 7) 普通成员队务问答范围：只答已录入内容，不调模型 ---
 # 开启后普通成员（非老师/超管）的提问只匹配 FAQ / 课程 / 校安排 / 已录入比赛：
 # 命中则按库内内容作答，未命中直接转人工收集为未答问题，绝不调用大模型。
 # 这样既不会出现“我没有数据库权限”这类模型臆造的管理端话术，

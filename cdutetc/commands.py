@@ -616,7 +616,7 @@ def cmd_group_add(group_id: str, sender: str, args: str) -> list[dict]:
         return [{"group_id": group_id, "text": "仅超管可添加群"}]
     gid, note = _split_id_note(args)
     ok, msg = roles.add_group(gid, operator=sender, note=note)
-    return [{"group_id": group_id, "text": msg}]
+    return [{"group_id": group_id, "text": msg, "notify_super_admin": ok}]
 
 
 def cmd_group_remove(group_id: str, sender: str, args: str) -> list[dict]:
@@ -638,7 +638,7 @@ def cmd_teacher_add(group_id: str, sender: str, args: str) -> list[dict]:
         return [{"group_id": group_id, "text": "仅超管可添加老师"}]
     uid, note = _split_id_note(args)
     ok, msg = roles.add_teacher(uid, operator=sender, note=note)
-    return [{"group_id": group_id, "text": msg}]
+    return [{"group_id": group_id, "text": msg, "notify_super_admin": ok}]
 
 
 def cmd_teacher_remove(group_id: str, sender: str, args: str) -> list[dict]:
@@ -1044,12 +1044,14 @@ async def handle_non_command_message(text: str, group_id: str, sender: str,
                                      staff: bool = False) -> list[dict]:
     """非命令消息问答。
 
-    staff=False（普通成员）：只答库内已录入内容，绝不调用模型；
-        未命中则直接收集为未答问题转人工。
+    staff=False（普通成员）：队务只答库内已录入内容；纯寒暄可用轻量模型。
+        队务未命中则收集为未答问题转人工。
     staff=True（老师/超管）：FAQ → 算法拦截 → 模型问答（可用未录入资料作答）。
 
     text/group_id/sender 均由调用方校验完毕；本函数不做权限判断。
     """
+    if config.QA_SOCIAL_CHAT_ENABLED and content_filter.is_social_chat(text):
+        return [{"group_id": group_id, "text": await llm.answer_social_chat(text)}]
     faq = match_faq(group_id, text)
     if faq is not None:
         return [{"group_id": group_id, "text": f"Q：{faq['question']}\nA：{faq['answer']}"}]

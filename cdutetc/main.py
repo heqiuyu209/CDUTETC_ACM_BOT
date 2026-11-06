@@ -545,6 +545,7 @@ class ACMBot:
                 if (
                     config.NL_INTENT_ENABLED
                     and not text.startswith("/")
+                    and not content_filter.is_social_chat(text)
                     and can_manage_group(member_id)
                 ):
                     intent = await llm.classify_intent(text)
@@ -574,6 +575,7 @@ class ACMBot:
                     ]
             cross_sent = 0
             cross_total = 0
+            admin_notice_texts = []
             for reply in replies:
                 if not reply.get("text"):
                     continue
@@ -584,6 +586,28 @@ class ACMBot:
                     cross_total += 1
                     if await self._send_group(target_group, reply["text"]):
                         cross_sent += 1
+                if reply.get("notify_super_admin"):
+                    admin_notice_texts.append(reply["text"])
+            if admin_notice_texts:
+                notice = "管理变更确认：\n" + "\n".join(admin_notice_texts)
+                sent = 0
+                for admin in sorted(config.SUPER_ADMIN):
+                    try:
+                        if await self.client.send_private_msg(admin, notice):
+                            sent += 1
+                    except Exception:
+                        logger.warning("管理变更超管确认发送异常", exc_info=True)
+                if sent == 0:
+                    await self._safe_reply(
+                        message,
+                        "操作已保存，但未能私聊确认超管；请超管查看 /群列表 或 /老师列表。",
+                    )
+                elif sent < len(config.SUPER_ADMIN):
+                    await self._safe_reply(
+                        message,
+                        f"操作已保存，超管私聊确认仅送达 {sent}/{len(config.SUPER_ADMIN)} 人；"
+                        "未收到者可查看 /群列表 或 /老师列表。",
+                    )
             if cross_total:
                 await self._safe_reply(message, _notification_summary(cross_sent, cross_total))
         except Exception:
@@ -841,8 +865,16 @@ class ACMBot:
         if not config.GROUP_ACTIVE_MESSAGES_ENABLED:
             logger.info("主动群消息未启用，暂停提醒投递")
             return
-        await check_reminders(self._send_group)
-        await check_general_reminders(self._send_group)
+        # 两套提醒表/计划彼此独立；一套的数据库或兼容数据故障不应
+        # 阻断另一套的投递，下一轮仍会按持久化状态重试。
+        try:
+            await check_reminders(self._send_group)
+        except Exception:  # noqa: BLE001
+            logger.exception("旧版比赛提醒扫描失败，继续执行通用提醒")
+        try:
+            await check_general_reminders(self._send_group)
+        except Exception:  # noqa: BLE001
+            logger.exception("通用提醒扫描失败，等待下一轮重试")
 
     async def _weekly_contest_job(self, now: datetime | None = None):
         """提前生成下一场未来周赛（默认不通知全员）。
