@@ -449,36 +449,42 @@ def _new_competition(name: str, hours_from_now: int) -> int:
     return cid
 
 
-def test_competition_without_scope_notifies_all_groups(memory_db, monkeypatch):
+def test_competition_without_scope_notifies_all_groups(monkeypatch):
     from cdutetc import reminder
-
-    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"TRAIN", "FRESH"})
-    _new_competition("蓝桥杯", 5)
-    comps = database.list_competitions(status="confirmed")
-    from datetime import datetime
+    from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
 
-    items = reminder.build_general_reminders(
-        [], comps, datetime.now(ZoneInfo("Asia/Shanghai"))
-    )
+    now = datetime(2026, 11, 1, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
+    target = (now + timedelta(hours=5)).strftime("%Y-%m-%d %H:%M")
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"TRAIN", "FRESH"})
+    monkeypatch.setattr(config, "REMIND_OFFSET_HOURS", (24.0, 1.0))
+    monkeypatch.setattr(database, "get_competition_notify_groups", lambda cid: set())
+    monkeypatch.setattr(reminder, "get_competition_notify_groups", database.get_competition_notify_groups)
+    comps = [{"id": 1, "name": "蓝桥杯报名", "status": "confirmed",
+              "official_reg_deadline": target, "official_time": "", "official_site": ""}]
+    items = reminder.build_general_reminders([], comps, now)
     assert {item["group_id"] for item in items} == {"TRAIN", "FRESH"}
+    assert len(items) == 2
+    assert all(item["remind_type"] == "reg_deadline" for item in items)
 
 
-def test_competition_scope_limits_reminder_groups(memory_db, monkeypatch):
-    """周赛限定到集训队群后，新生群不应收到提醒。"""
+def test_competition_scope_limits_reminder_groups(monkeypatch):
+    """报名截止只发指定群；纯构造测试不读取共享数据库。"""
     from cdutetc import reminder
-    from datetime import datetime
+    from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
 
+    now = datetime(2026, 11, 1, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
+    target = (now + timedelta(hours=5)).strftime("%Y-%m-%d %H:%M")
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"TRAIN", "FRESH"})
-    cid = _new_competition("ACM 周赛（本周）", 5)
-    database.set_competition_notify_groups(cid, {"TRAIN"}, "admin")
-
-    items = reminder.build_general_reminders(
-        [], database.list_competitions(status="confirmed"),
-        datetime.now(ZoneInfo("Asia/Shanghai")),
-    )
+    monkeypatch.setattr(config, "REMIND_OFFSET_HOURS", (24.0, 1.0))
+    monkeypatch.setattr(database, "get_competition_notify_groups", lambda cid: {"TRAIN"})
+    monkeypatch.setattr(reminder, "get_competition_notify_groups", database.get_competition_notify_groups)
+    comps = [{"id": 1, "name": "校赛报名", "status": "confirmed",
+              "official_reg_deadline": target, "official_time": "", "official_site": ""}]
+    items = reminder.build_general_reminders([], comps, now)
     assert [item["group_id"] for item in items] == ["TRAIN"]
+    assert items[0]["remind_type"] == "reg_deadline"
 
 
 def test_scoped_competition_hidden_from_other_group_qa(memory_db, monkeypatch):
@@ -491,21 +497,21 @@ def test_scoped_competition_hidden_from_other_group_qa(memory_db, monkeypatch):
     assert database.list_question_contests("FRESH") == []
 
 
-def test_scope_pointing_to_unknown_group_sends_nothing(memory_db, monkeypatch):
-    """范围里全是未授权群时宁可不提醒，绝不退回全群广播。"""
+def test_scope_pointing_to_unknown_group_sends_nothing(monkeypatch):
+    """到期报名提醒范围全未授权时绝不退回全群广播。"""
     from cdutetc import reminder
-    from datetime import datetime
+    from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
 
+    now = datetime(2026, 11, 1, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
+    target = (now + timedelta(hours=5)).strftime("%Y-%m-%d %H:%M")
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"TRAIN", "FRESH"})
-    cid = _new_competition("ACM 周赛（本周）", 5)
-    database.set_competition_notify_groups(cid, {"GONE"}, "admin")
-
-    items = reminder.build_general_reminders(
-        [], database.list_competitions(status="confirmed"),
-        datetime.now(ZoneInfo("Asia/Shanghai")),
-    )
-    assert items == []
+    monkeypatch.setattr(config, "REMIND_OFFSET_HOURS", (24.0, 1.0))
+    monkeypatch.setattr(database, "get_competition_notify_groups", lambda cid: {"GONE"})
+    monkeypatch.setattr(reminder, "get_competition_notify_groups", database.get_competition_notify_groups)
+    comps = [{"id": 1, "name": "校赛报名", "status": "confirmed",
+              "official_reg_deadline": target, "official_time": "", "official_site": ""}]
+    assert reminder.build_general_reminders([], comps, now) == []
 
 
 def test_publish_scope_defaults_to_source_group(memory_db, monkeypatch):

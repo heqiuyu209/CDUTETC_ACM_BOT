@@ -211,39 +211,42 @@ class OneBotClient:
             self._pending.pop(echo, None)
             return None
 
-    async def send_group_msg(self, group_id: str, text: str) -> bool:
-        """向群发送文本消息；仅 OneBot 返回成功才确认。"""
+    async def send_group_msg_result(self, group_id: str, text: str, *,
+                                    reply_to: str | None = None, reply_seq: int = 1):
+        """Send group message and return normalized status; OneBot has no passive mode."""
+        from cdutetc.errors import result_from_onebot
+
         if not text:
-            return False
+            from cdutetc.errors import DeliveryCode, DeliveryMode, DeliveryResult
+            return DeliveryResult(False, DeliveryCode.EMPTY_MESSAGE, "onebot", DeliveryMode.ACTIVE)
+        connected = self._ws is not None
         resp = await self.call_api(
             "send_group_msg",
             group_id=int(group_id) if group_id.isdigit() else group_id,
             message=text,
         )
-        data = resp.get("data") if isinstance(resp, dict) else None
-        message_id = data.get("message_id") if isinstance(data, dict) else None
-        valid_message_id = (
-            isinstance(message_id, int) and not isinstance(message_id, bool) and message_id > 0
-        ) or (
-            isinstance(message_id, str) and bool(message_id.strip()) and message_id.strip() != "0"
-        )
-        if (not isinstance(resp, dict) or resp.get("status") != "ok"
-                or type(resp.get("retcode")) is not int or resp.get("retcode") != 0
-                or not valid_message_id):
-            logger.warning("群消息发送失败: %s", resp)
-            return False
-        return True
+        return result_from_onebot(resp, action="send_group_msg", connected=connected)
 
-    async def send_private_msg(self, user_id: str, text: str) -> bool:
-        """向用户发送私聊消息。"""
+    async def send_group_msg(self, group_id: str, text: str) -> bool:
+        """Backward-compatible bool wrapper."""
+        return bool(await self.send_group_msg_result(group_id, text))
+
+    async def send_private_msg_result(self, user_id: str, text: str, *,
+                                      reply_to: str | None = None, reply_seq: int = 1):
+        """Send private message and return normalized status."""
+        from cdutetc.errors import result_from_onebot
+
         if not text:
-            return False
+            from cdutetc.errors import DeliveryCode, DeliveryMode, DeliveryResult
+            return DeliveryResult(False, DeliveryCode.EMPTY_MESSAGE, "onebot", DeliveryMode.ACTIVE)
+        connected = self._ws is not None
         resp = await self.call_api(
             "send_private_msg",
             user_id=int(user_id) if user_id.isdigit() else user_id,
             message=text,
         )
-        if resp is None or resp.get("status") != "ok" or resp.get("retcode") not in (0, None):
-            logger.warning("私聊消息发送失败: %s", resp)
-            return False
-        return True
+        return result_from_onebot(resp, action="send_private_msg", connected=connected)
+
+    async def send_private_msg(self, user_id: str, text: str) -> bool:
+        """Backward-compatible bool wrapper."""
+        return bool(await self.send_private_msg_result(user_id, text))

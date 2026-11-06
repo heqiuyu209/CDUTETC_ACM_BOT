@@ -36,6 +36,22 @@
 
 后台更新使用 `/待审列表`、`/待审批准 <更新id>`、`/待审拒绝 <更新id> [原因]` 处理，仅超管可执行。批准合并已提取的有效字段，未包含或为空的字段保留当前值；首次发布仍免审。这三条命令只回复发起群，列表只列比赛及改动字段名，不发送提取正文、操作者或拒绝原因；需要清空可选字段时用 `/修正 字段=` 显式操作。
 
+## 自动开赛提醒与通知自检
+
+- 老师发布 → 超管同意后，比赛、来源群范围、未来开赛提醒计划在同一数据库事务保存；无需再手工设定时器。
+- 默认开赛前 **30 分钟、15 分钟**各一次，使用北京时间。专用任务每30秒检查持久化队列；不能承诺秒级精确或终端必达。
+- 审批时已经过去的节点不创建；改期时取消旧计划并创建新时间的未来节点；时间未定不排计划。停机恢复时只发送仍在120秒宽限内的节点，超过标记 expired，避免补刷过时消息。
+- `/提醒状态` 显示计划时间、目标时间、状态、尝试次数和错误码；关闭主动消息时暂停投递、不消耗重试次数。暂停超过宽限的节点不会在开启后追发。
+- 超管可用 `/通知测试 群 <群标识>` 或 `/通知测试 私聊 [用户标识]` 主动发送一条测试消息，再在当前会话收到含错误码的结果。群内省略参数默认测本群，私聊省略参数默认测自己；测试会真实发一条消息，不自动触发。
+
+发布、修正、超管确认、定时提醒、直接回复共用统一通知入口。应用错误包括 `[validation]`、`[permission]`、`[internal]`、`[fetch]`、`[llm]`；投递错误包括 `[not_connected]`、`[disabled]`、`[target_not_allowed]`、`[authentication]`、`[forbidden]`、`[rate_limited]`、`[timeout_unknown]` 等。未知平台错误保留为 `[unknown]`，不会猜测成“额度用完”。网络超时存在平台已收但本地未确认的可能，重试不能保证严格 exactly-once。
+
+### 双协议保持可切换
+
+`ACM_BOT_PROTOCOL=onebot` 使用 NapCat/OneBot；`qqbot` 使用 QQ 开放平台 botpy。配置协议后需重启，不会同时登录两个接入。两套身份标识不同：OneBot填QQ号/群号，官方填对应 openid，不能直接复用QQ号。
+
+官方被动回复只关联当前入站消息的 `msg_id`，同一消息的多条回复递增 `msg_seq`；定时和跨群通知不借用历史消息ID，不把被动发送失败悄悄改成主动重发。官方主动消息仍受平台权限、频控和配额限制，创建计划不等于平台允许投递。实际可用性请用通知测试确认。参见 [官方消息收发文档](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html)。
+
 ## 消息指令
 
 | 场景 | 示例 | 权限 | 行为 |
@@ -127,7 +143,10 @@ python scripts/export_collection.py --group-id '群openid' --collection-id 1 --o
 | `ACM_FETCH_CONCURRENCY` | 否 | `2` | 同时抓取上限 |
 | `ACM_FETCH_TEXT_LIMIT` | 否 | `3000` | 旧配置兼容保留；模型输入由 `ACM_LLM_MAX_INPUT_CHARS` 限制 |
 | `ACM_FETCH_MIN_INTERVAL_MINUTES` | 否 | `60` | 公共来源最小抓取间隔（分钟） |
-| `ACM_REMIND_CHECK_INTERVAL_MINUTES` | 否 | `30` | 提醒检查周期（分钟） |
+| `ACM_CONTEST_REMIND_OFFSETS_MINUTES` | 否 | `30,15` | 已确认公共比赛的开赛前提醒节点（分钟），发布/审批时持久化 |
+| `ACM_CONTEST_REMIND_CHECK_SECONDS` | 否 | `30` | 专用开赛提醒检查间隔（5–60秒） |
+| `ACM_CONTEST_REMIND_GRACE_SECONDS` | 否 | `120` | 节点宽限时间，超过后过期，不补刷 |
+| `ACM_REMIND_CHECK_INTERVAL_MINUTES` | 否 | `30` | 其他旧版提醒检查周期（分钟），不控制公共比赛开赛计划 |
 | `ACM_REMIND_BEFORE_HOURS` | 否 | `24` | 单节点回退值；未配 `ACM_REMIND_OFFSET_HOURS` 时生效 |
 | `ACM_REMIND_OFFSET_HOURS` | 否 | `24,1` | 多节点提前提醒（小时，逗号分隔，支持小数）。按周期扫描判定，不建独立定时器 |
 | `ACM_QA_TOPIC_GATE_ENABLED` | 否 | `1` | 话题范围硬限制，与 ACM 无关的问题不调模型 |

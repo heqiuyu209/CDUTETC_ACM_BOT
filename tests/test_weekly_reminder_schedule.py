@@ -13,6 +13,7 @@ from cdutetc import config
 from cdutetc import database
 from cdutetc import main
 from cdutetc import reminder
+from cdutetc.errors import DeliveryMode, DeliveryResult
 
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -33,6 +34,10 @@ def memory_db(monkeypatch):
     monkeypatch.setattr(config, "WEEKLY_CONTEST_START", "19:00")
     monkeypatch.setattr(config, "WEEKLY_CONTEST_END", "21:00")
     monkeypatch.setattr(config, "REMIND_BEFORE_HOURS", 24)
+    monkeypatch.setattr(config, "CONTEST_REMIND_OFFSETS_MINUTES", (30, 15))
+    monkeypatch.setattr(config, "CONTEST_REMIND_GRACE_SECONDS", 120)
+    monkeypatch.setattr(config, "CONTEST_REMIND_CHECK_SECONDS", 30)
+    monkeypatch.setattr(database, "_delivery_now", lambda value=None: value or datetime(2026, 10, 31, 18, 29, tzinfo=TZ))
     monkeypatch.setattr(config, "REMIND_CHECK_INTERVAL_MINUTES", 30)
     monkeypatch.setattr(reminder, "REMIND_BEFORE_HOURS", 24)
     yield conn
@@ -40,7 +45,9 @@ def memory_db(monkeypatch):
 
 
 def new_bot():
-    return main.ACMBot(SimpleNamespace(send_group_msg=AsyncMock(return_value=True)))
+    return main.ACMBot(SimpleNamespace(send_group_msg_result=AsyncMock(
+        return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
+    )))
 
 
 async def stop(bot):
@@ -64,33 +71,53 @@ async def test_actual_default_cron_generates_before_reminder_window(memory_db):
         sender = AsyncMock(return_value=True)
         assert await reminder.check_general_reminders(sender, now=generation_at) == 0
         window_opens = generation_at + timedelta(minutes=30)
-        assert await reminder.check_general_reminders(sender, now=window_opens) == 1
-        assert await reminder.check_general_reminders(sender, now=window_opens + timedelta(minutes=30)) == 0
-        sender.assert_awaited_once()
+        assert await reminder.check_general_reminders(sender, now=window_opens) == 0
+        sender.assert_not_awaited()
+        plans = memory_db.execute(
+            "SELECT scheduled_at, expires_at, group_id FROM reminder_deliveries"
+            " WHERE obj_type='competition' AND remind_type='contest_start' ORDER BY scheduled_at"
+        ).fetchall()
+        assert plans == [
+            ("2026-11-01 18:30:00", "2026-11-01 18:32:00", "123456"),
+            ("2026-11-01 18:45:00", "2026-11-01 18:47:00", "123456"),
+        ]
+        first_node = datetime(2026, 11, 1, 18, 30, tzinfo=TZ)
+        assert await reminder.check_contest_start_reminders(sender, now=first_node) == 1
+        assert await reminder.check_contest_start_reminders(sender, now=first_node + timedelta(seconds=30)) == 0
+        assert await reminder.check_contest_start_reminders(sender, now=first_node + timedelta(minutes=15)) == 1
+        assert sender.await_count == 2
+        assert all(call.args[0] == "123456" for call in sender.await_args_list)
     finally:
         await stop(bot)
 
 
-async def test_startup_inside_last_scan_period_creates_and_checks_immediately(memory_db, monkeypatch):
+async def test_startup_inside_last_scan_period_does_not_backfill_elapsed_nodes(memory_db, monkeypatch):
     now = datetime(2026, 11, 1, 18, 59, tzinfo=TZ)
+    monkeypatch.setattr(database, "_delivery_now", lambda value=None: value or now)
     async def check_at_startup(sender):
         return await reminder.check_general_reminders(sender, now=now)
+    async def check_contest_at_startup(sender):
+        return await reminder.check_contest_start_reminders(sender, now=now)
     monkeypatch.setattr(main, "check_reminders", AsyncMock(return_value=0))
     monkeypatch.setattr(main, "check_general_reminders", check_at_startup)
+    monkeypatch.setattr(main, "check_contest_start_reminders", check_contest_at_startup)
     bot = new_bot()
     restarted = new_bot()
     try:
         await bot._on_ready(now=now)
-        remind_job = bot.sched.get_job("remind-check")
+        remind_job = bot.sched.get_job("contest-remind-check")
         assert remind_job.next_run_time == now
-        assert remind_job.trigger.interval == timedelta(minutes=30)
+        assert remind_job.trigger.interval == timedelta(seconds=30)
         await remind_job.func()
-        bot.client.send_group_msg.assert_awaited_once()
-        assert "2026-11-01 19:00" in bot.client.send_group_msg.await_args.args[1]
+        await bot.sched.get_job("remind-check").func()
+        bot.client.send_group_msg_result.assert_not_awaited()
+        assert memory_db.execute(
+            "SELECT COUNT(*) FROM reminder_deliveries WHERE remind_type='contest_start'"
+        ).fetchone()[0] == 0
         await stop(bot)
         await restarted._on_ready(now=now)
-        await restarted.sched.get_job("remind-check").func()
-        restarted.client.send_group_msg.assert_not_awaited()
+        await restarted.sched.get_job("contest-remind-check").func()
+        restarted.client.send_group_msg_result.assert_not_awaited()
         assert len(database.list_competitions()) == 1
     finally:
         if bot.sched is not None and bot.sched.running:
@@ -139,7 +166,10 @@ async def test_repeated_ready_keeps_scheduler_and_week_record(memory_db):
         scheduler = bot.sched
         await bot._on_ready(now=now)
         assert bot.sched is scheduler
-        assert len(bot.sched.get_jobs()) == 3
+        assert {job.id for job in bot.sched.get_jobs()} == {
+            "remind-check", "contest-remind-check", "source-crawl", "weekly-contest",
+        }
+        assert len(bot.sched.get_jobs()) == 4
         assert len(database.list_competitions()) == 1
     finally:
         await stop(bot)

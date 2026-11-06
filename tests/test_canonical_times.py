@@ -72,40 +72,40 @@ def test_invalid_preexisting_deadline_is_retained_and_rejects_registration(db):
 
 
 async def test_amending_padding_keeps_success_history_but_changed_time_sends_once(db):
-    cid = database.create_competition({"name": "同一时刻", "official_time": RAW}, status="confirmed")
+    cid = database.create_competition({"name": "同一时刻", "official_reg_deadline": RAW}, status="confirmed")
     sender = AsyncMock(return_value=True)
     assert await reminder.check_general_reminders(sender, now=NOW) == 1
-    amended = await commands.handle_command(f"/修正 {cid} time={TARGET}", "g1", "admin")
+    amended = await commands.handle_command(f"/修正 {cid} reg_deadline={TARGET}", "g1", "admin")
     assert "已修正" in amended[0]["text"]
     assert await reminder.check_general_reminders(sender, now=NOW) == 0
     assert sender.await_count == 1
     assert len(database.list_deliveries("g1")) == 1
-    database.amend_competition(cid, {"official_time": "2026-11-01 10:00"})
+    database.amend_competition(cid, {"official_reg_deadline": "2026-11-01 10:00"})
     assert await reminder.check_general_reminders(sender, now=NOW) == 1
-    database.amend_competition(cid, {"official_time": RAW})
+    database.amend_competition(cid, {"official_reg_deadline": RAW})
     assert await reminder.check_general_reminders(sender, now=NOW) == 0
     assert sender.await_count == 2
 
 
 @pytest.mark.parametrize("old_status, has_receipt", [("sent", False), ("sending", True), ("cancelled", True)])
 async def test_migration_merges_equivalent_delivery_rows_and_retains_success(db, old_status, has_receipt):
-    cid = database.create_competition({"name": "旧比赛", "official_time": TARGET}, status="confirmed")
-    old_key = f"g1:competition:{cid}:contest_time:{RAW}"
-    key = database.delivery_dedup_key("g1", "competition", cid, "contest_time", TARGET)
+    cid = database.create_competition({"name": "旧比赛", "official_reg_deadline": TARGET}, status="confirmed")
+    old_key = f"g1:competition:{cid}:reg_deadline:{RAW}"
+    key = database.delivery_dedup_key("g1", "competition", cid, "reg_deadline", TARGET)
     with database._connect() as conn:
-        conn.execute("UPDATE competitions SET official_time = ? WHERE id = ?", (RAW, cid))
+        conn.execute("UPDATE competitions SET official_reg_deadline = ? WHERE id = ?", (RAW, cid))
         conn.execute("""INSERT INTO reminder_deliveries
             (group_id, obj_type, obj_id, remind_type, target_time, attempts, status, sent_at, dedup_key, lease_token)
-            VALUES ('g1', 'competition', ?, 'contest_time', ?, 1, ?, ?, ?, 'old-token')""",
+            VALUES ('g1', 'competition', ?, 'reg_deadline', ?, 1, ?, ?, ?, 'old-token')""",
                      (cid, RAW, old_status, "2026-11-01 08:00:00" if old_status == "sent" else "", old_key))
         conn.execute("""INSERT INTO reminder_deliveries
             (group_id, obj_type, obj_id, remind_type, target_time, attempts, dedup_key)
-            VALUES ('g1', 'competition', ?, 'contest_time', ?, 3, ?)""", (cid, TARGET, key))
+            VALUES ('g1', 'competition', ?, 'reg_deadline', ?, 3, ?)""", (cid, TARGET, key))
         if has_receipt:
             conn.execute("INSERT INTO reminder_success_receipts VALUES (?, 'old-token', '2026-11-01 08:00:00')", (old_key,))
     database.init_db()
     database.init_db()
-    assert database.get_competition(cid)["official_time"] == TARGET
+    assert database.get_competition(cid)["official_reg_deadline"] == TARGET
     row = database.get_delivery_by_key(old_key)
     assert (row["dedup_key"], row["target_time"], row["status"], row["attempts"]) == (key, TARGET, "sent", 3)
     assert row["sent_at"] == "2026-11-01 08:00:00"
@@ -121,8 +121,8 @@ async def test_migration_merges_equivalent_delivery_rows_and_retains_success(db,
 
 
 async def test_orphan_success_receipt_still_prevents_resend_after_normalization(db):
-    cid = database.create_competition({"name": "成功状态曾写库失败", "official_time": TARGET}, status="confirmed")
-    old_key = f"g1|competition|{cid}|contest_time|{RAW}"
+    cid = database.create_competition({"name": "成功状态曾写库失败", "official_reg_deadline": TARGET}, status="confirmed")
+    old_key = f"g1|competition|{cid}|reg_deadline|{RAW}"
     with database._connect() as conn:
         conn.execute("INSERT INTO reminder_success_receipts VALUES (?, 'old-token', '2026-11-01 08:00:00')", (old_key,))
     database.init_db()

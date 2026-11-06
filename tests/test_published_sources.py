@@ -14,6 +14,7 @@ from cdutetc import database
 from cdutetc import main
 from cdutetc.fetcher import FetchError
 from cdutetc.clients.onebot import OneBotMessage
+from cdutetc.errors import DeliveryMode, DeliveryResult
 
 
 URL = "https://contest.example.com/announcement"
@@ -66,7 +67,7 @@ async def bot(monkeypatch, db_file, onebot_client):
 
     async def send(group_id, content):
         state.sent.append((group_id, content))
-        return True
+        return DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent-id")
 
     async def fetch(url):
         state.fetched.append(url)
@@ -77,7 +78,7 @@ async def bot(monkeypatch, db_file, onebot_client):
         return dict(INFO), None
 
     monkeypatch.setattr(state.client, "_safe_reply", reply)
-    monkeypatch.setattr(state.client, "_send_group", send)
+    monkeypatch.setattr(state.client, "_send_group_result", send)
     monkeypatch.setattr(main, "fetch_text", fetch)
     monkeypatch.setattr(main, "extract_contest", extract)
     return state

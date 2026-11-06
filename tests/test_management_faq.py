@@ -13,6 +13,7 @@ from cdutetc import commands
 from cdutetc import config
 from cdutetc import database
 from cdutetc import main
+from cdutetc.errors import DeliveryMode, DeliveryResult
 from cdutetc import utils
 
 
@@ -46,11 +47,13 @@ def message(api, text, member, group="g1"):
 @pytest.mark.parametrize("member", ["admin", "teacher"])
 async def test_onebot_role_can_add_cancel_courses_and_add_delete_faq(db, monkeypatch, member):
     question_id = database.add_unanswered_question("g1", "怎么报名？", "student")
-    api = SimpleNamespace(send_group_msg=AsyncMock(return_value=True))
+    api = SimpleNamespace(send_group_msg_result=AsyncMock(
+        return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
+    ))
     client = main.ACMBot(api)
     await client.on_group_at_message_create(message(api, "/课程添加 算法课 周三 19:00-21:00 机房", member))
     course_id = database.list_training_sessions("g1")[0]["id"]
-    assert "已添加课程" in api.send_group_msg.await_args.args[1]
+    assert "已添加课程" in api.send_group_msg_result.await_args.args[1]
     await client.on_group_at_message_create(message(api, f"/课程取消 {course_id}", member))
     assert database.list_training_sessions("g1") == []
     await client.on_group_at_message_create(message(api, "/FAQ添加 怎么报名？ = 联系老师", member))
@@ -59,7 +62,7 @@ async def test_onebot_role_can_add_cancel_courses_and_add_delete_faq(db, monkeyp
     assert [(q["id"], q["faq_id"]) for q in answered] == [(question_id, faq_id)]
     await client.on_group_at_message_create(message(api, f"/FAQ删除 {faq_id}", member))
     assert database.list_faq("g1") == []
-    assert all(call.args[0] == "g1" for call in api.send_group_msg.await_args_list)
+    assert all(call.args[0] == "g1" for call in api.send_group_msg_result.await_args_list)
 
 
 def test_management_helper_preserves_distinct_roles_and_default_denial(db, monkeypatch):

@@ -13,6 +13,7 @@ import pytest
 from cdutetc import config
 from cdutetc import database
 from cdutetc import main
+from cdutetc.errors import DeliveryMode, DeliveryResult
 
 
 BEIJING = ZoneInfo("Asia/Shanghai")
@@ -34,7 +35,9 @@ async def bot(memory_db, monkeypatch):
     monkeypatch.setattr(config, "WEEKLY_CONTEST_START", "19:00")
     monkeypatch.setattr(config, "WEEKLY_CONTEST_END", "21:00")
     monkeypatch.setattr(config, "WEEKLY_CONTEST_TEMPLATE", "ACM 周赛（本周）")
-    client = main.ACMBot(SimpleNamespace(send_group_msg=AsyncMock(return_value=True)))
+    client = main.ACMBot(SimpleNamespace(send_group_msg_result=AsyncMock(
+        return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
+    )))
     monkeypatch.setattr(client, "_send_group", AsyncMock(return_value=False))
     return client
 
@@ -80,7 +83,9 @@ async def test_same_week_remains_idempotent_after_restart_and_amendment(bot, mem
     monkeypatch.setattr(config, "WEEKLY_CONTEST_END", "22:00")
 
     await bot._weekly_contest_job(now=_now())
-    restarted = main.ACMBot(SimpleNamespace(send_group_msg=AsyncMock(return_value=True)))
+    restarted = main.ACMBot(SimpleNamespace(send_group_msg_result=AsyncMock(
+        return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
+    )))
     await restarted._weekly_contest_job(now=_now())
 
     competitions = database.list_competitions()

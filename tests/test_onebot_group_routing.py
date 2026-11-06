@@ -11,6 +11,7 @@ from cdutetc import config
 from cdutetc import database
 from cdutetc import main
 from cdutetc.clients.onebot import OneBotMessage
+from cdutetc.errors import DeliveryMode, DeliveryResult
 from cdutetc.utils import mentioned_user_ids
 
 
@@ -34,8 +35,10 @@ def bot(monkeypatch):
     monkeypatch.setattr(config, "QA_WHITELIST", set())
     monkeypatch.setattr(config, "QA_BLACKLIST", set())
     monkeypatch.setattr(config, "QA_RATE_LIMIT_ENABLED", False)
-    client = SimpleNamespace(send_group_msg=AsyncMock(return_value=True),
-                             send_private_msg=AsyncMock(return_value=True))
+    client = SimpleNamespace(
+        send_group_msg_result=AsyncMock(return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")),
+        send_private_msg_result=AsyncMock(return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")),
+    )
     return main.ACMBot(client)
 
 
@@ -57,7 +60,7 @@ async def test_unaddressed_messages_have_no_side_effects(bot, monkeypatch, conte
     command.assert_not_awaited()
     question.assert_not_awaited()
     publish.assert_not_awaited()
-    bot.client.send_group_msg.assert_not_awaited()
+    bot.client.send_group_msg_result.assert_not_awaited()
 
 
 @pytest.mark.parametrize("content", ["[CQ:at,qq=111111] /帮助", "<@!111111> /帮助"])
@@ -66,7 +69,7 @@ async def test_addressed_explicit_commands_preserve_group_and_sender(bot, monkey
     monkeypatch.setattr(main.commands, "handle_command", command)
     await bot.on_group_at_message_create(message(content))
     command.assert_awaited_once_with("/帮助", "123456", "654321")
-    bot.client.send_group_msg.assert_awaited_once_with("123456", "帮助文本")
+    bot.client.send_group_msg_result.assert_awaited_once_with("123456", "帮助文本", reply_to="1")
 
 
 async def test_default_group_gate_rejects_unmentioned_explicit_command(bot, monkeypatch):
@@ -76,7 +79,7 @@ async def test_default_group_gate_rejects_unmentioned_explicit_command(bot, monk
     await bot.on_group_at_message_create(message("/帮助"))
 
     command.assert_not_awaited()
-    bot.client.send_group_msg.assert_not_awaited()
+    bot.client.send_group_msg_result.assert_not_awaited()
 
 
 async def test_disabled_group_gate_allows_unmentioned_explicit_command_with_reply(bot, monkeypatch):
@@ -87,7 +90,7 @@ async def test_disabled_group_gate_allows_unmentioned_explicit_command_with_repl
     await bot.on_group_at_message_create(message("/帮助"))
 
     command.assert_awaited_once_with("/帮助", "123456", "654321")
-    bot.client.send_group_msg.assert_awaited_once_with("123456", "帮助文本")
+    bot.client.send_group_msg_result.assert_awaited_once_with("123456", "帮助文本", reply_to="1")
 
 
 async def test_disabled_group_gate_does_not_allow_unmentioned_question(bot, monkeypatch):
@@ -98,7 +101,7 @@ async def test_disabled_group_gate_does_not_allow_unmentioned_question(bot, monk
     await bot.on_group_at_message_create(message("最近比赛是什么"))
 
     question.assert_not_awaited()
-    bot.client.send_group_msg.assert_not_awaited()
+    bot.client.send_group_msg_result.assert_not_awaited()
 
 
 async def test_question_handler_receives_staff_permission_keyword(bot, monkeypatch):
@@ -110,7 +113,7 @@ async def test_question_handler_receives_staff_permission_keyword(bot, monkeypat
     await bot.on_group_at_message_create(message("[CQ:at,qq=111111] 近期比赛是什么"))
 
     question.assert_awaited_once_with("近期比赛是什么", "123456", "654321", staff=True)
-    bot.client.send_group_msg.assert_awaited_once_with("123456", "答复")
+    bot.client.send_group_msg_result.assert_awaited_once_with("123456", "答复", reply_to="1")
 
 
 async def test_only_addressed_questions_reach_model_and_question_storage(bot, monkeypatch):
@@ -127,7 +130,7 @@ async def test_only_addressed_questions_reach_model_and_question_storage(bot, mo
         assert answer.await_args.args[0] == "近期比赛是什么"
         questions = database.list_unanswered("123456")
         assert [q["question"] for q in questions] == ["近期比赛是什么"]
-        assert bot.client.send_group_msg.await_count == 1
+        assert bot.client.send_group_msg_result.await_count == 1
     finally:
         conn.close()
 
@@ -172,10 +175,10 @@ async def test_unallowed_group_only_receives_optional_authorization_notice(
 
     command.assert_not_awaited()
     question.assert_not_awaited()
-    assert bot.client.send_group_msg.await_count == expected_calls
+    assert bot.client.send_group_msg_result.await_count == expected_calls
     if enabled:
-        assert bot.client.send_group_msg.await_args.args[0] == "345678"
-        assert "尚未授权" in bot.client.send_group_msg.await_args.args[1]
+        assert bot.client.send_group_msg_result.await_args.args[0] == "345678"
+        assert "尚未授权" in bot.client.send_group_msg_result.await_args.args[1]
 
 
 async def test_unmentioned_publish_keeps_teacher_permission_check(bot, monkeypatch):
@@ -184,8 +187,8 @@ async def test_unmentioned_publish_keeps_teacher_permission_check(bot, monkeypat
     monkeypatch.setattr(main, "fetch_text", fetch)
     await bot.on_group_at_message_create(message("发布 https://example.com/contest", user=999999))
     fetch.assert_not_awaited()
-    bot.client.send_group_msg.assert_awaited_once()
-    assert "没有发布" in bot.client.send_group_msg.await_args.args[1]
+    bot.client.send_group_msg_result.assert_awaited_once()
+    assert "没有发布" in bot.client.send_group_msg_result.await_args.args[1]
 
 
 async def test_publish_without_mention_routes_to_publish_handler(bot, monkeypatch):
@@ -204,7 +207,7 @@ async def test_command_cross_group_replies_still_use_target_group(bot, monkeypat
         {"group_id": "234567", "text": "目标群"},
     ]))
     await bot.on_group_at_message_create(message("/帮助"))
-    calls = [call.args for call in bot.client.send_group_msg.await_args_list]
+    calls = [call.args for call in bot.client.send_group_msg_result.await_args_list]
     assert ("234567", "目标群") in calls
     assert calls[-1][0] == "123456" and "群通知已发送" in calls[-1][1]
 

@@ -55,6 +55,10 @@ botpy.log
 .review-stub/
 .review-tmp/
 .old-verify/
+.test-deps*/
+.test-tmp*/
+.pytest-tmp*/
+.acl-recovery/
 
 # 系统文件
 .DS_Store

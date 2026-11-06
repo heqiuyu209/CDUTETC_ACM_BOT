@@ -7,6 +7,7 @@ import pytest
 
 from cdutetc import config, database, main
 from cdutetc.clients.onebot import OneBotMessage
+from cdutetc.errors import DeliveryCode, DeliveryMode, DeliveryResult
 
 
 @pytest.fixture
@@ -42,6 +43,10 @@ def _admin_command(text, member="admin-1"):
     })
 
 
+def _failure():
+    return DeliveryResult(False, DeliveryCode.NOT_CONNECTED, "onebot", DeliveryMode.ACTIVE)
+
+
 @pytest.mark.parametrize(
     ("command", "table", "identity_column", "identity"),
     [
@@ -53,10 +58,11 @@ async def test_management_add_notifies_super_admin_and_persists(
     management_bot, command, table, identity_column, identity,
 ):
     bot, group_replies, client = management_bot
+    client.send_private_msg_result = AsyncMock(return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent-id"))
     await bot.on_group_at_message_create(_admin_command(command))
 
-    client.send_private_msg.assert_awaited_once()
-    admin, text = client.send_private_msg.await_args.args
+    client.send_private_msg_result.assert_awaited_once()
+    admin, text = client.send_private_msg_result.await_args.args[:2]
     assert admin == "admin-1"
     assert "管理变更确认" in text
     assert "123456" in text
@@ -70,7 +76,7 @@ async def test_management_add_notifies_super_admin_and_persists(
 
 async def test_management_notification_failure_is_visible_without_rollback(management_bot):
     bot, group_replies, client = management_bot
-    client.send_private_msg = AsyncMock(return_value=False)
+    client.send_private_msg_result = AsyncMock(return_value=_failure())
 
     await bot.on_group_at_message_create(_admin_command("/加群 123456"))
 
@@ -83,9 +89,11 @@ async def test_management_notification_failure_is_visible_without_rollback(manag
 async def test_management_notification_partial_failure(management_bot, monkeypatch):
     bot, replies, client = management_bot
     monkeypatch.setattr(config, "SUPER_ADMIN", {"admin-1", "admin-2"})
-    client.send_private_msg = AsyncMock(side_effect=[True, RuntimeError("offline")])
+    client.send_private_msg_result = AsyncMock(side_effect=[
+        DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent-1"), _failure(),
+    ])
     await bot.on_group_at_message_create(_admin_command("/加老师 123456"))
-    assert client.send_private_msg.await_count == 2
+    assert client.send_private_msg_result.await_count == 2
     assert any("1/2" in reply for reply in replies)
     assert database._connect().execute(
         "SELECT 1 FROM runtime_teachers WHERE user_id = ?", ("123456",)
@@ -94,8 +102,9 @@ async def test_management_notification_partial_failure(management_bot, monkeypat
 
 async def test_unauthorized_management_does_not_notify(management_bot):
     bot, replies, client = management_bot
+    client.send_private_msg_result = AsyncMock(return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent-id"))
     await bot.on_group_at_message_create(_admin_command("/加群 123456", member="student"))
-    client.send_private_msg.assert_not_awaited()
+    client.send_private_msg_result.assert_not_awaited()
     assert any("仅超管" in reply for reply in replies)
 
 
@@ -104,7 +113,7 @@ async def test_publish_review_delivery_failure_is_reported_without_losing_reques
 ):
     bot, group_replies, client = management_bot
     monkeypatch.setattr(config, "PUBLISH_CONFIRM_ENABLED", True)
-    client.send_private_msg = AsyncMock(return_value=False)
+    client.send_private_msg_result = AsyncMock(return_value=_failure())
 
     async def no_fetch(url):
         raise AssertionError("test uses plain text and must not fetch")

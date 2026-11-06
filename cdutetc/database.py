@@ -320,6 +320,9 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries (
     dedup_key   TEXT NOT NULL DEFAULT '',
     lease_token TEXT NOT NULL DEFAULT '',
     lease_until TEXT NOT NULL DEFAULT '',
+    scheduled_at TEXT NOT NULL DEFAULT '',
+    expires_at  TEXT NOT NULL DEFAULT '',
+    error_code  TEXT NOT NULL DEFAULT '',
     UNIQUE (dedup_key)
 )
 """
@@ -725,8 +728,19 @@ def _row_to_competition(r: sqlite3.Row) -> dict:
     }
 
 
+def _set_competition_scope_on(conn: sqlite3.Connection, competition_id: int, group_ids) -> set[str]:
+    groups = {str(g).strip() for g in (group_ids or []) if str(g).strip()}
+    conn.execute("DELETE FROM competition_notify_groups WHERE competition_id = ?", (competition_id,))
+    for group_id in sorted(groups):
+        conn.execute(
+            "INSERT OR IGNORE INTO competition_notify_groups (competition_id, group_id) VALUES (?, ?)",
+            (competition_id, group_id),
+        )
+    return groups
+
+
 def _create_competition_on(conn: sqlite3.Connection, info: dict,
-                           status: str, operator: str) -> int:
+                           status: str, operator: str, notify_groups=None) -> int:
     """在给定连接上创建公共比赛（供 create_competition 与同事务调用方复用）。"""
     cleaned = _clean_competition_info(info)
     if status not in ("draft", "confirmed"):
@@ -748,6 +762,12 @@ def _create_competition_on(conn: sqlite3.Connection, info: dict,
     cid = cur.lastrowid
     _add_version(conn, cid, "draft" if status == "draft" else "confirmed",
                  cleaned, "创建", operator)
+    if status == "confirmed":
+        if notify_groups is not None:
+            groups = _set_competition_scope_on(conn, cid, notify_groups)
+            _sync_contest_start_reminders(conn, cid, groups or None)
+        else:
+            _sync_contest_start_reminders(conn, cid)
     return cid
 
 
@@ -778,7 +798,8 @@ def create_weekly_competition(week_start: str, info: dict) -> tuple[int, bool]:
         ).fetchone()
         if existing is not None:
             return existing[0], False
-        cid = _create_competition_on(conn, info, "confirmed", "weekly:auto")
+        weekly_groups = set(config.WEEKLY_CONTEST_GROUPS)
+        cid = _create_competition_on(conn, info, "confirmed", "weekly:auto", notify_groups=weekly_groups)
         conn.execute(
             "INSERT INTO weekly_contest_runs (week_start, competition_id, created_at)"
             " VALUES (?, ?, ?)",
@@ -825,6 +846,7 @@ def set_competition_notify_groups(competition_id: int, group_ids,
                 " (competition_id, group_id) VALUES (?, ?)",
                 (competition_id, gid),
             )
+        _sync_contest_start_reminders(conn, competition_id, groups or set(config.ALLOWED_GROUPS))
         add_audit(operator, "", "set_notify_groups", "competition",
                   str(competition_id), "", ",".join(sorted(groups)), conn=conn)
         return len(groups)
@@ -893,6 +915,11 @@ def update_competition(cid: int, info: dict, operator: str = "", note: str = "")
         ).fetchone()
         _add_version(conn, cid, "draft", _row_to_competition(cur_comp),
                      note or "编辑", operator)
+        if "official_time" in cleaned:
+            scoped = {r[0] for r in conn.execute(
+                "SELECT group_id FROM competition_notify_groups WHERE competition_id = ?", (cid,)
+            ).fetchall()}
+            _sync_contest_start_reminders(conn, cid, scoped or None)
         return True
 
 
@@ -910,6 +937,10 @@ def confirm_competition(cid: int, operator: str = "") -> bool:
             f"SELECT {_COMPETITION_COLS} FROM competitions WHERE id = ?", (cid,)
         ).fetchone()
         _add_version(conn, cid, "confirmed", _row_to_competition(row), "确认发布", operator)
+        scoped = {r[0] for r in conn.execute(
+            "SELECT group_id FROM competition_notify_groups WHERE competition_id = ?", (cid,)
+        ).fetchall()}
+        _sync_contest_start_reminders(conn, cid, scoped or None)
         return True
 
 
@@ -944,6 +975,10 @@ def set_competition_status(cid: int, status: str, operator: str = "",
         ).fetchone()
         _add_version(conn, cid, status, _row_to_competition(row),
                      note or f"状态切换为 {status}", operator)
+        scoped = {r[0] for r in conn.execute(
+            "SELECT group_id FROM competition_notify_groups WHERE competition_id = ?", (cid,)
+        ).fetchall()}
+        _sync_contest_start_reminders(conn, cid, scoped or None)
         return True
 
 
@@ -1218,7 +1253,8 @@ def _find_legacy_publication(conn: sqlite3.Connection, identity: str,
 
 
 def _create_confirmed_from_pending(info: dict, source_url: str, source_text: str,
-                                   operator: str) -> tuple[int, bool]:
+                                   operator: str, *, conn: sqlite3.Connection | None = None,
+                                   notify_groups=None) -> tuple[int, bool]:
     """无链接发布及超管确认落库：按「名称+届次+时间」原子去重。
 
     不要求 source_url，因此群消息转发与官网发布的同场比赛仍可判重；
@@ -1227,16 +1263,12 @@ def _create_confirmed_from_pending(info: dict, source_url: str, source_text: str
     if not isinstance(info, dict):
         raise ValueError("比赛信息必须是对象")
     cleaned = _clean_competition_info(info)
-    existing = find_duplicate_competition(cleaned)
-    if existing is not None:
-        return existing["id"], False
     source_url = _as_str(source_url)
-    with _connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        # 事务内二次确认，避免并发同意同一条申请造成重复入库。
-        rows = conn.execute(
-            f"SELECT {_COMPETITION_COLS} FROM competitions"
-            " WHERE status IN ('confirmed', 'draft')"
+
+    def create_on(active_conn: sqlite3.Connection) -> tuple[int, bool]:
+        # 事务内查重，避免并发同意同一条申请造成重复入库。
+        rows = active_conn.execute(
+            f"SELECT {_COMPETITION_COLS} FROM competitions WHERE status IN ('confirmed', 'draft')"
         ).fetchall()
         for row in rows:
             record = _row_to_competition(row)
@@ -1247,18 +1279,23 @@ def _create_confirmed_from_pending(info: dict, source_url: str, source_text: str
                     and str(record.get("official_time") or "").strip().lower()
                     == str(cleaned.get("official_time") or "").strip().lower()):
                 return record["id"], False
-        cid = _create_competition_on(conn, cleaned, "confirmed", operator)
+        cid = _create_competition_on(active_conn, cleaned, "confirmed", operator,
+                                     notify_groups=notify_groups)
         if source_url:
-            sid = add_competition_source(cid, source_url, conn=conn)
+            sid = add_competition_source(cid, source_url, conn=active_conn)
             body_hash = hashlib.sha256((source_text or "").encode("utf-8")).hexdigest()
-            update_source_fetch(
-                sid, body_hash=body_hash, last_status="confirmed", conn=conn,
-            )
+            update_source_fetch(sid, body_hash=body_hash, last_status="confirmed", conn=active_conn)
         return cid, True
+
+    if conn is not None:
+        return create_on(conn)
+    with _connect() as active_conn:
+        active_conn.execute("BEGIN IMMEDIATE")
+        return create_on(active_conn)
 
 
 def create_published_competition_once(info: dict, source_url: str, source_text: str,
-                                     operator: str = "") -> tuple[int, bool]:
+                                     operator: str = "", *, source_group_id: str = "") -> tuple[int, bool]:
     """原子发布，返回（比赛 id，是否新建）；重复不改资料或成功正文基线。
 
     持久发布身份独立于后续手工修正；写事务内完成查重、来源和版本创建。
@@ -1268,8 +1305,10 @@ def create_published_competition_once(info: dict, source_url: str, source_text: 
         raise ValueError("来源正文必须是字符串")
     if not isinstance(info, dict):
         raise ValueError("比赛信息必须是对象")
+    notify_groups = {source_group_id} if config.PUBLISH_SCOPE_TO_SOURCE and source_group_id else None
     if not source_url:
-        return _create_confirmed_from_pending(info, "", source_text, operator)
+        return _create_confirmed_from_pending(info, "", source_text, operator,
+                                               notify_groups=notify_groups)
     cleaned = _clean_competition_info({**info, "official_site": source_url})
     canonical_url = _canonical_publication_url(source_url)
     identity = _publication_identity(cleaned, canonical_url)
@@ -1289,7 +1328,8 @@ def create_published_competition_once(info: dict, source_url: str, source_text: 
                 " VALUES (?, ?, ?)", (identity, cid, now_str()),
             )
             return cid, False
-        cid = _create_competition_on(conn, cleaned, "confirmed", operator)
+        cid = _create_competition_on(conn, cleaned, "confirmed", operator,
+                                     notify_groups=notify_groups)
         sid = add_competition_source(cid, source_url, conn=conn)
         update_source_fetch(
             sid, body_hash=body_hash, last_status="confirmed", conn=conn,
@@ -1393,32 +1433,59 @@ def list_pending_publications(status: str = "pending") -> list[dict]:
 
 
 def approve_pending_publication(pid: int, operator: str = "") -> tuple[int, bool]:
-    """超管同意：原子地把申请转成正式比赛并标记已通过。
-
-    Returns:
-        (competition_id, created)：created=False 表示期间已存在相同记录，未重复创建。
-        申请不存在或非 pending 状态时抛 ValueError。
-    """
-    pending = get_pending_publication(pid)
-    if pending is None:
-        raise ValueError(f"发布申请 #{pid} 不存在")
-    if pending["status"] != "pending":
-        raise ValueError(f"发布申请 #{pid} 已是 {pending['status']} 状态")
-    info = json.loads(pending["fields_json"] or "{}")
-    cid, created = _create_confirmed_from_pending(
-        info,
-        source_url=pending["source_url"],
-        source_text=pending["source_text"],
-        operator=f"approve:{operator or pending['submitted_by']}",
-    )
+    """超管同意：原子创建正式比赛、群级提醒计划并提交申请状态。"""
     with _connect() as conn:
-        conn.execute(
-            "UPDATE pending_publications SET status = 'approved', decided_by = ?,"
-            " decided_at = ? WHERE id = ?", (_as_str(operator), now_str(), pid),
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            f"SELECT {_PENDING_PUB_COLS} FROM pending_publications WHERE id = ?", (pid,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"发布申请 #{pid} 不存在")
+        pending = _row_to_pending_publication(row)
+        if pending["status"] == "approved":
+            info = json.loads(pending["fields_json"] or "{}")
+            cleaned = _clean_competition_info(info)
+            found = conn.execute(
+                "SELECT id FROM competitions WHERE lower(name) = lower(?)"
+                " AND lower(edition) = lower(?) AND lower(official_time) = lower(?)"
+                " ORDER BY id LIMIT 1",
+                (cleaned["name"], cleaned["edition"], cleaned["official_time"]),
+            ).fetchone()
+            if found:
+                return found[0], False
+            raise ValueError(f"已批准申请 #{pid} 对应比赛记录不存在")
+        if pending["status"] != "pending":
+            raise ValueError(f"发布申请 #{pid} 已是 {pending['status']} 状态")
+        info = json.loads(pending["fields_json"] or "{}")
+        pending_groups = (
+            {pending["group_id"]}
+            if config.PUBLISH_SCOPE_TO_SOURCE and pending["group_id"] else set()
         )
+        cid, created = _create_confirmed_from_pending(
+            info, pending["source_url"], pending["source_text"],
+            operator=f"approve:{operator or pending['submitted_by']}",
+            conn=conn, notify_groups=pending_groups,
+        )
+        if not created:
+            existing_groups = {r[0] for r in conn.execute(
+                "SELECT group_id FROM competition_notify_groups WHERE competition_id = ?", (cid,)
+            ).fetchall()}
+            if config.PUBLISH_SCOPE_TO_SOURCE and pending["group_id"]:
+                pending_groups = existing_groups | {pending["group_id"]}
+            else:
+                pending_groups = set()
+            groups = _set_competition_scope_on(conn, cid, pending_groups)
+            _sync_contest_start_reminders(conn, cid, groups or None)
+        cur = conn.execute(
+            "UPDATE pending_publications SET status = 'approved', decided_by = ?, decided_at = ?"
+            " WHERE id = ? AND status = 'pending'",
+            (_as_str(operator), now_str(), pid),
+        )
+        if cur.rowcount != 1:
+            raise ValueError(f"发布申请 #{pid} 状态已变化")
         add_audit(operator, pending["group_id"], "approve_publication",
                   "pending_publication", str(pid), "", f"competition:{cid}", conn=conn)
-    return cid, created
+        return cid, created
 
 
 def reject_pending_publication(pid: int, operator: str = "", note: str = "") -> bool:
@@ -2208,16 +2275,112 @@ def amend_competition(cid: int, info: dict, operator: str = "", note: str = "", 
         )
         add_audit(operator, "", "amend", "competition", str(cid),
                   "", json.dumps(cleaned, ensure_ascii=False), conn=conn)
+        if "official_time" in cleaned:
+            scoped = {r[0] for r in conn.execute(
+                "SELECT group_id FROM competition_notify_groups WHERE competition_id = ?", (cid,)
+            ).fetchall()}
+            _sync_contest_start_reminders(conn, cid, scoped or None)
         return True
+
+
+def _sync_contest_start_reminders(conn: sqlite3.Connection, competition_id: int,
+                                  group_ids=None, *, now: datetime | None = None) -> None:
+    """在业务写事务中同步比赛开赛前节点；过去节点不创建、不补发。"""
+    row = conn.execute(
+        "SELECT status, official_time FROM competitions WHERE id = ?", (competition_id,)
+    ).fetchone()
+    if row is None:
+        return
+    offsets = tuple(getattr(config, "CONTEST_REMIND_OFFSETS_MINUTES", (30, 15)))
+    try:
+        grace_seconds = max(1, int(getattr(config, "CONTEST_REMIND_GRACE_SECONDS", 120)))
+    except (TypeError, ValueError):
+        grace_seconds = 120
+    target = _delivery_parse_time(row[1] or "")
+    groups = {str(g).strip() for g in (group_ids or []) if str(g).strip()}
+    if group_ids is None:
+        groups = set(config.ALLOWED_GROUPS)
+    if row[0] != "confirmed" or target is None:
+        groups = set()
+    current = _delivery_now(now)
+    desired: set[str] = set()
+    if target is not None and row[0] == "confirmed":
+        for group_id in sorted(groups):
+            for raw_offset in offsets:
+                try:
+                    minutes = int(raw_offset)
+                except (TypeError, ValueError):
+                    continue
+                if minutes <= 0:
+                    continue
+                scheduled = target - timedelta(minutes=minutes)
+                expires = scheduled + timedelta(seconds=grace_seconds)
+                key = delivery_dedup_key(
+                    group_id, "competition", competition_id, "contest_start",
+                    row[1], minutes / 60,
+                )
+                # Existing in-grace deliveries remain desired, but never create a late plan.
+                existing = conn.execute(
+                    "SELECT id, status, attempts FROM reminder_deliveries WHERE dedup_key = ?", (key,)
+                ).fetchone()
+                if expires >= current:
+                    desired.add(key)
+                if scheduled > current and existing is None:
+                    conn.execute(
+                        "INSERT INTO reminder_deliveries"
+                        " (group_id, obj_type, obj_id, remind_type, target_time, status, dedup_key, scheduled_at, expires_at)"
+                        " VALUES (?, 'competition', ?, 'contest_start', ?, 'pending', ?, ?, ?)",
+                        (group_id, competition_id, _canonical_time(row[1]), key,
+                         scheduled.strftime("%Y-%m-%d %H:%M:%S"), expires.strftime("%Y-%m-%d %H:%M:%S")),
+                    )
+                elif (scheduled > current and existing is not None
+                      and existing[1] == "cancelled" and existing[2] == 0
+                      and not conn.execute(
+                          "SELECT 1 FROM reminder_success_receipts WHERE dedup_key = ?", (key,)
+                      ).fetchone()):
+                    conn.execute(
+                        "UPDATE reminder_deliveries SET status='pending', last_error='', error_code=''"
+                        " WHERE id=? AND status='cancelled' AND attempts=0", (existing[0],)
+                    )
+    old = conn.execute(
+        "SELECT id, dedup_key, status FROM reminder_deliveries"
+        " WHERE obj_type = 'competition' AND obj_id = ? AND remind_type = 'contest_start'"
+        " AND status IN ('pending', 'sending')", (competition_id,),
+    ).fetchall()
+    for delivery_id, key, status in old:
+        if key not in desired:
+            conn.execute(
+                "UPDATE reminder_deliveries SET status = 'cancelled', lease_token = '', lease_until = ''"
+                " WHERE id = ?", (delivery_id,),
+            )
+
+
+def list_due_contest_start_deliveries(now: datetime, allowed_groups: set[str]) -> list[dict]:
+    """列出到期且仍在宽限期的持久比赛开赛提醒；不创建迟到节点。"""
+    current = _delivery_now(now).strftime("%Y-%m-%d %H:%M:%S")
+    groups = sorted(allowed_groups)
+    if not groups:
+        return []
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_DELIVERY_COLS} FROM reminder_deliveries"
+            " WHERE obj_type = 'competition' AND remind_type = 'contest_start'"
+            " AND status IN ('pending', 'sending') AND scheduled_at <= ? AND expires_at >= ?"
+            f" AND group_id IN ({','.join('?' for _ in groups)}) ORDER BY scheduled_at, id",
+            [current, current, *groups],
+        ).fetchall()
+    return [_row_to_delivery(r) for r in rows]
 
 
 # =====================================================================
 # 通用提醒投递（reminder_deliveries）
 # =====================================================================
+# =====================================================================
 
 _DELIVERY_COLS = (
     "id, group_id, obj_type, obj_id, remind_type, target_time, attempts,"
-    " status, sent_at, last_error, dedup_key, lease_token, lease_until"
+    " status, sent_at, last_error, dedup_key, lease_token, lease_until,"
+    " scheduled_at, expires_at, error_code"
 )
 
 
@@ -2227,6 +2390,9 @@ def _row_to_delivery(r: sqlite3.Row) -> dict:
         "remind_type": r[4], "target_time": r[5], "attempts": r[6],
         "status": r[7], "sent_at": r[8], "last_error": r[9], "dedup_key": r[10],
         "lease_token": r[11], "lease_until": r[12],
+        "scheduled_at": r[13] if len(r) > 13 else "",
+        "expires_at": r[14] if len(r) > 14 else "",
+        "error_code": r[15] if len(r) > 15 else "",
     }
 
 
@@ -2260,7 +2426,7 @@ def _migrate_reminder_deliveries(conn: sqlite3.Connection) -> None:
     if not conn.in_transaction:
         conn.execute("BEGIN IMMEDIATE")
     cols = {r[1] for r in conn.execute("PRAGMA table_info(reminder_deliveries)")}
-    for column in ("lease_token", "lease_until"):
+    for column in ("lease_token", "lease_until", "scheduled_at", "expires_at", "error_code"):
         if column not in cols:
             conn.execute(f"ALTER TABLE reminder_deliveries ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
     # 成功事实保留原始记录，并为旧时间格式补规范身份；状态投影失败的成功也不能重发。
@@ -2308,6 +2474,8 @@ def _migrate_reminder_deliveries(conn: sqlite3.Connection) -> None:
         f" THEN CAST({offset_expr} AS REAL) ELSE '' END)"
     )
     # 成功事实独立提交；状态投影写入失败时，查询仍显示已发送并保留去重。
+    # Recreate the projection view so existing installations expose migrated columns.
+    conn.execute("DROP VIEW IF EXISTS reminder_delivery_states")
     conn.execute("""CREATE VIEW IF NOT EXISTS reminder_delivery_states AS
         SELECT d.id, d.group_id, d.obj_type, d.obj_id, d.remind_type,
                d.target_time, d.attempts,
@@ -2316,7 +2484,9 @@ def _migrate_reminder_deliveries(conn: sqlite3.Connection) -> None:
                CASE WHEN r.dedup_key IS NOT NULL THEN '' ELSE d.last_error END AS last_error,
                d.dedup_key,
                CASE WHEN r.dedup_key IS NOT NULL THEN '' ELSE d.lease_token END AS lease_token,
-               CASE WHEN r.dedup_key IS NOT NULL THEN '' ELSE d.lease_until END AS lease_until
+               CASE WHEN r.dedup_key IS NOT NULL THEN '' ELSE d.lease_until END AS lease_until,
+                d.scheduled_at, d.expires_at,
+                CASE WHEN r.dedup_key IS NOT NULL THEN '' ELSE d.error_code END AS error_code
         FROM reminder_deliveries d
         LEFT JOIN reminder_success_receipts r ON r.dedup_key = d.dedup_key
     """)
@@ -2352,11 +2522,23 @@ def _delivery_invalid_status(conn: sqlite3.Connection, delivery: dict,
         if row is None or row[0] != delivery["group_id"] or row[1] != "open" or _canonical_time(row[2]) != delivery["target_time"]:
             return "cancelled"
     elif delivery["obj_type"] == "competition":
-        field = {"reg_deadline": "official_reg_deadline", "contest_time": "official_time"}.get(delivery["remind_type"])
+        if delivery["remind_type"] == "contest_time":
+            return "cancelled"  # 新版只由 contest_start 的30/15分钟计划负责开赛。
+        field = {
+            "reg_deadline": "official_reg_deadline",
+            "contest_time": "official_time",
+            "contest_start": "official_time",
+        }.get(delivery["remind_type"])
         if field is None:
             return "cancelled"
         row = conn.execute(f"SELECT status, {field} FROM competitions WHERE id = ?", (delivery["obj_id"],)).fetchone()
         if row is None or row[0] != "confirmed" or _canonical_time(row[1]) != delivery["target_time"]:
+            return "cancelled"
+        scoped = {r[0] for r in conn.execute(
+            "SELECT group_id FROM competition_notify_groups WHERE competition_id = ?",
+            (delivery["obj_id"],),
+        ).fetchall()}
+        if scoped and delivery["group_id"] not in scoped:
             return "cancelled"
     elif delivery["obj_type"] == "training_session":
         if delivery["remind_type"] != "start_time" or not delivery["group_id"]:
@@ -2373,6 +2555,14 @@ def _delivery_invalid_status(conn: sqlite3.Connection, delivery: dict,
     target = _delivery_parse_time(delivery["target_time"])
     if target is None:
         return "cancelled"
+    if delivery["remind_type"] == "contest_start":
+        scheduled = _delivery_parse_time(delivery.get("scheduled_at") or "")
+        expires = _delivery_parse_time(delivery.get("expires_at") or "")
+        if scheduled is None or expires is None:
+            return "cancelled"
+        if now < scheduled:
+            return None
+        return "expired" if now > expires else None
     return "expired" if target <= now else None
 
 
@@ -2390,6 +2580,8 @@ def reconcile_deliveries(now: datetime | None = None, *, max_attempts: int = 3,
         ).fetchall()
         for row in rows:
             delivery = _row_to_delivery(row)
+            if delivery["remind_type"] == "contest_start" and delivery["status"] == "cancelled":
+                continue
             # 在途发送仍有写回权；对象关闭/改期只能阻止尚未发送的计划。
             if delivery["status"] == "sending":
                 until = _delivery_parse_time(delivery["lease_until"])
@@ -2446,6 +2638,10 @@ def claim_delivery(group_id: str, obj_type: str, obj_id: int, remind_type: str,
         )
         row = conn.execute(f"SELECT {_DELIVERY_COLS} FROM reminder_deliveries WHERE dedup_key = ?", (key,)).fetchone()
         delivery = _row_to_delivery(row)
+        if remind_type == "contest_start":
+            scheduled = _delivery_parse_time(delivery.get("scheduled_at") or "")
+            if scheduled is None or now < scheduled or delivery["status"] == "cancelled":
+                return None
         if delivery["status"] == "sent" or conn.execute(
             "SELECT 1 FROM reminder_success_receipts WHERE dedup_key = ?", (key,)
         ).fetchone():
@@ -2523,7 +2719,7 @@ def record_delivery_success(dedup_key: str, token: str, *, now: datetime | None 
 
 
 def finish_delivery(dedup_key: str, token: str, ok: bool, *, error: str = "",
-                    now: datetime | None = None, max_attempts: int = 3) -> bool:
+                    error_code: str = "", now: datetime | None = None, max_attempts: int = 3) -> bool:
     """成功事实先独立提交；状态更新异常不撤销成功，也不会导致租约过期重发。"""
     key = _canonical_delivery_key(dedup_key)
     now_text = _delivery_now(now).strftime("%Y-%m-%d %H:%M:%S")
@@ -2533,9 +2729,11 @@ def finish_delivery(dedup_key: str, token: str, ok: bool, *, error: str = "",
         with _connect() as conn:
             cur = conn.execute(
                 "UPDATE reminder_deliveries SET status = CASE WHEN ? THEN 'sent' WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,"
-                " sent_at = CASE WHEN ? THEN ? ELSE sent_at END, last_error = ?, lease_token = '', lease_until = ''"
+                " sent_at = CASE WHEN ? THEN ? ELSE sent_at END, last_error = ?, error_code = ?,"
+                " lease_token = '', lease_until = ''"
                 " WHERE dedup_key = ? AND status = 'sending' AND lease_token = ?",
-                (ok, max_attempts, ok, now_text, "" if ok else (error or "发送失败"), key, token),
+                (ok, max_attempts, ok, now_text, "" if ok else (error or "发送失败"),
+                 "" if ok else (error_code or "send_failed"), key, token),
             )
             return ok or cur.rowcount > 0
     except sqlite3.Error:
@@ -2925,6 +3123,11 @@ def apply_pending_update(update_id: int, operator: str = "") -> bool:
                      pending["change_note"] or "待审更新通过", operator)
         add_audit(operator, "", "apply_pending_update", "competition",
                   str(comp_id), "", pending["change_note"] or "", conn=conn)
+        if "official_time" in cleaned:
+            scoped = {r[0] for r in conn.execute(
+                "SELECT group_id FROM competition_notify_groups WHERE competition_id = ?", (comp_id,)
+            ).fetchall()}
+            _sync_contest_start_reminders(conn, comp_id, scoped or None)
         return True
 
 

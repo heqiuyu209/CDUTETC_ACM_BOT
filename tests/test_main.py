@@ -297,7 +297,9 @@ async def test_private_event_replies_to_the_onebot_qq_identity(bot, onebot_clien
         "post_type": "message", "message_type": "private", "user_id": 20001,
         "raw_message": "你好", "message_id": 12345,
     }))
-    onebot_client.send_private_msg.assert_awaited_once_with("20001", "收到（20001）")
+    onebot_client.call_api.assert_awaited_once_with(
+        "send_private_msg", user_id=20001, message="收到（20001）",
+    )
 
 
 def test_run_bot_checks_config_then_constructs_and_starts_onebot(monkeypatch, onebot_client):

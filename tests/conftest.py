@@ -20,6 +20,7 @@ def onebot_client():
             self.call_api = AsyncMock(return_value={
                 "status": "ok", "retcode": 0, "data": {"message_id": 12345},
             })
+            self._ws = object()
             self.send_private_msg = AsyncMock(return_value=True)
             self.start = AsyncMock()
 

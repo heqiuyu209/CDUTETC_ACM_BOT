@@ -10,7 +10,6 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
-
 import pytest
 
 from cdutetc import commands
@@ -18,6 +17,7 @@ from cdutetc import config
 from cdutetc import database
 from cdutetc import main
 from cdutetc import reminder
+from cdutetc.errors import DeliveryMode, DeliveryResult
 
 TZ = ZoneInfo("Asia/Shanghai")
 NOW = datetime(2026, 11, 1, 18, 59, tzinfo=TZ)
@@ -51,14 +51,16 @@ async def test_course_command_enters_actual_main_reminder_job(db, monkeypatch):
         def now(cls, tz=None):
             return NOW
     monkeypatch.setattr(reminder, "datetime", Clock)
-    client = SimpleNamespace(send_group_msg=AsyncMock(return_value=True))
+    client = SimpleNamespace(send_group_msg_result=AsyncMock(
+        return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
+    ))
     bot = main.ACMBot(client)
     await bot._remind_job()
-    client.send_group_msg.assert_awaited_once()
-    group, text = client.send_group_msg.await_args.args
+    client.send_group_msg_result.assert_awaited_once()
+    group, text = client.send_group_msg_result.await_args.args
     assert group == "123456" and TARGET in text and "B201" in text
     await bot._remind_job()
-    assert client.send_group_msg.await_count == 1
+    assert client.send_group_msg_result.await_count == 1
 
 
 async def test_next_week_has_new_identity_but_same_week_and_restart_are_deduplicated(db):
@@ -233,7 +235,9 @@ async def test_concurrent_training_scans_deliver_one_instance(db):
 async def test_unknown_or_past_schedule_does_not_block_healthy_competition(db):
     training(weekday="下周")
     training(start_time="18:00")
-    database.create_competition({"name": "健康比赛", "official_time": TARGET}, status="confirmed")
+    database.create_competition({"name": "健康比赛", "official_reg_deadline": TARGET}, status="confirmed")
     sender = AsyncMock(return_value=True)
     assert await reminder.check_general_reminders(sender, now=NOW) == 2
     assert all("健康比赛" in call.args[1] for call in sender.await_args_list)
+    assert all(row["remind_type"] == "reg_deadline"
+               for gid in config.ALLOWED_GROUPS for row in database.list_deliveries(gid))

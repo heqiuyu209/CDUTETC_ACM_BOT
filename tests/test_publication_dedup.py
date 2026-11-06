@@ -14,6 +14,7 @@ from cdutetc import crawler
 from cdutetc import config
 from cdutetc import database
 from cdutetc import llm
+from cdutetc.errors import DeliveryMode, DeliveryResult
 from cdutetc import main
 from cdutetc.contest_fields import map_competition_info
 from cdutetc.llm import validate_contest_info
@@ -332,7 +333,9 @@ async def test_onebot_publish_twice_preserves_fields_without_second_notification
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2", "g3"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
     monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
-    onebot = SimpleNamespace(send_group_msg=AsyncMock(return_value=True))
+    onebot = SimpleNamespace(send_group_msg_result=AsyncMock(
+        return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
+    ))
     bot = main.ACMBot(onebot)
     extracted = {
         "name": "完整校赛", "edition": "2026", "reg_start": "2026-11-01 08:00",
@@ -363,7 +366,7 @@ async def test_onebot_publish_twice_preserves_fields_without_second_notification
     }
     for field, value in expected.items():
         assert record[field] == value
-    first_calls = list(onebot.send_group_msg.await_args_list)
+    first_calls = list(onebot.send_group_msg_result.await_args_list)
     notices = [call.args for call in first_calls if "【新比赛发布】" in call.args[1]]
     assert [group for group, content in notices] == ["g1"]
     assert all(expected["official_reg_deadline"] in content and expected["official_time"] in content
@@ -373,5 +376,5 @@ async def test_onebot_publish_twice_preserves_fields_without_second_notification
     await bot.on_group_at_message_create(message("second"))
     assert database.list_competitions(status="confirmed") == [record]
     assert counts(db_file[0]) == (1, 1, 1, 1)
-    added = onebot.send_group_msg.await_args_list[len(first_calls):]
+    added = onebot.send_group_msg_result.await_args_list[len(first_calls):]
     assert len(added) == 1 and added[0].args[0] == "g1" and "未重复发布" in added[0].args[1]

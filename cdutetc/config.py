@@ -310,6 +310,17 @@ LLM_CONCURRENCY = int(os.getenv("ACM_LLM_CONCURRENCY", "2"))              # 模�
 # ================= 定时提醒 =================
 TZ_NAME = "Asia/Shanghai"
 REMIND_CHECK_INTERVAL_MINUTES = int(os.getenv("ACM_REMIND_CHECK_INTERVAL_MINUTES", "30"))
+# 开赛计划独立于旧版提前小时数，批准时即持久化；扫描间隔不会被旧30分钟配置拖慢。
+CONTEST_REMIND_OFFSETS_MINUTES = tuple(sorted({
+    int(x.strip()) for x in os.getenv("ACM_CONTEST_REMIND_OFFSETS_MINUTES", "30,15").split(",")
+    if x.strip()
+}, reverse=True))
+CONTEST_REMIND_CHECK_SECONDS = int(os.getenv("ACM_CONTEST_REMIND_CHECK_SECONDS", "30"))
+CONTEST_REMIND_GRACE_SECONDS = int(os.getenv("ACM_CONTEST_REMIND_GRACE_SECONDS", "120"))
+if (not CONTEST_REMIND_OFFSETS_MINUTES or any(x <= 0 for x in CONTEST_REMIND_OFFSETS_MINUTES)
+        or not 5 <= CONTEST_REMIND_CHECK_SECONDS <= 60
+        or not CONTEST_REMIND_CHECK_SECONDS <= CONTEST_REMIND_GRACE_SECONDS <= 600):
+    raise RuntimeError("开赛提醒节点须为正分钟数，检查间隔须为5–60秒，宽限须介于检查间隔与600秒之间")
 REMIND_BEFORE_HOURS = int(os.getenv("ACM_REMIND_BEFORE_HOURS", "24"))
 REMIND_TYPES = ("reg_deadline", "contest_time")
 # 多节点提前提醒（小时，逗号分隔，支持小数）。例：24,1,0.167 表示

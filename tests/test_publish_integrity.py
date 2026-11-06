@@ -11,6 +11,7 @@ from cdutetc import commands
 from cdutetc import config
 from cdutetc import database as db
 from cdutetc import main
+from cdutetc.errors import DeliveryMode, DeliveryResult
 from cdutetc.utils import match_publish_command
 
 
@@ -34,7 +35,9 @@ async def test_question_does_not_publish_or_fetch(monkeypatch, text):
     monkeypatch.setattr(main, "fetch_text", fetch)
     monkeypatch.setattr(main, "extract_contest", extract)
     monkeypatch.setattr(commands, "handle_non_command_message", question_handler)
-    client = main.ACMBot(SimpleNamespace(send_group_msg=AsyncMock(return_value=True)))
+    client = main.ACMBot(SimpleNamespace(send_group_msg_result=AsyncMock(
+        return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
+    )))
     message = OneBotMessage({
         "message_id": 1, "raw_message": f"[CQ:at,qq=30001] {text}", "group_id": "g1",
         "message_type": "group", "user_id": "teacher", "self_id": 30001,
@@ -83,7 +86,9 @@ async def test_onebot_explicit_url_publication_keeps_documented_syntax(monkeypat
     extract = AsyncMock(return_value=({"name": "校赛"}, None))
     monkeypatch.setattr(main, "fetch_text", fetch)
     monkeypatch.setattr(main, "extract_contest", extract)
-    client = main.ACMBot(SimpleNamespace(send_group_msg=AsyncMock(return_value=True)))
+    client = main.ACMBot(SimpleNamespace(send_group_msg_result=AsyncMock(
+        return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
+    )))
     message = OneBotMessage({
         "message_id": 1, "raw_message": f"[CQ:at,qq=30001] 发布{separator}https://contest.example.com", "group_id": "g1",
         "message_type": "group", "user_id": "teacher", "self_id": 30001,

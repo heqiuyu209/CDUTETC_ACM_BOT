@@ -133,7 +133,7 @@ async def test_permission_is_checked_before_parser_or_database(competition, monk
     monkeypatch.setattr(commands, "_parse_amend_fields", forbidden)
     monkeypatch.setattr(database, "get_competition", forbidden)
     replies = await commands.handle_command('/修正 1 name="坏引号', "g1", "member")
-    assert replies == [{"group_id": "g1", "text": "仅超管可修正比赛信息"}]
+    assert replies == [{"group_id": "g1", "text": "仅超管可修正比赛信息 [permission]", "error_code": "permission"}]
 
 
 async def test_refetch_still_routes_before_field_parser(competition, monkeypatch):

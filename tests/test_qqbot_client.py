@@ -58,47 +58,89 @@ def test_send_without_connection_returns_false():
     assert asyncio.run(client.send_private_msg("u", "hi")) is False
 
 
-def test_send_group_uses_msg_id_for_passive_reply():
-    """群内收到过消息时应带 msg_id 做被动回复，避免消耗主动配额。"""
+def test_send_group_is_active_without_explicit_reply_even_after_inbound_message():
+    """最近收到的 msg_id 不得污染定时主动提醒。"""
     client = QQBotClient("appid", "secret")
     captured = {}
 
     class _Api:
         async def post_group_message(self, **params):
             captured.update(params)
-            return {"id": "x"}
+            return {"id": "SENT1"}
 
     client._client = SimpleNamespace(api=_Api())
-    client._last_msg_id["g1"] = "MSG1"
-
+    # Active send stays independent of any previously received message.
     import asyncio
 
-    assert asyncio.run(client.send_group_msg("g1", "hi")) is True
-    assert captured["group_openid"] == "g1"
-    assert captured["msg_id"] == "MSG1"
-    assert captured["content"] == "hi"
+    result = asyncio.run(client.send_group_msg_result("g1", "提醒"))
+    assert result and result.mode.value == "active"
+    assert result.message_id == "SENT1"
+    assert "msg_id" not in captured
 
 
-def test_send_group_retries_without_msg_id_on_typeerror():
-    """某些 botpy 版本不接受 msg_id，应退化重试一次而不是直接失败。"""
+def test_passive_reply_requires_explicit_message_id():
+    client = QQBotClient("appid", "secret")
+    captured = {}
+
+    class _Api:
+        async def post_group_message(self, **params):
+            captured.update(params)
+            return SimpleNamespace(id="SENT2")
+
+    client._client = SimpleNamespace(api=_Api())
+    # Passive context is explicit, never inferred from received message history.
+    import asyncio
+
+    result = asyncio.run(client.send_group_msg_result("g1", "reply", reply_to="EXPLICIT"))
+    assert result and result.mode.value == "passive"
+    assert captured["msg_id"] == "EXPLICIT"
+
+
+def test_passive_failure_does_not_retry_as_active():
     client = QQBotClient("appid", "secret")
     calls = []
 
     class _Api:
         async def post_group_message(self, **params):
             calls.append(dict(params))
-            if "msg_id" in params:
-                raise TypeError("unexpected keyword argument 'msg_id'")
-            return {"id": "x"}
+            raise RuntimeError("failure")
 
     client._client = SimpleNamespace(api=_Api())
-    client._last_msg_id["g1"] = "MSG1"
-
     import asyncio
 
-    assert asyncio.run(client.send_group_msg("g1", "hi")) is True
-    assert len(calls) == 2
-    assert "msg_id" in calls[0] and "msg_id" not in calls[1]
+    result = asyncio.run(client.send_group_msg_result("g1", "reply", reply_to="M1"))
+    assert not result and result.mode.value == "passive"
+    assert len(calls) == 1 and calls[0]["msg_id"] == "M1"
+
+
+def test_success_requires_message_id_receipt():
+    client = QQBotClient("appid", "secret")
+
+    class _Api:
+        async def post_group_message(self, **params):
+            return {"content": "maybe sent"}
+
+    client._client = SimpleNamespace(api=_Api())
+    import asyncio
+
+    result = asyncio.run(client.send_group_msg_result("g1", "text"))
+    assert not result and result.code.value == "unknown"
+
+
+def test_private_active_send_does_not_use_last_inbound_id():
+    client = QQBotClient("appid", "secret")
+    captured = {}
+
+    class _Api:
+        async def post_c2c_message(self, **params):
+            captured.update(params)
+            return {"id": "SENT3"}
+
+    client._client = SimpleNamespace(api=_Api())
+    import asyncio
+
+    assert asyncio.run(client.send_private_msg("u1", "notice")) is True
+    assert "msg_id" not in captured
 
 
 def test_api_call_failure_is_swallowed():
@@ -114,23 +156,3 @@ def test_api_call_failure_is_swallowed():
     import asyncio
 
     assert asyncio.run(client.send_group_msg("g1", "hi")) is False
-
-
-def test_send_private_uses_msg_id_for_passive_reply():
-    """私聊也要优先被动回复，避免消耗主动消息配额。"""
-    client = QQBotClient("appid", "secret")
-    captured = {}
-
-    class _Api:
-        async def post_c2c_message(self, **params):
-            captured.update(params)
-            return {"id": "x"}
-
-    client._client = SimpleNamespace(api=_Api())
-    client._last_c2c_msg_id["USER1"] = "C2C1"
-
-    import asyncio
-
-    assert asyncio.run(client.send_private_msg("USER1", "hi")) is True
-    assert captured["openid"] == "USER1"
-    assert captured["msg_id"] == "C2C1"

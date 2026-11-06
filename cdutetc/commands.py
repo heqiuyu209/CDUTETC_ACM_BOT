@@ -14,6 +14,7 @@
 
 import asyncio
 import json
+import logging
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -25,9 +26,16 @@ from cdutetc import database as db
 from cdutetc import llm
 from cdutetc import roles
 from cdutetc.fetcher import FetchError, fetch_text
+from cdutetc.errors import AppErrorCode, safe_error_hint
 from cdutetc.utils import can_manage_group, is_super_admin, is_valid_account_id, parse_command
 
 TZ = ZoneInfo("Asia/Shanghai")
+logger = logging.getLogger(__name__)
+
+
+def _error_reply(group_id: str, code: AppErrorCode, detail: str = "") -> list[dict]:
+    text = f"[{code.value}] {detail}" if detail else safe_error_hint(code)
+    return [{"group_id": group_id, "text": text, "error_code": code.value}]
 
 _HELP_HEADER = "【CDUTETC ACM 事务助手 · 命令帮助】"
 
@@ -68,6 +76,7 @@ _HELP_SECTIONS = (
     )),
     ("提醒与来源", (
         (2, "/提醒状态", "查看提醒发送情况"),
+        (3, "/通知测试 [群|私聊] [目标标识]", "主动发送测试消息并显示错误码"),
         (2, "/抓取状态", "查看比赛来源更新情况"),
         (2, "/抓取一次", "立即检查一次比赛来源"),
     )),
@@ -242,7 +251,7 @@ async def cmd_amend(group_id: str, sender: str, args: str) -> list[dict]:
       /修正 <比赛id> 重新提取 <链接>    重新抓取官网并提取，覆盖官方字段
     """
     if not is_super_admin(sender):
-        return [{"group_id": group_id, "text": "仅超管可修正比赛信息"}]
+        return [{"group_id": group_id, "text": "仅超管可修正比赛信息 [permission]", "error_code": AppErrorCode.PERMISSION.value}]
     parts = args.strip().split(None, 1)
     if not parts:
         return [{"group_id": group_id, "text": "用法：/修正 <比赛id> <字段=值 ...> 或 /修正 <比赛id> 重新提取 <链接>"}]
@@ -282,7 +291,7 @@ async def _amend_refetch(group_id: str, cid: int, comp: dict, rest: str) -> list
     try:
         page = await fetch_text(url)
     except Exception as e:
-        return [{"group_id": group_id, "text": f"链接抓取失败：{e}"}]
+        return _error_reply(group_id, AppErrorCode.FETCH)
     if not isinstance(page, str) or not page.strip():
         return [{"group_id": group_id, "text": "链接正文为空，未修正"}]
     try:
@@ -819,13 +828,26 @@ def cmd_reminder_status(group_id: str, sender: str, args: str) -> list[dict]:
     state = "主动群消息：已启用" if config.GROUP_ACTIVE_MESSAGES_ENABLED else "主动群消息：未启用（定时提醒暂停）"
     labels = {"pending": "待发送", "sending": "发送中", "sent": "已发送",
               "failed": "重试耗尽", "cancelled": "已取消", "expired": "已过期"}
-    lines = [state, "投递统计：" + "｜".join(f"{label} {counts.get(status, 0)}" for status, label in labels.items())]
+    lines = [state,
+             f"开赛计划：提前 {'、'.join(str(x) for x in config.CONTEST_REMIND_OFFSETS_MINUTES)} 分钟；"
+             f"每 {config.CONTEST_REMIND_CHECK_SECONDS} 秒检查；逾期超过 {config.CONTEST_REMIND_GRACE_SECONDS} 秒跳过",
+             "投递统计：" + "｜".join(f"{label} {counts.get(status, 0)}" for status, label in labels.items())]
     if not pending:
         lines.append("本群当前无待发送提醒")
     else:
         lines.append("待发送/发送中提醒：")
         for d in pending:
-            lines.append(f"{d['obj_type']}#{d['obj_id']}｜{labels[d['status']]}｜{d['remind_type']}｜目标 {d['target_time']}｜已尝试 {d['attempts']} 次")
+            lines.append(f"{d['obj_type']}#{d['obj_id']}｜{labels[d['status']]}｜{d['remind_type']}"
+                         f"｜计划 {d.get('scheduled_at') or '按窗口扫描'}｜目标 {d['target_time']}"
+                         f"｜已尝试 {d['attempts']} 次"
+                         + (f"｜错误 [{d['error_code']}]" if d.get('error_code') else ""))
+    failures = db.list_deliveries(group_id, statuses=("failed", "expired"), limit=5)
+    if failures:
+        lines.append("最近失败/过期：")
+        for d in failures:
+            lines.append(f"{d['obj_type']}#{d['obj_id']}｜{labels[d['status']]}"
+                         f"｜计划 {d.get('scheduled_at') or d['target_time']}"
+                         f"｜错误 [{d.get('error_code') or d['status']}]")
     return [{"group_id": group_id, "text": "\n".join(lines)}]
 
 
@@ -923,10 +945,17 @@ async def handle_command(text: str, group_id: str, sender: str) -> list[dict] | 
                 break
     if handler is None:
         return [{"group_id": group_id, "text": f"命令 /{cmd} 暂不支持，用 /帮助 查看所有命令"}]
-    result = handler(group_id, sender, args)
-    if asyncio.iscoroutine(result):
-        result = await result
-    return result
+    try:
+        result = handler(group_id, sender, args)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return result
+    except ValueError:
+        logger.warning("命令参数校验失败 [%s]", AppErrorCode.VALIDATION.value)
+        return _error_reply(group_id, AppErrorCode.VALIDATION)
+    except Exception:
+        logger.exception("命令处理异常 [%s]", AppErrorCode.INTERNAL.value)
+        return _error_reply(group_id, AppErrorCode.INTERNAL)
 
 
 def match_faq(group_id: str, text: str) -> dict | None:

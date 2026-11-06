@@ -102,7 +102,7 @@ async def test_stale_collection_plans_leave_pending(file_db, change, expected):
 
 
 @pytest.mark.parametrize("kind, field", [
-    ("reg_deadline", "official_reg_deadline"), ("contest_time", "official_time"),
+    ("reg_deadline", "official_reg_deadline"),
 ])
 async def test_competition_amendment_cancels_old_plan_and_sends_new_time(file_db, kind, field, monkeypatch):
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
@@ -183,14 +183,16 @@ async def test_later_item_uses_fresh_time_after_an_await(file_db, monkeypatch):
     assert row["status"] == "expired" and row["attempts"] == 0
 
 
-async def test_sender_exception_exhausts_budget_and_preserves_error(file_db):
+async def test_sender_exception_exhausts_budget_and_preserves_safe_error(file_db):
     _, key = collection()
     sender = AsyncMock(side_effect=RuntimeError("receipt rejected"))
     for _ in range(4):
         assert await reminder.check_general_reminders(sender, now=NOW, max_attempts=2) == 0
     assert sender.await_count == 2
     row = database.get_delivery_by_key(key)
-    assert (row["status"], row["attempts"], row["last_error"]) == ("failed", 2, "receipt rejected")
+    assert (row["status"], row["attempts"], row["error_code"]) == ("failed", 2, "unknown")
+    assert "[unknown]" in row["last_error"]
+    assert "receipt rejected" not in row["last_error"]
     assert database.list_pending_deliveries() == []
 
 
@@ -203,7 +205,9 @@ async def test_sender_timeout_releases_claim_for_retry(file_db, monkeypatch):
 
     assert await reminder.check_general_reminders(slow_sender, now=NOW) == 0
     row = database.get_delivery_by_key(key)
-    assert (row["status"], row["attempts"], row["last_error"]) == ("pending", 1, "发送超时")
+    assert (row["status"], row["attempts"], row["error_code"]) == ("pending", 1, "timeout_unknown")
+    assert "[timeout_unknown]" in row["last_error"]
+    assert "无法确认" in row["last_error"]
     assert row["lease_token"] == row["lease_until"] == ""
     assert await reminder.check_general_reminders(AsyncMock(return_value=True), now=NOW) == 1
 
@@ -471,15 +475,15 @@ async def test_unsent_collection_resumes_after_reopening_but_sent_history_does_n
 async def test_amend_command_reschedule_then_revert_resumes_unsent_target(file_db, monkeypatch):
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
     monkeypatch.setattr(config, "SUPER_ADMIN", {"admin"})
-    cid = database.create_competition({"name": "校赛", "official_time": TARGET}, status="confirmed")
-    key = database.delivery_dedup_key("g1", "competition", cid, "contest_time", TARGET, 24)
+    cid = database.create_competition({"name": "校赛", "official_reg_deadline": TARGET}, status="confirmed")
+    key = database.delivery_dedup_key("g1", "competition", cid, "reg_deadline", TARGET, 24)
     assert await reminder.check_general_reminders(AsyncMock(return_value=False), now=NOW) == 0
-    await commands.handle_command(f"/修正 {cid} time=2026-11-05 10:00", "g1", "admin")
+    await commands.handle_command(f"/修正 {cid} reg_deadline=2026-11-05 10:00", "g1", "admin")
     sender = AsyncMock(return_value=True)
     assert await reminder.check_general_reminders(sender, now=NOW) == 0
     assert database.get_delivery_by_key(key)["status"] == "cancelled"
-    await commands.handle_command(f"/修正 {cid} time={TARGET}", "g1", "admin")
-    assert database.get_competition(cid)["official_time"] == TARGET
+    await commands.handle_command(f"/修正 {cid} reg_deadline={TARGET}", "g1", "admin")
+    assert database.get_competition(cid)["official_reg_deadline"] == TARGET
     assert await reminder.check_general_reminders(sender, now=NOW) == 1
     assert await reminder.check_general_reminders(sender, now=NOW) == 0
     sender.assert_awaited_once()
@@ -488,9 +492,9 @@ async def test_amend_command_reschedule_then_revert_resumes_unsent_target(file_d
 
 async def test_reconfirm_competition_restores_cancelled_unsent_target(file_db, monkeypatch):
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
-    cid = database.create_competition({"name": "校赛", "official_time": TARGET}, status="confirmed")
-    key = database.delivery_dedup_key("g1", "competition", cid, "contest_time", TARGET, 24)
-    database.ensure_delivery("g1", "competition", cid, "contest_time", TARGET, offset_hours=24)
+    cid = database.create_competition({"name": "校赛", "official_reg_deadline": TARGET}, status="confirmed")
+    key = database.delivery_dedup_key("g1", "competition", cid, "reg_deadline", TARGET, 24)
+    database.ensure_delivery("g1", "competition", cid, "reg_deadline", TARGET, offset_hours=24)
     database.set_competition_status(cid, "draft")
     database.reconcile_deliveries(NOW, allowed_groups={"g1"})
     database.set_competition_status(cid, "confirmed")
@@ -644,9 +648,9 @@ async def test_offset_nodes_keep_independent_state_across_restart_and_recovery(f
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
     monkeypatch.setattr(config, "REMIND_OFFSET_HOURS", (24.0, 1.0))
     target = "2026-11-02 00:00"
-    cid = database.create_competition({"name": "双节点", "official_time": target}, status="confirmed")
-    key_24 = database.delivery_dedup_key("g1", "competition", cid, "contest_time", target, 24)
-    key_1 = database.delivery_dedup_key("g1", "competition", cid, "contest_time", target, 1)
+    cid = database.create_competition({"name": "双节点", "official_reg_deadline": target}, status="confirmed")
+    key_24 = database.delivery_dedup_key("g1", "competition", cid, "reg_deadline", target, 24)
+    key_1 = database.delivery_dedup_key("g1", "competition", cid, "reg_deadline", target, 1)
     sender = AsyncMock(return_value=True)
 
     assert await reminder.check_general_reminders(sender, now=datetime(2026, 11, 1, 0, tzinfo=NOW.tzinfo)) == 1
@@ -666,14 +670,14 @@ async def test_offset_node_cancelled_by_reschedule_can_resume(file_db, monkeypat
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
     monkeypatch.setattr(config, "REMIND_OFFSET_HOURS", (24.0, 1.0))
     target = "2026-11-02 00:00"
-    cid = database.create_competition({"name": "节点恢复", "official_time": target}, status="confirmed")
-    key = database.delivery_dedup_key("g1", "competition", cid, "contest_time", target, 24)
+    cid = database.create_competition({"name": "节点恢复", "official_reg_deadline": target}, status="confirmed")
+    key = database.delivery_dedup_key("g1", "competition", cid, "reg_deadline", target, 24)
     assert await reminder.check_general_reminders(AsyncMock(return_value=False), now=datetime(2026, 11, 1, 0, tzinfo=NOW.tzinfo)) == 0
     assert database.get_delivery_by_key(key)["status"] == "pending"
-    database.amend_competition(cid, {"official_time": "2026-11-03 00:00"})
+    database.amend_competition(cid, {"official_reg_deadline": "2026-11-03 00:00"})
     assert await reminder.check_general_reminders(AsyncMock(return_value=True), now=datetime(2026, 11, 1, 0, tzinfo=NOW.tzinfo)) == 0
     assert database.get_delivery_by_key(key)["status"] == "cancelled"
-    database.amend_competition(cid, {"official_time": target})
+    database.amend_competition(cid, {"official_reg_deadline": target})
     sender = AsyncMock(return_value=True)
     assert await reminder.check_general_reminders(sender, now=datetime(2026, 11, 1, 0, tzinfo=NOW.tzinfo)) == 1
     assert database.get_delivery_by_key(key)["status"] == "sent"
@@ -689,8 +693,8 @@ async def test_group_removal_does_not_spend_attempts_and_return_resumes(file_db,
         cid, key = collection()
         kind = "deadline"
     else:
-        cid = database.create_competition({"name": "校赛", "official_time": TARGET}, status="confirmed")
-        kind = "contest_time"
+        cid = database.create_competition({"name": "校赛", "official_reg_deadline": TARGET}, status="confirmed")
+        kind = "reg_deadline"
         key = database.delivery_dedup_key("g1", obj_type, cid, kind, TARGET, 24)
     attempts = int(existing_plan == "failed_once")
     if existing_plan == "queued":

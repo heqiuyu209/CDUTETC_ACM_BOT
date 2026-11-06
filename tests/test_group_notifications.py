@@ -119,6 +119,7 @@ async def test_active_send_requires_confirmed_response_and_correct_target(bot, r
     {"status": "ok", "data": {"message_id": 12345}},
     {"status": "ok", "retcode": 0, "data": {"message_id": True}},
     {"status": "ok", "retcode": 0, "data": {"message_id": "0"}},
+    {"status": "ok", "retcode": 0, "data": {"message_id": "sent", "error": "denied"}},
 ])
 async def test_active_send_rejects_missing_or_error_receipts(bot, response):
     client, api = bot
@@ -275,9 +276,8 @@ async def test_publish_notifies_all_allowed_groups_and_reports_real_results(bot,
     assert calls[-1]["group_id"] == "g1" and "已入库" in calls[-1]["message"]
     assert len(_reply_calls(client, api)) == 1
     text = _source_text(client, api)
-    assert "已入库" in text
-    _assert_sent_ratio(text, 2, 3)
     assert re.search(r"其余\s*1\s*个群未确认发送", text)
+    assert "[timeout_unknown]" in text
 
 
 def _use_fixed_general_reminders(monkeypatch):

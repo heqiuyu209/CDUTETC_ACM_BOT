@@ -116,17 +116,96 @@ def format_remind(item: dict) -> str:
     )
 
 
+async def check_contest_start_reminders(send_group, now: datetime | None = None,
+                                       max_attempts: int = _DELIVERY_MAX_ATTEMPTS) -> int:
+    """投递事务创建的开赛前30/15分钟计划；不动态补建逾期节点。"""
+    from cdutetc.database import list_due_contest_start_deliveries
+
+    if max_attempts < 1:
+        raise ValueError("提醒尝试次数必须大于零")
+
+    def clock():
+        value = now if now is not None else datetime.now(TZ)
+        return value.replace(tzinfo=TZ) if value.tzinfo is None else value.astimezone(TZ)
+
+    current = clock()
+    allowed = set(config.ALLOWED_GROUPS)
+    reconcile_deliveries(current, max_attempts=max_attempts, allowed_groups=allowed)
+    comps = {item["id"]: item for item in list_competitions(status="confirmed")}
+    sent = 0
+    for delivery in list_due_contest_start_deliveries(current, allowed):
+        current = clock()
+        competition = comps.get(delivery["obj_id"])
+        if not competition:
+            continue
+        scheduled = _parse_time(delivery.get("scheduled_at") or "")
+        expires = _parse_time(delivery.get("expires_at") or "")
+        if scheduled is None or expires is None or not scheduled <= current <= expires:
+            continue
+        key = delivery_dedup_key(
+            delivery["group_id"], "competition", delivery["obj_id"], "contest_start",
+            delivery["target_time"],
+        )
+        # Persisted identity includes offset suffix; retain it verbatim.
+        key = delivery["dedup_key"]
+        token = claim_delivery(
+            delivery["group_id"], "competition", delivery["obj_id"], "contest_start",
+            delivery["target_time"], now=current, max_attempts=max_attempts,
+            lease_seconds=_DELIVERY_LEASE_SECONDS, allowed_groups=allowed,
+            offset_hours=_contest_offset_hours(delivery),
+        )
+        if token is None or not validate_delivery_claim(key, token, now=clock(), allowed_groups=allowed):
+            continue
+        text = (
+            f"【开赛提醒】比赛「{competition['name']}」将在约{_contest_offset_minutes(delivery)}分钟后开始。\n"
+            f"开赛时间：{delivery['target_time']}\n"
+            f"官网：{competition.get('official_site') or '待定'}"
+        )
+        result = await _send_reminder_result(send_group, delivery["group_id"], text)
+        try:
+            receipt_saved = result[0] and record_delivery_success(key, token, now=current)
+            finish_delivery(key, token, result[0], error=result[1], error_code=result[2],
+                            now=current, max_attempts=max_attempts)
+        except sqlite3.Error:
+            logger.exception("开赛提醒回执写入异常: %s", key)
+            continue
+        if result[0] and receipt_saved:
+            sent += 1
+    return sent
+
+
+def _contest_offset_minutes(delivery: dict) -> int:
+    try:
+        return round(float(delivery["dedup_key"].rsplit("|", 1)[1]) * 60)
+    except (IndexError, TypeError, ValueError):
+        return 30
+
+
+def _contest_offset_hours(delivery: dict) -> float:
+    return _contest_offset_minutes(delivery) / 60
+
+
+async def _send_reminder_result(send_group, group_id: str, text: str) -> tuple[bool, str, str]:
+    """发送失败保留适配器提供的稳定错误码，旧 bool 回调保持兼容。"""
+    try:
+        result = await asyncio.wait_for(send_group(group_id, text), timeout=_DELIVERY_SEND_TIMEOUT_SECONDS)
+        if hasattr(result, "ok"):
+            ok = bool(result.ok)
+            code = getattr(result, "code", "")
+            return ok, "" if ok else str(getattr(result, "user_hint", "") or ""), str(getattr(code, "value", code) or "")
+        ok = bool(result)
+        return ok, "" if ok else "[unknown] 发送结果未确认", "" if ok else "unknown"
+    except asyncio.TimeoutError:
+        return False, "[timeout_unknown] 发送等待超时，平台是否已接受无法确认", "timeout_unknown"
+    except Exception as error:
+        logger.warning("提醒发送异常 [%s]", type(error).__name__)
+        return False, "[unknown] 发送结果无法确认，请检查平台连接", "unknown"
+
+
 async def _send_reminder(send_group, group_id: str, text: str) -> tuple[bool, str]:
     """两代提醒共用有界发送；单条异常不阻断同轮其他提醒。"""
-    try:
-        ok = await asyncio.wait_for(send_group(group_id, text),
-                                    timeout=_DELIVERY_SEND_TIMEOUT_SECONDS)
-        return bool(ok), "" if ok else "发送失败"
-    except asyncio.TimeoutError:
-        return False, "发送超时"
-    except Exception as error:
-        logger.warning("提醒发送异常: %s", error)
-        return False, str(error)
+    ok, error, _ = await _send_reminder_result(send_group, group_id, text)
+    return ok, error
 
 
 async def check_reminders(send_group) -> int:
@@ -199,7 +278,7 @@ def build_general_reminders(collections: list[dict], competitions: list[dict],
                 ),
             })
     # 公共比赛：字段是 official_ 前缀，映射到通用提醒类型
-    _COMP_FIELDS = {"reg_deadline": "official_reg_deadline", "contest_time": "official_time"}
+    _COMP_FIELDS = {"reg_deadline": "official_reg_deadline"}
     for c in competitions:
         if c.get("status") != "confirmed":
             continue
@@ -303,6 +382,10 @@ async def check_general_reminders(send_group, now: datetime | None = None,
     reconcile_deliveries(current_time(), max_attempts=max_attempts,
                          allowed_groups=set(config.ALLOWED_GROUPS))
     items = build_general_reminders(_list_collections_all(), list_competitions(status="confirmed"), current_time())
+    # Public contest starts now use only transaction-created 30/15-minute plans.
+    items = [item for item in items if not (
+        item.get("obj_type") == "competition" and item.get("remind_type") == "contest_time"
+    )]
     # 按群取课程，不按当前是否已生效过滤；首次开课前同样需要提前提醒。
     sessions = [session for gid in sorted(config.ALLOWED_GROUPS)
                 for session in list_training_sessions(gid, active_only=False)]
@@ -319,7 +402,7 @@ async def check_general_reminders(send_group, now: datetime | None = None,
             key, token, now=current_time(), allowed_groups=set(config.ALLOWED_GROUPS),
         ):
             continue
-        ok, error = await _send_reminder(send_group, item["group_id"], item["text"])
+        ok, error, error_code = await _send_reminder_result(send_group, item["group_id"], item["text"])
         # 接收到成功回执即先持久化事实，后续状态收尾抛错也不重复发送。
         try:
             receipt_saved = ok and record_delivery_success(key, token, now=current_time())
@@ -327,7 +410,7 @@ async def check_general_reminders(send_group, now: datetime | None = None,
             logger.exception("消息已发送但成功事实写入失败，保留 sending 等待恢复: %s", key)
             continue
         try:
-            finish_delivery(key, token, ok, error=error,
+            finish_delivery(key, token, ok, error=error, error_code=error_code,
                             now=current_time(), max_attempts=max_attempts)
         except sqlite3.Error:
             logger.exception("提醒回执写入异常: %s", key)

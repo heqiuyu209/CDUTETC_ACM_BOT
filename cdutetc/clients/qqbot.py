@@ -120,9 +120,6 @@ class QQBotClient:
         self.private_msg_handler: MessageHandler | None = None
         self.on_ready: ReadyHandler | None = None
         self._client = None
-        # 最近一次收到的消息 id，用于被动回复（被动回复不占主动消息配额）
-        self._last_msg_id: dict[str, str] = {}      # 按 group_openid
-        self._last_c2c_msg_id: dict[str, str] = {}  # 按 user_openid
         self._last_rx = time.monotonic()
 
     # ---------- 生命周期 ----------
@@ -142,8 +139,6 @@ class QQBotClient:
             async def on_group_at_message_create(self, message):
                 adapter._last_rx = time.monotonic()
                 wrapped = wrap_group_at_message(message)
-                if wrapped.id:
-                    adapter._last_msg_id[wrapped.group_id] = wrapped.id
                 if adapter.group_msg_handler is not None:
                     try:
                         await adapter.group_msg_handler(wrapped)
@@ -153,8 +148,6 @@ class QQBotClient:
             async def on_c2c_message_create(self, message):
                 adapter._last_rx = time.monotonic()
                 wrapped = wrap_c2c_message(message)
-                if wrapped.id:
-                    adapter._last_c2c_msg_id[wrapped.user_id] = wrapped.id
                 if adapter.private_msg_handler is not None:
                     try:
                         await adapter.private_msg_handler(wrapped)
@@ -174,48 +167,89 @@ class QQBotClient:
         client = self._client
         return getattr(client, "api", None) if client is not None else None
 
-    async def _post(self, action: str, **params) -> bool:
-        """调用官方 API；异常不抛出，返回是否成功，避免拖垮提醒循环。"""
+    @staticmethod
+    def _message_id(response) -> str:
+        """botpy's successful message response is a message-shaped object/dict."""
+        if isinstance(response, dict):
+            value = response.get("id") or response.get("message_id")
+        else:
+            value = getattr(response, "id", None)
+        return str(value or "").strip()
+
+    async def _post_result(self, action: str, *, mode, **params):
+        from cdutetc.errors import (
+            DeliveryCode, DeliveryResult, result_from_exception,
+        )
+
+        protocol = "qqbot"
         api = self._api()
         if api is None:
-            logger.warning("官方机器人未连接，%s 跳过", action)
-            return False
+            return DeliveryResult(False, DeliveryCode.NOT_CONNECTED, protocol, mode)
         func = getattr(api, action, None)
-        if func is None:  # pragma: no cover - 取决于 botpy 版本
-            logger.error("botpy 不支持 %s，请检查 botpy 版本", action)
-            return False
+        if func is None:
+            return DeliveryResult(False, DeliveryCode.UNSUPPORTED, protocol, mode,
+                                  detail="sdk_method_missing")
         try:
-            await func(**params)
-            return True
+            response = await func(**params)
         except Exception as error:  # noqa: BLE001
-            logger.warning("%s 发送失败: %s", action, error)
-            return False
+            result = result_from_exception(error, protocol=protocol, mode=mode)
+            logger.warning("%s send failed (%s)", action, result.code.value)
+            return result
+        message_id = self._message_id(response)
+        if response is None:
+            return DeliveryResult(False, DeliveryCode.TIMEOUT_UNKNOWN, protocol, mode,
+                                  detail="no_response")
+        if not message_id:
+            return DeliveryResult(False, DeliveryCode.UNKNOWN, protocol, mode,
+                                  detail="missing_message_id")
+        return DeliveryResult.sent(protocol, mode, message_id)
+
+    async def send_group_msg_result(self, group_id: str, text: str, *,
+                                    reply_to: str | None = None, reply_seq: int = 1):
+        """主动发送默认不带 msg_id；被动回复必须显式提供 reply_to。"""
+        from cdutetc.errors import DeliveryCode, DeliveryMode, DeliveryResult
+
+        mode = DeliveryMode.PASSIVE if reply_to is not None else DeliveryMode.ACTIVE
+        if not text:
+            return DeliveryResult(False, DeliveryCode.EMPTY_MESSAGE, "qqbot", mode)
+        if not str(group_id or "").strip():
+            return DeliveryResult(False, DeliveryCode.INVALID_TARGET, "qqbot", mode,
+                                  detail="empty_group_id")
+        if reply_to is not None and (not reply_to or type(reply_seq) is not int
+                                     or not 1 <= reply_seq <= 5):
+            return DeliveryResult(False, DeliveryCode.INVALID_REQUEST, "qqbot", mode,
+                                  detail="invalid_passive_reply")
+        params = {"group_openid": group_id, "msg_type": 0, "content": text}
+        if reply_to is not None:
+            params["msg_id"] = reply_to
+            params["msg_seq"] = reply_seq
+        return await self._post_result("post_group_message", mode=mode, **params)
 
     async def send_group_msg(self, group_id: str, text: str) -> bool:
-        """向群发消息；群内收到过消息时按被动回复发送（不占主动配额）。"""
+        """Backward-compatible active send; never borrows a received msg_id."""
+        return bool(await self.send_group_msg_result(group_id, text))
+
+    async def send_private_msg_result(self, user_id: str, text: str, *,
+                                      reply_to: str | None = None, reply_seq: int = 1):
+        """Active private send by default; passive reply only with explicit reply_to."""
+        from cdutetc.errors import DeliveryCode, DeliveryMode, DeliveryResult
+
+        mode = DeliveryMode.PASSIVE if reply_to is not None else DeliveryMode.ACTIVE
         if not text:
-            return False
-        params = {"group_openid": group_id, "msg_type": 0, "content": text}
-        msg_id = self._last_msg_id.get(group_id)
-        if msg_id:
-            params["msg_id"] = msg_id
-        ok = await self._post("post_group_message", **params)
-        if not ok and "msg_id" in params:
-            # 有的版本不接受 msg_id，退化重试一次主动消息
-            params.pop("msg_id", None)
-            ok = await self._post("post_group_message", **params)
-        return ok
+            return DeliveryResult(False, DeliveryCode.EMPTY_MESSAGE, "qqbot", mode)
+        if not str(user_id or "").strip():
+            return DeliveryResult(False, DeliveryCode.INVALID_TARGET, "qqbot", mode,
+                                  detail="empty_user_id")
+        if reply_to is not None and (not reply_to or type(reply_seq) is not int
+                                     or not 1 <= reply_seq <= 4):
+            return DeliveryResult(False, DeliveryCode.INVALID_REQUEST, "qqbot", mode,
+                                  detail="invalid_passive_reply")
+        params = {"openid": user_id, "msg_type": 0, "content": text}
+        if reply_to is not None:
+            params["msg_id"] = reply_to
+            params["msg_seq"] = reply_seq
+        return await self._post_result("post_c2c_message", mode=mode, **params)
 
     async def send_private_msg(self, user_id: str, text: str) -> bool:
-        """向用户发私聊；对方刚发过消息时按被动回复发送，不占主动配额。"""
-        if not text:
-            return False
-        params = {"openid": user_id, "msg_type": 0, "content": text}
-        msg_id = self._last_c2c_msg_id.get(user_id)
-        if msg_id:
-            params["msg_id"] = msg_id
-        ok = await self._post("post_c2c_message", **params)
-        if not ok and "msg_id" in params:
-            params.pop("msg_id", None)
-            ok = await self._post("post_c2c_message", **params)
-        return ok
+        """Backward-compatible active send; never borrows a received msg_id."""
+        return bool(await self.send_private_msg_result(user_id, text))
