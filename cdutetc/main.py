@@ -954,7 +954,7 @@ class ACMBot:
         except Exception:  # noqa: BLE001
             logger.exception("旧版比赛提醒扫描失败，继续执行通用提醒")
         try:
-            await check_general_reminders(self._send_group)
+            await check_general_reminders(self._send_group_result)
         except Exception:  # noqa: BLE001
             logger.exception("通用提醒扫描失败，等待下一轮重试")
 

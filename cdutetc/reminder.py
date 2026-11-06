@@ -14,10 +14,11 @@ import asyncio
 import logging
 import sqlite3
 from datetime import datetime, timedelta
+from math import ceil
 from zoneinfo import ZoneInfo
 
 from cdutetc import config
-from cdutetc.config import REMIND_BEFORE_HOURS, REMIND_TYPES, TZ_NAME
+from cdutetc.config import REMIND_TYPES, TZ_NAME
 from cdutetc.database import (
     claim_delivery,
     delivery_dedup_key,
@@ -112,8 +113,20 @@ def format_remind(item: dict) -> str:
     return (
         f"【提醒】{item['name']} {item['label']}时间：{item['target_str']}\n"
         f"形式：{item['mode'] or '待定'}  地点：{item['location'] or '待定'}\n"
-        "请同学们做好准备，记得按时参加！"
+        "记得留好时间，别错过啦。"
     )
+
+
+def _countdown(target: datetime, now: datetime) -> str:
+    """按发送时刻计算剩余时间，避免延迟投递仍照抄节点分钟数。"""
+    seconds = (target - now).total_seconds()
+    if seconds < 60:
+        return "不到1分钟"
+    minutes = ceil(seconds / 60)
+    if minutes < 60:
+        return f"约{minutes}分钟"
+    hours, remainder = divmod(minutes, 60)
+    return f"约{hours}小时" + (f"{remainder}分钟" if remainder else "")
 
 
 async def check_contest_start_reminders(send_group, now: datetime | None = None,
@@ -142,11 +155,6 @@ async def check_contest_start_reminders(send_group, now: datetime | None = None,
         expires = _parse_time(delivery.get("expires_at") or "")
         if scheduled is None or expires is None or not scheduled <= current <= expires:
             continue
-        key = delivery_dedup_key(
-            delivery["group_id"], "competition", delivery["obj_id"], "contest_start",
-            delivery["target_time"],
-        )
-        # Persisted identity includes offset suffix; retain it verbatim.
         key = delivery["dedup_key"]
         token = claim_delivery(
             delivery["group_id"], "competition", delivery["obj_id"], "contest_start",
@@ -156,10 +164,12 @@ async def check_contest_start_reminders(send_group, now: datetime | None = None,
         )
         if token is None or not validate_delivery_claim(key, token, now=clock(), allowed_groups=allowed):
             continue
+        target = _parse_time(delivery["target_time"])
         text = (
-            f"【开赛提醒】比赛「{competition['name']}」将在约{_contest_offset_minutes(delivery)}分钟后开始。\n"
+            f"【开赛提醒】「{competition['name']}」还有{_countdown(target, clock())}就开始啦。\n"
             f"开赛时间：{delivery['target_time']}\n"
-            f"官网：{competition.get('official_site') or '待定'}"
+            + (f"官网：{competition['official_site']}\n" if competition.get('official_site') else "")
+            + "记得提前登录，检查好比赛环境。"
         )
         result = await _send_reminder_result(send_group, delivery["group_id"], text)
         try:
@@ -243,9 +253,6 @@ async def check_reminders(send_group) -> int:
 # v2 通用提醒：征集报名截止 / 公共比赛 / 群课程开课
 # ---------------------------------------------------------------------
 
-_COLLECTION_LABELS = {"deadline": "报名截止"}
-
-
 def build_general_reminders(collections: list[dict], competitions: list[dict],
                             now: datetime) -> list[dict]:
     """计算通用提醒清单（纯函数，便于离线测试）。
@@ -272,9 +279,11 @@ def build_general_reminders(collections: list[dict], competitions: list[dict],
                 "obj_id": a["id"],
                 "remind_type": "deadline",
                 "target_str": a["deadline"],
+                "offset_hours": offset,
                 "text": (
-                    f"【提醒】征集「{a['title']}」报名截止：{a['deadline']}\n"
-                    f"已报名同学请确认，未报名同学请抓紧（/报名 {a['id']}）"
+                    f"【报名提醒】「{a['title']}」还有{_countdown(target, now)}截止。\n"
+                    f"截止时间：{a['deadline']}\n"
+                    f"想参加的话，记得在截止前用 /报名 {a['id']} 登记。"
                 ),
             })
     # 公共比赛：字段是 official_ 前缀，映射到通用提醒类型
@@ -313,8 +322,10 @@ def build_general_reminders(collections: list[dict], competitions: list[dict],
                         "target_str": c[field],
                         "offset_hours": offset,
                         "text": (
-                            f"【提醒】公共比赛「{c['name']}」{_LABELS[kind]}：{c[field]}\n"
-                            f"官网：{c.get('official_site') or '待定'}\n请同学们提前做好准备！"
+                            f"【报名提醒】「{c['name']}」还有{_countdown(target, now)}截止报名。\n"
+                            f"报名截止：{c[field]}\n"
+                            + (f"官网：{c['official_site']}\n" if c.get('official_site') else "")
+                            + "想参赛的同学记得确认报名结果。"
                         ),
                     })
     return out
@@ -337,7 +348,10 @@ def build_training_reminders(sessions: list[dict], now: datetime) -> list[dict]:
         group_id = session.get("group_id")
         if group_id not in config.ALLOWED_GROUPS:
             continue
-        for target in training_occurrence_times(session, now, REMIND_BEFORE_HOURS):
+        for target in training_occurrence_times(session, now, max(config.REMIND_OFFSET_HOURS)):
+            offset = _due_offset_hours(target - now)
+            if offset is None:
+                continue
             target_str = target.strftime("%Y-%m-%d %H:%M:%S" if target.second else "%Y-%m-%d %H:%M")
             details = []
             if session.get("needs_laptop"):
@@ -349,11 +363,12 @@ def build_training_reminders(sessions: list[dict], now: datetime) -> list[dict]:
             out.append({
                 "group_id": group_id, "obj_type": "training_session", "obj_id": session["id"],
                 "remind_type": "start_time", "target_str": target_str,
+                "offset_hours": offset,
                 "text": (
                     f"【提醒】课程「{session['title']}」开始：{target_str}\n"
                     f"地点：{session.get('location') or '待定'}"
                     + ("\n" + "；".join(details) if details else "")
-                    + "\n请提前做好训练准备！"
+                    + "\n记得留好时间，我们课上见。"
                 ),
             })
     return out
@@ -382,10 +397,6 @@ async def check_general_reminders(send_group, now: datetime | None = None,
     reconcile_deliveries(current_time(), max_attempts=max_attempts,
                          allowed_groups=set(config.ALLOWED_GROUPS))
     items = build_general_reminders(_list_collections_all(), list_competitions(status="confirmed"), current_time())
-    # Public contest starts now use only transaction-created 30/15-minute plans.
-    items = [item for item in items if not (
-        item.get("obj_type") == "competition" and item.get("remind_type") == "contest_time"
-    )]
     # 按群取课程，不按当前是否已生效过滤；首次开课前同样需要提前提醒。
     sessions = [session for gid in sorted(config.ALLOWED_GROUPS)
                 for session in list_training_sessions(gid, active_only=False)]

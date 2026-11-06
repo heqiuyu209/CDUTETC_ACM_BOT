@@ -31,7 +31,7 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"123456", "234567"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"654321"})
     monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
-    monkeypatch.setattr(reminder, "REMIND_BEFORE_HOURS", 24)
+    monkeypatch.setattr(config, "REMIND_OFFSET_HOURS", (24, 1))
     database.init_db()
     yield path
 
@@ -40,7 +40,7 @@ def training(group="123456", **values):
     info = {"title": "算法训练", "weekday": "周日", "start_time": "19:00", "end_time": "21:00",
             "location": "B201", "needs_laptop": True, "software": "IDE", "device_req": "充电器", **values}
     tid = database.create_training_session(group, info, operator="654321")
-    return tid, database.delivery_dedup_key(group, "training_session", tid, "start_time", TARGET)
+    return tid, database.delivery_dedup_key(group, "training_session", tid, "start_time", TARGET, 1)
 
 
 async def test_course_command_enters_actual_main_reminder_job(db, monkeypatch):

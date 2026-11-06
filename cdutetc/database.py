@@ -1668,7 +1668,7 @@ def training_occurrence_valid(session: dict, target: datetime) -> bool:
     return True
 
 
-def training_occurrence_times(session: dict, now: datetime, before_hours: int) -> list[datetime]:
+def training_occurrence_times(session: dict, now: datetime, before_hours: float) -> list[datetime]:
     """展开提醒窗口内尚未开始的每周课程，未知星期/时间不产生猜测计划。"""
     now = _delivery_now(now)
     weekday = _training_weekday(session.get("weekday"))
@@ -2314,7 +2314,7 @@ def _sync_contest_start_reminders(conn: sqlite3.Connection, competition_id: int,
                 if minutes <= 0:
                     continue
                 scheduled = target - timedelta(minutes=minutes)
-                expires = scheduled + timedelta(seconds=grace_seconds)
+                expires = min(scheduled + timedelta(seconds=grace_seconds), target)
                 key = delivery_dedup_key(
                     group_id, "competition", competition_id, "contest_start",
                     row[1], minutes / 60,
@@ -2526,7 +2526,6 @@ def _delivery_invalid_status(conn: sqlite3.Connection, delivery: dict,
             return "cancelled"  # 新版只由 contest_start 的30/15分钟计划负责开赛。
         field = {
             "reg_deadline": "official_reg_deadline",
-            "contest_time": "official_time",
             "contest_start": "official_time",
         }.get(delivery["remind_type"])
         if field is None:
@@ -2562,7 +2561,7 @@ def _delivery_invalid_status(conn: sqlite3.Connection, delivery: dict,
             return "cancelled"
         if now < scheduled:
             return None
-        return "expired" if now > expires else None
+        return "expired" if now > expires or target <= now else None
     return "expired" if target <= now else None
 
 

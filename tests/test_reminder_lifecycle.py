@@ -43,9 +43,9 @@ def file_db(tmp_path, monkeypatch):
         conn.close()
 
 
-def collection():
+def collection(offset_hours=None):
     cid = database.create_collection("g1", "报名", deadline=TARGET)
-    return cid, database.delivery_dedup_key("g1", "collection", cid, "deadline", TARGET)
+    return cid, database.delivery_dedup_key("g1", "collection", cid, "deadline", TARGET, offset_hours)
 
 
 def claim(cid, now=NOW, **kwargs):
@@ -54,7 +54,7 @@ def claim(cid, now=NOW, **kwargs):
 
 
 async def test_closed_collection_never_generates_a_reminder(file_db):
-    cid, _ = collection()
+    cid, _ = collection(24)
     database.set_collection_status(cid, "closed")
     sender = AsyncMock(return_value=True)
     assert await reminder.check_general_reminders(sender, now=NOW) == 0
@@ -63,7 +63,7 @@ async def test_closed_collection_never_generates_a_reminder(file_db):
 
 
 async def test_failed_plan_is_cancelled_after_collection_closes(file_db):
-    cid, key = collection()
+    cid, key = collection(24)
     sender = AsyncMock(return_value=False)
     assert await reminder.check_general_reminders(sender, now=NOW) == 0
     database.set_collection_status(cid, "closed")
@@ -80,8 +80,8 @@ async def test_failed_plan_is_cancelled_after_collection_closes(file_db):
     ("transferred", "cancelled"),
 ])
 async def test_stale_collection_plans_leave_pending(file_db, change, expected):
-    cid, key = collection()
-    database.ensure_delivery("g1", "collection", cid, "deadline", TARGET)
+    cid, key = collection(24)
+    database.ensure_delivery("g1", "collection", cid, "deadline", TARGET, offset_hours=24)
     now = NOW
     with database._connect() as conn:
         if change == "expired":
@@ -140,7 +140,7 @@ async def test_invalid_competition_plans_are_cancelled(file_db, change, offset, 
 
 
 async def test_object_is_rechecked_after_claim_and_before_send(file_db, monkeypatch):
-    cid, key = collection()
+    cid, key = collection(24)
     original_claim = reminder.claim_delivery
 
     def close_after_claim(*args, **kwargs):
@@ -157,10 +157,10 @@ async def test_object_is_rechecked_after_claim_and_before_send(file_db, monkeypa
 
 
 async def test_later_item_uses_fresh_time_after_an_await(file_db, monkeypatch):
-    collection()
+    collection(24)
     short_target = "2026-11-01 12:01"
     cid = database.create_collection("g1", "即将截止", deadline=short_target)
-    key = database.delivery_dedup_key("g1", "collection", cid, "deadline", short_target)
+    key = database.delivery_dedup_key("g1", "collection", cid, "deadline", short_target, 1)
     current = NOW
 
     class Clock(datetime):
@@ -184,7 +184,7 @@ async def test_later_item_uses_fresh_time_after_an_await(file_db, monkeypatch):
 
 
 async def test_sender_exception_exhausts_budget_and_preserves_safe_error(file_db):
-    _, key = collection()
+    _, key = collection(24)
     sender = AsyncMock(side_effect=RuntimeError("receipt rejected"))
     for _ in range(4):
         assert await reminder.check_general_reminders(sender, now=NOW, max_attempts=2) == 0
@@ -197,7 +197,7 @@ async def test_sender_exception_exhausts_budget_and_preserves_safe_error(file_db
 
 
 async def test_sender_timeout_releases_claim_for_retry(file_db, monkeypatch):
-    _, key = collection()
+    _, key = collection(24)
     monkeypatch.setattr(reminder, "_DELIVERY_SEND_TIMEOUT_SECONDS", 0.01)
 
     async def slow_sender(*args):
@@ -214,7 +214,7 @@ async def test_sender_timeout_releases_claim_for_retry(file_db, monkeypatch):
 
 @pytest.mark.parametrize("legacy_result", ["timeout", "exception", "no_receipt"])
 async def test_main_job_continues_after_legacy_send_failure(file_db, monkeypatch, legacy_result, onebot_client):
-    _, key = collection()
+    _, key = collection(24)
     legacy_id = database.save_contest("g1", {"name": "旧比赛", "reg_deadline": TARGET})
     monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
     monkeypatch.setattr(reminder, "_DELIVERY_SEND_TIMEOUT_SECONDS", 0.01)
@@ -303,7 +303,7 @@ async def test_legacy_callback_exception_does_not_skip_later_legacy_item(file_db
 
 
 async def test_concurrent_scans_do_not_send_the_same_claim(file_db):
-    _, key = collection()
+    _, key = collection(24)
     started, release = asyncio.Event(), asyncio.Event()
     calls = []
 
@@ -369,7 +369,7 @@ def test_crash_on_last_attempt_becomes_failed_after_lease_expiry(file_db):
 
 
 async def test_cancelled_worker_recovers_after_lease_expires(file_db):
-    _, key = collection()
+    _, key = collection(24)
     started = asyncio.Event()
 
     async def sender(*args):
@@ -387,7 +387,7 @@ async def test_cancelled_worker_recovers_after_lease_expires(file_db):
 
 
 async def test_sent_dedup_survives_database_reinitialization(file_db):
-    _, key = collection()
+    _, key = collection(24)
     sender = AsyncMock(return_value=True)
     assert await reminder.check_general_reminders(sender, now=NOW) == 1
     database.init_db()
@@ -453,7 +453,7 @@ def test_reminder_status_filters_group_before_limiting_and_shows_terminal_counts
 
 
 async def test_unsent_collection_resumes_after_reopening_but_sent_history_does_not(file_db):
-    cid, key = collection()
+    cid, key = collection(24)
     failing = AsyncMock(return_value=False)
     assert await reminder.check_general_reminders(failing, now=NOW) == 0
     database.set_collection_status(cid, "closed")
@@ -518,7 +518,7 @@ def test_cancelled_restore_preserves_exhausted_retry_budget(file_db):
 
 @pytest.mark.parametrize("change", ["closed", "rescheduled", "expired"])
 async def test_active_sender_keeps_receipt_right_when_object_becomes_invalid(file_db, change):
-    cid, key = collection()
+    cid, key = collection(24)
     started, release = asyncio.Event(), asyncio.Event()
 
     async def sender(*args):
@@ -553,7 +553,7 @@ async def test_active_sender_keeps_receipt_right_when_object_becomes_invalid(fil
 
 
 async def test_receipt_projection_error_keeps_durable_success_and_continues_scan(file_db):
-    _, key = collection()
+    _, key = collection(24)
     second_id = database.create_collection("g1", "后续提醒", deadline=TARGET)
     with database._connect() as conn:
         conn.execute("""CREATE TRIGGER reject_sent_projection BEFORE UPDATE OF status ON reminder_deliveries
@@ -573,7 +573,7 @@ async def test_receipt_projection_error_keeps_durable_success_and_continues_scan
     assert database.list_pending_deliveries() == []
     assert await reminder.check_general_reminders(sender, now=NOW + timedelta(seconds=121)) == 0
     assert sender.await_count == 2
-    assert database.claim_delivery("g1", "collection", second_id, "deadline", TARGET, now=NOW) is None
+    assert database.claim_delivery("g1", "collection", second_id, "deadline", TARGET, now=NOW, offset_hours=24) is None
     # 新进程重建数据库连接，原 UPDATE trigger 仍在，成功事实不依赖内存。
     restart = subprocess.run([
         sys.executable, "-c",
@@ -591,7 +591,7 @@ async def test_receipt_projection_error_keeps_durable_success_and_continues_scan
 
 
 async def test_failed_receipt_database_error_does_not_skip_healthy_later_item(file_db):
-    _, key = collection()
+    _, key = collection(24)
     database.create_collection("g1", "后续提醒", deadline=TARGET)
     with database._connect() as conn:
         conn.execute("""CREATE TRIGGER reject_failed_receipt BEFORE UPDATE OF status ON reminder_deliveries
@@ -605,7 +605,7 @@ async def test_failed_receipt_database_error_does_not_skip_healthy_later_item(fi
 
 
 async def test_success_fact_insert_error_preserves_inflight_state_and_continues_scan(file_db, caplog):
-    _, key = collection()
+    _, key = collection(24)
     database.create_collection("g1", "后续提醒", deadline=TARGET)
     with database._connect() as conn:
         conn.execute("""CREATE TRIGGER reject_success_fact BEFORE INSERT ON reminder_success_receipts
@@ -624,7 +624,7 @@ async def test_success_fact_insert_error_preserves_inflight_state_and_continues_
 
 
 async def test_success_fact_is_saved_before_finish_function_can_fail(file_db, monkeypatch):
-    _, key = collection()
+    _, key = collection(24)
     database.create_collection("g1", "后续提醒", deadline=TARGET)
     original = reminder.finish_delivery
     calls = 0
@@ -690,7 +690,7 @@ async def test_offset_node_cancelled_by_reschedule_can_resume(file_db, monkeypat
 async def test_group_removal_does_not_spend_attempts_and_return_resumes(file_db, monkeypatch, existing_plan, obj_type):
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
     if obj_type == "collection":
-        cid, key = collection()
+        cid, key = collection(24)
         kind = "deadline"
     else:
         cid = database.create_competition({"name": "校赛", "official_reg_deadline": TARGET}, status="confirmed")
@@ -699,7 +699,7 @@ async def test_group_removal_does_not_spend_attempts_and_return_resumes(file_db,
     attempts = int(existing_plan == "failed_once")
     if existing_plan == "queued":
         database.ensure_delivery("g1", obj_type, cid, kind, TARGET,
-                                 offset_hours=24 if obj_type == "competition" else None)
+                                 offset_hours=24)
     elif existing_plan == "failed_once":
         assert await reminder.check_general_reminders(AsyncMock(return_value=False), now=NOW) == 0
     monkeypatch.setattr(config, "ALLOWED_GROUPS", set())
@@ -723,7 +723,7 @@ async def test_registration_example_from_actual_reminder_is_accepted(file_db, mo
     monkeypatch.setattr(database, "now_str", lambda: "2026-11-01 12:00:00")
     cid, _ = collection()
     item = reminder.build_general_reminders([database.get_collection(cid)], [], NOW)[0]
-    example = re.search(r"（(/报名 \d+)）", item["text"]).group(1)
+    example = re.search(r"(/报名 \d+)", item["text"]).group(1)
     result = await commands.handle_command(example, "g1", "member")
     assert "报名成功" in result[0]["text"]
     assert database.summarize_collection(cid)["registered"] == 1

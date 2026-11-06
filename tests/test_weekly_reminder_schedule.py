@@ -39,7 +39,7 @@ def memory_db(monkeypatch):
     monkeypatch.setattr(config, "CONTEST_REMIND_CHECK_SECONDS", 30)
     monkeypatch.setattr(database, "_delivery_now", lambda value=None: value or datetime(2026, 10, 31, 18, 29, tzinfo=TZ))
     monkeypatch.setattr(config, "REMIND_CHECK_INTERVAL_MINUTES", 30)
-    monkeypatch.setattr(reminder, "REMIND_BEFORE_HOURS", 24)
+    monkeypatch.setattr(config, "REMIND_OFFSET_HOURS", (24, 1))
     yield conn
     conn.close()
 
