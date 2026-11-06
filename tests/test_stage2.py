@@ -89,7 +89,7 @@ def test_org_event_shareable_filter(db):
         "reg_deadline": "2026-11-01 10:00", "contest_time": "2026-11-03 14:00",
         "location": "机房A", "shareable": True,
     })
-    e2 = database.create_org_event({"title": "内部通知", "shareable": False})
+    database.create_org_event({"title": "内部通知", "shareable": False})
     assert len(database.list_org_events()) == 2
     assert [x["id"] for x in database.list_org_events(shareable_only=True)] == [e1]
     assert database.confirm_org_event(e1, operator="t") is True

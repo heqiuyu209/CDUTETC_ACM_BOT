@@ -5,7 +5,6 @@ DB_PATH 变成空串 → sqlite3.connect("") 打开临时库 → 每个连接都
 → 建的表立刻消失 → 机器人启动后完全不回消息。
 """
 
-import os
 
 from cdutetc import config
 

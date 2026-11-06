@@ -8,7 +8,6 @@
 import asyncio
 import time
 
-import pytest
 
 from cdutetc.clients.onebot import OneBotClient
 

@@ -4,7 +4,6 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
-import sqlite3
 import subprocess
 import sys
 from types import SimpleNamespace

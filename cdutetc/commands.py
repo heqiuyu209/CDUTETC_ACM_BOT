@@ -1,9 +1,6 @@
 """命令处理模块（v2）：命令式操作 + 权限校验 + 全部业务命令。
 
-对应 PRODUCT_SPEC v2：
-- 移除订阅/取消订阅/比赛列表/比赛详情、审核列表/通过/拒绝、活动全套命令；
-  新增 /修正（超管）、/征集 /征集关闭（老师/超管）、/征集汇总 /报名（群成员）；
-  发布改为免审（老师白名单，见 main.py）。
+行为边界见 PRODUCT_SPEC.md；命令与配置用法见 README.md。
 - 命令式敏感操作 + 清晰帮助：所有写操作必须以命令形式显式发出，禁止隐式触发。
 - 权限默认全拒绝：super_admin=超管（/修正、全局管理）；teacher=老师
   （课程/FAQ、征集管理）；member=普通成员只可报名/查询。
@@ -13,10 +10,8 @@
 """
 
 import asyncio
-import json
 import logging
 import re
-from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from cdutetc import config
@@ -26,7 +21,7 @@ from cdutetc import database as db
 from cdutetc import faq as faq_search
 from cdutetc import llm
 from cdutetc import roles
-from cdutetc.fetcher import FetchError, fetch_text
+from cdutetc.fetcher import fetch_text
 from cdutetc.errors import AppErrorCode, safe_error_hint
 from cdutetc.utils import can_manage_group, is_super_admin, is_valid_account_id, parse_command
 
@@ -291,7 +286,7 @@ async def _amend_refetch(group_id: str, cid: int, comp: dict, rest: str) -> list
         return [{"group_id": group_id, "text": "用法：/修正 <比赛id> 重新提取 <链接>"}]
     try:
         page = await fetch_text(url)
-    except Exception as e:
+    except Exception:
         return _error_reply(group_id, AppErrorCode.FETCH)
     if not isinstance(page, str) or not page.strip():
         return [{"group_id": group_id, "text": "链接正文为空，未修正"}]
@@ -990,7 +985,9 @@ async def _answer_from_knowledge_base(text: str, group_id: str) -> str | None:
         wanted = set()
         if re.search(r"截止|报名.*(时间|何时|什么时候|几点|几号)", text):
             wanted.add("reg_deadline")
-        if re.search(r"开赛|开打|开始|比赛时间", text) or ("报名" not in text and re.search(r"什么时候|几点|几号|何时", text)):
+        if re.search(r"开赛|开打|开始|比赛时间", text) or (
+            "报名" not in text and "截止" not in text and re.search(r"什么时候|几点|几号|何时", text)
+        ):
             wanted.add("contest_time")
         if re.search(r"地点|在哪|哪里|哪儿|教室|机房", text):
             wanted.add("location")

@@ -19,7 +19,6 @@ botpy 采用延迟导入：未安装时本模块仍可被导入，只有真正�
 这样纯 OneBot 部署和单元测试都不受影响。
 """
 
-import asyncio
 import logging
 import time
 from typing import Awaitable, Callable

@@ -1,9 +1,9 @@
 """数据库模块：分层数据模型、按群隔离、草稿审核、活动登记、通用提醒与审计。
 
-数据分层（对应 PRODUCT_SPEC 第 3 节）：
+数据分层：
 - 公共层（无 group_id，通过关联表授予群访问）：
     competitions / competition_sources / competition_versions
-- 学校层：org_events（可标注 shareable 供订阅群共享）
+- 学校层：org_events（可标注 shareable 供授权群共享）
 - 群层（每条都带 group_id）：contests（阶段一群级比赛兼容表）、
     training_sessions、group_faq、unanswered_questions、
     collections / collection_responses（征集登记，替代 activities）
@@ -567,16 +567,6 @@ def list_contests(group_id: str | None = None) -> list[dict]:
                 f"SELECT {_CONTEST_COLS} FROM contests WHERE group_id = ? ORDER BY id DESC",
                 (group_id,),
             ).fetchall()
-    return [_row_to_contest(r) for r in rows]
-
-
-def list_recent_contests(group_id: str, limit: int = 5) -> list[dict]:
-    """查询某群最近 N 条旧版群级比赛，保留兼容接口。"""
-    with _connect() as conn:
-        rows = conn.execute(
-            f"SELECT {_CONTEST_COLS} FROM contests WHERE group_id = ? ORDER BY id DESC LIMIT ?",
-            (group_id, limit),
-        ).fetchall()
     return [_row_to_contest(r) for r in rows]
 
 
@@ -2810,24 +2800,6 @@ def delivery_status_counts(group_id: str) -> dict[str, int]:
     return dict(rows)
 
 
-def record_delivery_attempt(dedup_key: str, ok: bool, error: str = "", *, max_attempts: int = 3) -> None:
-    """兼容旧调用：只记录未领取 pending，不能覆盖租约或成功记录。"""
-    with _connect() as conn:
-        if ok:
-            conn.execute(
-                "UPDATE reminder_deliveries SET attempts = attempts + 1, status = 'sent',"
-                " sent_at = ?, last_error = '' WHERE dedup_key = ? AND status = 'pending'",
-                (now_str(), _canonical_delivery_key(dedup_key)),
-            )
-        else:
-            conn.execute(
-                "UPDATE reminder_deliveries SET attempts = attempts + 1,"
-                " status = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE 'pending' END,"
-                " last_error = ? WHERE dedup_key = ? AND status = 'pending'",
-                (max_attempts, error or "发送失败", _canonical_delivery_key(dedup_key)),
-            )
-
-
 # =====================================================================
 # 审计日志
 # =====================================================================
@@ -3055,12 +3027,12 @@ def list_pending_updates() -> list[dict]:
     """列出全部待审更新（join 比赛名，供 /待审列表 使用）。"""
     with _connect() as conn:
         rows = conn.execute(
-            f"SELECT pu.id, pu.competition_id, pu.fields_json, pu.source_id,"
+            "SELECT pu.id, pu.competition_id, pu.fields_json, pu.source_id,"
             " pu.change_note, pu.created_by, pu.created_at, pu.updated_at,"
             " c.name, c.status"
-            f" FROM competition_pending_updates pu"
-            f" JOIN competitions c ON c.id = pu.competition_id"
-            f" ORDER BY pu.id DESC"
+            " FROM competition_pending_updates pu"
+            " JOIN competitions c ON c.id = pu.competition_id"
+            " ORDER BY pu.id DESC"
         ).fetchall()
     result = []
     for r in rows:

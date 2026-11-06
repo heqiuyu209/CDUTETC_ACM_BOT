@@ -3,7 +3,6 @@
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-import pytest
 
 from cdutetc import reminder
 from cdutetc.config import REMIND_BEFORE_HOURS, TZ_NAME

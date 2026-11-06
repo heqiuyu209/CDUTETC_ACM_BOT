@@ -37,7 +37,6 @@ async def test_tail_change_creates_pending_update_and_hashes_complete_text(page,
     monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "source.db"))
     monkeypatch.setattr(crawler, "AUTO_FETCH_ENABLED", True)
     monkeypatch.setattr(database, "now_str", lambda: "2026-11-01 08:00:00")
-    monkeypatch.setattr(fetcher.config, "FETCH_TEXT_LIMIT", 3000)
     database.init_db()
     prefix = "<p>比赛公告</p><p>" + "A" * 3500 + "</p><p>报名截止："
     page["body"] = (prefix + "2026-11-10 23:59</p>").encode()

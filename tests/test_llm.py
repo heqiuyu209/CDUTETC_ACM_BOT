@@ -3,7 +3,6 @@
 对应修复点：提取结果结构校验（失败不写库）；输入/输出/上下文限量。
 """
 
-import pytest
 
 from cdutetc.llm import (
     _limit_contests,

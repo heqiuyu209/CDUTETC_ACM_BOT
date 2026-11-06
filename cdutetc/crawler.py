@@ -269,39 +269,3 @@ async def run_fetch(now: datetime | None = None,
             # 包含抓取、提取、校验、比赛写入和状态写入；只失败当前来源。
             results.append(_source_error(source, name, now, error))
     return results
-
-
-def run_fetch_sync(now=None, fetch=None, extract=None, send_group=None) -> list[dict]:
-    """同步入口：供离线脚本 / 测试在无事件循环环境直接触发一次抓取。
-
-    若当前线程已存在运行中的事件循环（如 bot 协程内被同步调用），
-    严禁嵌套 asyncio.run（会抛 RuntimeError），改在独立线程中运行并等待结果；
-    命令 /抓取一次 已改为异步调度（await crawler.run_fetch()）。
-    """
-    import asyncio
-    import threading
-
-    def _run() -> list[dict]:
-        return asyncio.run(run_fetch(now=now, fetch=fetch, extract=extract,
-                                     send_group=send_group))
-
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return _run()
-    # 运行中的事件循环：另起线程 asyncio.run，避免嵌套循环
-    box: dict = {}
-    def worker():
-        try:
-            box["result"] = _run()
-        except Exception as e:  # noqa: BLE001
-            box["error"] = e
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
-    t.join(timeout=300)
-    if "error" in box:
-        raise box["error"]
-    if "result" not in box:
-        raise TimeoutError("抓取超时")
-    return box["result"]
-

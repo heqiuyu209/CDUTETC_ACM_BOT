@@ -31,7 +31,7 @@ def _contest(name="校赛", **overrides):
 
 
 def test_save_and_list_by_group(db):
-    id1 = database.save_contest("g1", _contest("甲"))
+    database.save_contest("g1", _contest("甲"))
     database.save_contest("g2", _contest("乙"))
 
     g1 = database.list_contests("g1")
@@ -41,12 +41,6 @@ def test_save_and_list_by_group(db):
 
     all_rows = database.list_contests()
     assert len(all_rows) == 2
-
-
-def test_list_recent_limit(db):
-    for i in range(8):
-        database.save_contest("g1", _contest(f"比赛{i}"))
-    assert len(database.list_recent_contests("g1", limit=3)) == 3
 
 
 def test_delete_only_own_group(db):

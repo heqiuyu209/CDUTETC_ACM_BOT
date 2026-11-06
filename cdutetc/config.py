@@ -176,7 +176,7 @@ SUPER_ADMIN = {
     m.strip() for m in os.getenv("ACM_SUPER_ADMIN", "").split(",") if m.strip()
 }
 # 老师 QQ 号白名单（逗号分隔，发布权并入此白名单，原发布者白名单已移除）：
-# 可免审发布比赛、维护校安排/课程/FAQ、发起征集、查看征集汇总。
+# 可提交比赛发布（默认超管确认）、维护课程/FAQ、发起征集、查看汇总。
 # 未配置 = 老师管理命令全部拒绝。
 ENV_TEACHER_WHITELIST = {
     m.strip() for m in os.getenv("ACM_TEACHER_WHITELIST", "").split(",") if m.strip()
@@ -303,7 +303,6 @@ FETCH_MAX_BYTES = int(os.getenv("ACM_FETCH_MAX_BYTES", "1000000"))        # 解�
 FETCH_MAX_REDIRECTS = int(os.getenv("ACM_FETCH_MAX_REDIRECTS", "3"))      # 重定向跳数上限
 FETCH_TIMEOUT = float(os.getenv("ACM_FETCH_TIMEOUT", "10"))               # 每跳 DNS/连接/读取/解析总超时（秒）
 FETCH_CONCURRENCY = int(os.getenv("ACM_FETCH_CONCURRENCY", "2"))          # 同时抓取上限
-FETCH_TEXT_LIMIT = int(os.getenv("ACM_FETCH_TEXT_LIMIT", "3000"))         # 旧配置兼容保留；模型输入使用 LLM_MAX_INPUT_CHARS
 
 # ================= 大模型资源限制 =================
 LLM_MAX_INPUT_CHARS = int(os.getenv("ACM_LLM_MAX_INPUT_CHARS", "6000"))   # 单次请求输入长度上限

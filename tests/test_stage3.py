@@ -136,75 +136,10 @@ def test_delivery_dedup_key_idempotent(db):
     assert d is not None and d["status"] == "pending"
 
 
-def test_record_delivery_only_success_marks_sent(db):
-    database.ensure_delivery("g1", "collection", 1, "deadline", "2026-11-05 23:59")
-    key = database.delivery_dedup_key("g1", "collection", 1, "deadline", "2026-11-05 23:59")
-    database.record_delivery_attempt(key, ok=False, error="网络错误")
-    d = database.get_delivery_by_key(key)
-    assert d["status"] == "pending" and d["attempts"] == 1 and d["last_error"]
-    database.record_delivery_attempt(key, ok=True)
-    d = database.get_delivery_by_key(key)
-    assert d["status"] == "sent" and d["sent_at"]
-    assert key not in [x["dedup_key"] for x in database.list_pending_deliveries()]
-
-
-def test_general_reminder_success_marks_sent(db):
-    database.create_collection("g1", "集训报名", deadline="2026-11-01 23:59")
-    sent_log = []
-
-    async def send(gid, text):
-        sent_log.append((gid, text))
-        return True
-
-    n = asyncio.run(reminder.check_general_reminders(send, now=_now()))
-    assert n == 1
-    assert sent_log[0][0] == "g1" and "集训报名" in sent_log[0][1]
-    # 已 sent，再次扫描不重复发送
-    sent_log.clear()
-    n2 = asyncio.run(reminder.check_general_reminders(send, now=_now()))
-    assert n2 == 0 and sent_log == []
-
-
-def test_general_reminder_retry_on_failure(db):
-    database.create_collection("g1", "报名", deadline="2026-11-01 23:59")
-    calls = []
-
-    async def send_fail(gid, text):
-        calls.append(gid)
-        return False
-
-    n = asyncio.run(reminder.check_general_reminders(send_fail, now=_now(), max_attempts=3))
-    assert n == 0 and len(calls) == 1
-    pending = database.list_pending_deliveries()
-    assert len(pending) == 1 and pending[0]["status"] == "pending"
-    assert pending[0]["attempts"] == 1  # 失败留 pending 且计数
-
-    async def send_ok(gid, text):
-        return True
-
-    n2 = asyncio.run(reminder.check_general_reminders(send_ok, now=_now(), max_attempts=3))
-    assert n2 == 1
-    assert len(database.list_pending_deliveries()) == 0  # 成功后清出队列
-
-
-def test_general_reminder_gives_up_after_max_attempts(db):
-    database.create_collection("g1", "报名", deadline="2026-11-01 23:59")
-
-    async def send_fail(gid, text):
-        return False
-
-    for _ in range(3):
-        asyncio.run(reminder.check_general_reminders(send_fail, now=_now(), max_attempts=2))
-    # 第 3 轮不再尝试（attempts 已达上限）
-    assert database.list_pending_deliveries() == []
-    d = database.list_deliveries("g1")
-    assert len(d) == 1 and d[0]["status"] == "failed" and d[0]["attempts"] == 2
-
-
 def test_competition_reminder_all_groups(db, monkeypatch):
     """v2：已确认公共比赛提醒发送到所有允许群（原订阅群机制已移除）。"""
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2"})
-    cid = database.create_competition(
+    database.create_competition(
         {"name": "ICPC 2026", "official_reg_deadline": "2026-11-02 10:00",
          "official_time": "2026-11-03 09:00", "official_site": "https://icpc.example"},
         status="confirmed")
@@ -215,7 +150,7 @@ def test_competition_reminder_all_groups(db, monkeypatch):
         return True
 
     n = asyncio.run(reminder.check_general_reminders(send, now=_now()))
-    # 距注册截止 22h / 距开赛 21h，均 <= REMIND_BEFORE_HOURS（默认 24h 内应触发）
+    # 距报名截止 22h，进入默认24小时节点；开赛由专用持久计划负责。
     # 去重键含群号：每个允许群各应收到一条
     assert n == 2
     assert sorted(sent_log) == ["g1", "g2"]

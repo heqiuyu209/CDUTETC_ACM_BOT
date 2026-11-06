@@ -1,16 +1,16 @@
 """CDUTETC ACM 机器人主程序。
 
-职责：连接 QQ 官方机器人，路由群消息：
+职责：连接 OneBot 或 QQ 官方机器人，路由群消息：
   - 命令式操作（/修正、/征集、/报名、/征集汇总、/征集关闭 等）→ commands 模块分发
-  - 「发布 <链接/信息>」命令（老师白名单）→ 抓取 → 提取 → 免审 confirmed → 群通知
-  - @ 本机器人的自然语言提问 → FAQ / 模型问答，闲聊和 @ 他人不触发
+  - 「发布 <链接/信息>」→ 抓取 → 提取 → 默认私聊超管确认 → 按群通知
+  - @ 本机器人的自然语言提问 → FAQ / 资料 / 受限模型；纯寒暄默认本地回复
   - 周期提醒：比赛临近 + 征集登记截止 + 训练开始
-  - 周期抓取：公共来源低频抓取（默认关闭）+ 变化检测 + 免审记录（不通知全员）
+  - 周期抓取：公共来源低频抓取（默认关闭）+ 变化检测 + 待审更新
   - 自动周赛：每周日按模板生成记录并提醒（默认不通知全员，超管确认后处理）
 
 安全要点：
   - 群与发布者白名单默认全拒绝；权限校验先于抓取/调模型/写库。
-  - 身份一律取自 SDK 事件字段（group_openid / member_openid），不信消息正文。
+  - 身份一律取自协议事件字段，不信消息正文。
   - 主动消息由显式开关控制；仅 QQ 返回有效消息 id 才确认发送成功。
   - 跨群通知按目标群路由，发送失败不标记去重，也不声称已通知成功。
 
@@ -66,16 +66,6 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 _reply_sequence = contextvars.ContextVar("qq_reply_sequence", default=0)
 _private_reply_context = contextvars.ContextVar("qq_private_reply_context", default=None)
-
-
-def _message_sent(result) -> bool:
-    """SDK 超时可能返回 None；只有有效消息回执才算成功。"""
-    return (
-        isinstance(result, dict)
-        and isinstance(result.get("id"), str)
-        and bool(result["id"].strip())
-        and result.get("code") in (None, 0)
-    )
 
 
 def _notification_summary(sent: int, total: int) -> str:
@@ -295,7 +285,7 @@ def _weekly_contest_window(now: datetime):
 
 
 class ACMBot:
-    """CDUTETC ACM 机器人：OneBot 协议接入普通 QQ 账号。"""
+    """CDUTETC ACM 机器人：共用业务路由与双协议发送接口。"""
 
     def __init__(self, client: OneBotClient | None = None):
         self.client = client
@@ -450,7 +440,6 @@ class ACMBot:
             if approve:
                 cid, created = db.approve_pending_publication(pid, operator=uid)
                 pending_item = db.get_pending_publication(pid) or {}
-                source_group = pending_item.get("group_id") or ""
                 if created:
                     await self._send_private(
                         uid, f"已入库：#{cid} {pending_item.get('name') or ''}。"
@@ -468,7 +457,7 @@ class ACMBot:
                     await self._send_private(uid, f"申请 #{pid} 已处理过，无需重复操作。")
                     return True
                 await self._send_private(uid, f"已拒绝申请 #{pid}，未入库。")
-        except ValueError as error:
+        except ValueError:
             await self._send_private(uid, safe_error_hint(AppErrorCode.VALIDATION))
         return True
 
@@ -1005,7 +994,7 @@ class ACMBot:
         logger.info("已自动生成周赛记录: %s（id=%s），未通知全员", template, cid)
 
     async def _crawl_job(self):
-        """周期抓取公共来源（默认关闭）：变化检测 → 免审记录 → 不通知全员。"""
+        """周期抓取公共来源（默认关闭）：变化检测 → 待审更新，不自动广播。"""
         await crawler.run_fetch(send_group=self._send_group)
 
 
