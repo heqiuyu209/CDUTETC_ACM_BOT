@@ -140,7 +140,7 @@ def test_genuinely_offtopic_questions_still_blocked():
 
 
 async def test_algorithm_concept_question_blocked_without_model(bot, monkeypatch):
-    monkeypatch.setattr(commands, "match_faq", lambda *a, **k: None)
+    monkeypatch.setattr(commands, "match_faq", AsyncMock(return_value=None))
     chat = AsyncMock(return_value="不应调用")
     monkeypatch.setattr(llm, "_chat_once", chat)
 
@@ -151,7 +151,7 @@ async def test_algorithm_concept_question_blocked_without_model(bot, monkeypatch
 
 async def test_faq_answer_wins_before_algorithm_gate(bot, monkeypatch):
     faq = {"id": 1, "question": "动态规划", "answer": "管理员预设答案"}
-    monkeypatch.setattr(commands, "match_faq", lambda *a, **k: faq)
+    monkeypatch.setattr(commands, "match_faq", AsyncMock(return_value=faq))
     chat = AsyncMock(return_value="不应调用")
     monkeypatch.setattr(llm, "_chat_once", chat)
 

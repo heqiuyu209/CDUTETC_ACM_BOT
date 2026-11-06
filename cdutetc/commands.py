@@ -23,6 +23,7 @@ from cdutetc import config
 from cdutetc import content_filter
 from cdutetc import crawler
 from cdutetc import database as db
+from cdutetc import faq as faq_search
 from cdutetc import llm
 from cdutetc import roles
 from cdutetc.fetcher import FetchError, fetch_text
@@ -958,31 +959,15 @@ async def handle_command(text: str, group_id: str, sender: str) -> list[dict] | 
         return _error_reply(group_id, AppErrorCode.INTERNAL)
 
 
-def match_faq(group_id: str, text: str) -> dict | None:
-    """在群 FAQ 中匹配问题：精确包含优先，其次按关键词/相似度模糊匹配。"""
-    faqs = db.list_faq(group_id)
-    for faq in faqs:
-        if faq["question"] in text:
-            return faq
-        q_words = [w for w in faq["question"].replace("？", " ").replace("?", " ").split() if len(w) >= 2]
-        if any(w in text for w in q_words):
-            return faq
-    # 兜底：口语化同义问法（「这周有周赛没」≈「周赛什么时候」）也要能命中
-    threshold = config.QA_KB_MATCH_MIN_SCORE
-    best, best_score = None, 0.0
-    for faq in faqs:
-        score = content_filter.question_match_score(text, faq["question"])
-        if score > best_score:
-            best, best_score = faq, score
-    if best is not None and best_score >= threshold:
-        return best
-    return None
+async def match_faq(group_id: str, text: str) -> dict | None:
+    """单次读取本群 FAQ；高置信本地匹配，模糊时按配置选择模型消歧。"""
+    return await faq_search.find(group_id, text, db.list_faq(group_id))
 
 
 async def _answer_from_knowledge_base(text: str, group_id: str) -> str | None:
     """只查库内已录入内容作答，不调用模型（普通成员问答路径）。
 
-    依次尝试：已录入比赛 → 本群课程安排 → 学校安排 → 本群 FAQ。
+    FAQ 已由入口查询；此处依次尝试已录入比赛、本群课程、学校安排。
     命中返回整理好的纯事实文本；全部未命中返回 None（由调用方转人工）。
 
     设计要点：比赛名、时间、地点等全部原样取自数据库，不做任何推测补全，
@@ -1051,10 +1036,6 @@ async def _answer_from_knowledge_base(text: str, group_id: str) -> str | None:
                 lines.append(f"{label}：{value}")
         return "\n".join(lines)
 
-    # 4) FAQ（关键词包含匹配，与 FAQ 专用查询口径一致）
-    faq = match_faq(group_id, text)
-    if faq is not None:
-        return f"Q：{faq['question']}\nA：{faq['answer']}"
     return None
 
 
@@ -1081,7 +1062,7 @@ async def handle_non_command_message(text: str, group_id: str, sender: str,
     """
     if config.QA_SOCIAL_CHAT_ENABLED and content_filter.is_social_chat(text):
         return [{"group_id": group_id, "text": await llm.answer_social_chat(text)}]
-    faq = match_faq(group_id, text)
+    faq = await match_faq(group_id, text)
     if faq is not None:
         return [{"group_id": group_id, "text": f"Q：{faq['question']}\nA：{faq['answer']}"}]
     # 能力类提问用固定话术，避免模型臆造「我不能自动提醒」这类错误结论

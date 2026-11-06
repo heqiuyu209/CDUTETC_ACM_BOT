@@ -81,7 +81,7 @@ async def test_group_social_skips_publish_classifier_and_obeys_blacklist(monkeyp
 async def test_disabled_social_preserves_member_kb_policy(monkeypatch):
     monkeypatch.setattr(config, "QA_SOCIAL_CHAT_ENABLED", False)
     monkeypatch.setattr(config, "QA_MEMBER_KB_ONLY", True)
-    monkeypatch.setattr(commands, "match_faq", lambda *args: None)
+    monkeypatch.setattr(commands, "match_faq", AsyncMock(return_value=None))
     monkeypatch.setattr(commands, "_answer_from_knowledge_base", AsyncMock(return_value=None))
     monkeypatch.setattr(database, "add_unanswered_question", lambda *args: 9)
     social = AsyncMock()

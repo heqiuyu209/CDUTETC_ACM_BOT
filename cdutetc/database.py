@@ -1836,6 +1836,16 @@ def list_faq(group_id: str, keyword: str | None = None) -> list[dict]:
     return [_row_to_faq(r) for r in rows]
 
 
+def get_faq(group_id: str, faq_id: int) -> dict | None:
+    """只读取本群仍有效的 FAQ，供等待模型后的复核使用。"""
+    with _connect() as conn:
+        row = conn.execute(
+            f"SELECT {_FAQ_COLS} FROM group_faq WHERE group_id=? AND id=? AND status != 'deleted'",
+            (group_id, faq_id),
+        ).fetchone()
+    return _row_to_faq(row) if row else None
+
+
 def delete_faq(group_id: str, faq_id: int, operator: str = "") -> bool:
     """标记 FAQ 删除（保留审计，不物理删除）。"""
     with _connect() as conn:

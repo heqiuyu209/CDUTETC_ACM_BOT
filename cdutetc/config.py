@@ -288,6 +288,8 @@ QA_MEMBER_NO_MATCH_REPLY = os.getenv(
 )
 # 已录入比赛的本地检索：问题与比赛名称/时间的字符串相似度低于阈值即视为未命中。
 QA_KB_MATCH_MIN_SCORE = float(os.getenv("ACM_QA_KB_MATCH_MIN_SCORE", "0.34"))
+# 仅本地无法确定 FAQ 时让模型选择候选编号；默认关闭，保持零模型成本。
+QA_FAQ_LLM_ENABLED = os.getenv("ACM_QA_FAQ_LLM_ENABLED", "0") == "1"
 
 # ================= 链接抓取（SSRF 与资源限制） =================
 # 域名白名单（逗号分隔，小写）。配置后仅白名单域名可抓取（重定向目标同样校验）
