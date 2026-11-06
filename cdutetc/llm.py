@@ -129,7 +129,9 @@ async def classify_intent(text: str) -> str:
         宁可不动作，也不要误把普通提问当成发布。
     """
     text = (text or "").strip()
-    if not text:
+    if (not text or content_filter.is_social_chat(text)
+            or re.search(r"[?？]|什么时候|何时|几点|几号|在哪|哪里|怎么|如何|什么|是否|有没有|有没|能不能|能否|吗(?:[呀啊呢。！!~～]*)$", text)
+            or (config.QA_SENSITIVE_GATE_ENABLED and content_filter.has_sensitive(text))):
         return "other"
     system = (
         "你是意图分类器，只输出 JSON 对象，不要解释。\n"
@@ -143,7 +145,9 @@ async def classify_intent(text: str) -> str:
         "- 只是提到“比赛”这个词但没有具体信息"
     )
     try:
-        raw = await _chat_once(system, text[: config.LLM_MAX_INPUT_CHARS], json_mode=True)
+        raw = await asyncio.wait_for(_chat_once(
+            system, text[:min(1200, config.LLM_MAX_INPUT_CHARS)], json_mode=True, max_tokens=32,
+        ), timeout=3)
     except Exception as e:  # noqa: BLE001
         logger.warning("意图分类调用失败: %s", type(e).__name__)
         return "other"
