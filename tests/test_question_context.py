@@ -101,8 +101,6 @@ async def test_teacher_published_competition_reaches_qa_model_in_allowed_groups(
         "name": "新发布校赛",
         "reg_deadline": "2026-11-10 23:59",
         "contest_time": "2026-11-20 09:00",
-        "mode": "",
-        "location": "",
         "source_link": "https://example.com/contest",
     }]
     assert _prompt_contests(chat.await_args_list[1]) == expected
@@ -213,8 +211,6 @@ async def test_qa_reads_amended_formal_fields_instead_of_old_version(bot, monkey
         "name": "修正校赛标题",
         "reg_deadline": "2026-12-02 23:59",
         "contest_time": "2026-12-10 09:00",
-        "mode": "",
-        "location": "",
         "source_link": "https://example.com/corrected",
     }]
 
@@ -257,7 +253,7 @@ async def test_member_question_prefers_local_kb_without_model(bot, monkeypatch):
     await client.on_group_at_message_create(_message("本群校赛报名在哪里？", member_id="student"))
 
     chat.assert_not_awaited()
-    assert replies == [("g1", "Q：本群校赛报名\nA：本群知识库答案")]
+    assert replies == [("g1", "本群知识库答案")]
 
 
 async def test_faq_match_still_skips_qa_model(bot, monkeypatch):
@@ -270,4 +266,4 @@ async def test_faq_match_still_skips_qa_model(bot, monkeypatch):
     await client.on_group_at_message_create(_message("校赛怎么报名？"))
 
     chat.assert_not_awaited()
-    assert replies == [("g1", "Q：校赛怎么报名\nA：请找负责老师登记。")]
+    assert replies == [("g1", "请找负责老师登记。")]

@@ -267,14 +267,15 @@ QA_OUTPUT_FILTERED_REPLY = os.getenv(
 QA_PROBLEM_GATE_ENABLED = os.getenv("ACM_QA_PROBLEM_GATE_ENABLED", "1") != "0"
 QA_PROBLEM_REPLY = os.getenv(
     "ACM_QA_PROBLEM_REPLY",
-    "算法相关的题解、思路和概念科普，机器人这边就不展开啦（省点 token 留给队务和比赛消息~）。想啃题就自己多想想，或把代码贴给队友讨论，等集训课问老师收获更大！",
+    "我主要帮忙处理队务和比赛安排，算法题可以带到集训课上和老师、队友一起讨论。",
 )
 QA_PROBLEM_EXTRA_WORDS = {
     w.strip() for w in os.getenv("ACM_QA_PROBLEM_EXTRA_WORDS", "").split(",") if w.strip()
 }
 
-# 简短寒暄可调用轻量模型回复；不携带群资料，不改变队务知识库限制。
+# 简短寒暄默认本地自然回复；可显式开启轻量模型，不携带群资料。
 QA_SOCIAL_CHAT_ENABLED = os.getenv("ACM_QA_SOCIAL_CHAT_ENABLED", "1") != "0"
+QA_SOCIAL_CHAT_USE_LLM = os.getenv("ACM_QA_SOCIAL_CHAT_USE_LLM", "0") == "1"
 
 # --- 7) 普通成员队务问答范围：只答已录入内容，不调模型 ---
 # 开启后普通成员（非老师/超管）的提问只匹配 FAQ / 课程 / 校安排 / 已录入比赛：
@@ -284,7 +285,7 @@ QA_SOCIAL_CHAT_ENABLED = os.getenv("ACM_QA_SOCIAL_CHAT_ENABLED", "1") != "0"
 QA_MEMBER_KB_ONLY = os.getenv("ACM_QA_MEMBER_KB_ONLY", "1") != "0"
 QA_MEMBER_NO_MATCH_REPLY = os.getenv(
     "ACM_QA_MEMBER_NO_MATCH_REPLY",
-    "这个问题我暂时查不到确切答案，已经帮你转给老师啦，稍等一下~",
+    "这条我还没查到，已经记下了，等老师补充后就能查到。",
 )
 # 已录入比赛的本地检索：问题与比赛名称/时间的字符串相似度低于阈值即视为未命中。
 QA_KB_MATCH_MIN_SCORE = float(os.getenv("ACM_QA_KB_MATCH_MIN_SCORE", "0.34"))

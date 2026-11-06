@@ -1,4 +1,4 @@
-"""纯寒暄的轻量模型路由，不接真实 API。"""
+"""纯寒暄的零 token 默认路径和可选模型回退，不接真实 API。"""
 from unittest.mock import AsyncMock
 
 import pytest
@@ -16,8 +16,11 @@ def test_social_does_not_bypass_business_or_instructions(text):
     assert not content_filter.is_social_chat(text)
 
 
-async def test_member_social_calls_model_without_reading_group_data(monkeypatch):
+@pytest.mark.parametrize("use_llm", [False, True])
+async def test_member_social_without_reading_group_data(monkeypatch, use_llm):
     monkeypatch.setattr(config, "QA_SOCIAL_CHAT_ENABLED", True)
+    monkeypatch.setattr(config, "QA_SOCIAL_CHAT_USE_LLM", use_llm)
+    monkeypatch.setattr(config, "LLM_API_KEY", "offline-test")
     chat = AsyncMock(return_value="嗨，今天过得怎么样？")
     monkeypatch.setattr(llm, "_chat_once", chat)
     def forbidden(*args, **kwargs):
@@ -26,19 +29,27 @@ async def test_member_social_calls_model_without_reading_group_data(monkeypatch)
     monkeypatch.setattr(database, "list_question_contests", forbidden)
     monkeypatch.setattr(database, "add_unanswered_question", forbidden)
     replies = await commands.handle_non_command_message("你好", "g1", "member")
-    assert replies == [{"group_id": "g1", "text": "嗨，今天过得怎么样？"}]
-    chat.assert_awaited_once()
-    assert chat.call_args.kwargs == {"max_tokens": 120, "temperature": 0.7}
-    assert chat.call_args.args[1] == "你好"
+    assert replies[0]["group_id"] == "g1" and replies[0]["text"]
+    if use_llm:
+        assert replies[0]["text"] == "嗨，今天过得怎么样？"
+        chat.assert_awaited_once()
+        assert chat.call_args.kwargs == {"max_tokens": 60, "temperature": 0.7}
+        assert chat.call_args.args[1] == "你好"
+    else:
+        chat.assert_not_awaited()
 
 
 async def test_social_model_failure_is_not_unanswered_question(monkeypatch):
+    monkeypatch.setattr(config, "QA_SOCIAL_CHAT_USE_LLM", True)
+    monkeypatch.setattr(config, "LLM_API_KEY", "offline-test")
     monkeypatch.setattr(llm, "_chat_once", AsyncMock(side_effect=RuntimeError("offline")))
     answer = await llm.answer_social_chat("你好")
-    assert "我在" in answer
+    assert answer and "模型" not in answer
 
 
 async def test_social_output_filtered(monkeypatch):
+    monkeypatch.setattr(config, "QA_SOCIAL_CHAT_USE_LLM", True)
+    monkeypatch.setattr(config, "LLM_API_KEY", "offline-test")
     monkeypatch.setattr(config, "QA_SENSITIVE_GATE_ENABLED", True)
     monkeypatch.setattr(llm, "_chat_once", AsyncMock(return_value="刷单兼职"))
     assert await llm.answer_social_chat("你好") == config.QA_OUTPUT_FILTERED_REPLY

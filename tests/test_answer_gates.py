@@ -156,7 +156,7 @@ async def test_faq_answer_wins_before_algorithm_gate(bot, monkeypatch):
     monkeypatch.setattr(llm, "_chat_once", chat)
 
     replies = await _run_chain(bot, "动态规划是什么", member_id="teacher")
-    assert replies == [("g1", "Q：动态规划\nA：管理员预设答案")]
+    assert replies == [("g1", "管理员预设答案")]
     chat.assert_not_awaited()
 
 

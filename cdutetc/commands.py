@@ -984,13 +984,29 @@ async def _answer_from_knowledge_base(text: str, group_id: str) -> str | None:
         if score > best_score:
             best, best_score = comp, score
     if best is not None and best_score >= threshold:
-        lines = [f"【{best.get('name') or '未命名比赛'}】"]
-        for label, key in (("报名截止", "reg_deadline"), ("比赛时间", "contest_time"),
-                           ("形式", "mode"), ("地点", "location")):
+        name = best.get('name') or '未命名比赛'
+        fields = (("报名截止", "reg_deadline"), ("比赛时间", "contest_time"),
+                  ("形式", "mode"), ("地点", "location"), ("官网", "source_link"))
+        wanted = set()
+        if re.search(r"截止|报名.*(时间|何时|什么时候|几点|几号)", text):
+            wanted.add("reg_deadline")
+        if re.search(r"开赛|开打|开始|比赛时间", text) or ("报名" not in text and re.search(r"什么时候|几点|几号|何时", text)):
+            wanted.add("contest_time")
+        if re.search(r"地点|在哪|哪里|哪儿|教室|机房", text):
+            wanted.add("location")
+        if re.search(r"形式|线上|线下", text):
+            wanted.add("mode")
+        if re.search(r"官网|网址|链接", text):
+            wanted.add("source_link")
+        if wanted:
+            fields = tuple((label, key) for label, key in fields if key in wanted)
+        lines = [f"「{name}」目前登记的安排："]
+        for label, key in fields:
             value = (best.get(key) or "").strip()
             if value:
                 lines.append(f"{label}：{value}")
-        lines.append("（以上为群内登记的信息，详情以群公告为准）")
+            elif wanted:
+                lines.append(f"{label}：还没登记，暂时无法确定")
         return "\n".join(lines)
 
     # 2) 本群课程安排
@@ -1043,9 +1059,9 @@ async def _answer_from_knowledge_base(text: str, group_id: str) -> str | None:
 # 面向群成员公开，只讲能做什么，不涉及实现细节。
 CAPABILITY_TEXT = """【我能做的事】
 - 查信息：比赛、课程、学校安排、常见问题都可以问我
-- 自动提醒：比赛报名截止、开赛，征集截止，课程开课，快到了我会发到群里
+- 自动提醒：比赛报名截止、开赛，征集截止，课程开课，按管理员设置提醒群里
 - 报名：群里发起的征集，可以直接用 /报名 参加
-- 发布：老师可以把比赛信息发给我，我会整理好并通知大家
+- 发布：老师把比赛信息发给我，我整理后由超管确认，再按设置通知群里
 
 有问题直接 @我 就行。"""
 
@@ -1064,7 +1080,7 @@ async def handle_non_command_message(text: str, group_id: str, sender: str,
         return [{"group_id": group_id, "text": await llm.answer_social_chat(text)}]
     faq = await match_faq(group_id, text)
     if faq is not None:
-        return [{"group_id": group_id, "text": f"Q：{faq['question']}\nA：{faq['answer']}"}]
+        return [{"group_id": group_id, "text": faq['answer']}]
     # 能力类提问用固定话术，避免模型臆造「我不能自动提醒」这类错误结论
     if content_filter.is_capability_query(text):
         return [{"group_id": group_id, "text": CAPABILITY_TEXT}]
