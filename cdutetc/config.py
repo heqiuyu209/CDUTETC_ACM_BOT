@@ -8,6 +8,8 @@
 
 import os
 import shutil
+from datetime import timedelta
+from math import isfinite
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -83,6 +85,9 @@ def _sync_env_keys() -> list[str]:
     added_keys: list[str] = []
     for comments, assignment, key in blocks:
         if not key or key in existing:
+            continue
+        if key == "ACM_REMIND_OFFSET_HOURS" and "ACM_REMIND_BEFORE_HOURS" in existing:
+            # 旧单节点部署继续回退到原值；自动补入24,1会静默改变提醒行为。
             continue
         additions.extend(comments)
         additions.append(assignment)
@@ -325,17 +330,31 @@ if (not CONTEST_REMIND_OFFSETS_MINUTES or any(x <= 0 for x in CONTEST_REMIND_OFF
         or not CONTEST_REMIND_CHECK_SECONDS <= CONTEST_REMIND_GRACE_SECONDS <= 600):
     raise RuntimeError("开赛提醒节点须为正分钟数，检查间隔须为5–60秒，宽限须介于检查间隔与600秒之间")
 REMIND_BEFORE_HOURS = int(os.getenv("ACM_REMIND_BEFORE_HOURS", "24"))
+if REMIND_CHECK_INTERVAL_MINUTES < 1 or REMIND_BEFORE_HOURS <= 0:
+    raise RuntimeError("提醒扫描间隔和提前小时数必须大于零")
 REMIND_TYPES = ("reg_deadline", "contest_time")
 # 多节点提前提醒（小时，逗号分隔，支持小数）。例：24,1,0.167 表示
 # 提前 24 小时、1 小时、10 分钟各提醒一次。每场活动不建独立定时器，
 # 仍由周期扫描按「已进入哪个节点窗口」判定，资源占用与比赛数量无关。
 # 留空则回退为单节点 REMIND_BEFORE_HOURS 的旧行为。
-REMIND_OFFSET_HOURS = tuple(
-    sorted(
-        (float(x) for x in os.getenv("ACM_REMIND_OFFSET_HOURS", "24,1").split(",") if x.strip()),
-        reverse=True,
-    )
-) or (float(REMIND_BEFORE_HOURS),)
+def _remind_offset_hours() -> tuple[float, ...]:
+    """显式多节点优先；仅配置旧提前小时数时保留单节点行为。"""
+    raw = os.getenv("ACM_REMIND_OFFSET_HOURS", "").strip()
+    if not raw:
+        raw = os.getenv("ACM_REMIND_BEFORE_HOURS", "").strip() or "24,1"
+    try:
+        offsets = {float(value) for value in raw.split(",") if value.strip()} or {float(REMIND_BEFORE_HOURS)}
+        if any(not isfinite(value) or value <= 0 for value in offsets):
+            raise ValueError
+        # 过大的有限数字同样不能交给运行中的提醒扫描。
+        for value in offsets:
+            timedelta(hours=value)
+    except (ValueError, OverflowError) as error:
+        raise RuntimeError("提醒节点必须是可表示的正数小时，不能包含 NaN 或 Infinity") from error
+    return tuple(sorted(offsets, reverse=True))
+
+
+REMIND_OFFSET_HOURS = _remind_offset_hours()
 
 # ================= 发布确认（超管私聊） =================
 # 老师发布比赛后，整理结果先私聊推送给超管，超管回「同意/拒绝」才入库并通知群。

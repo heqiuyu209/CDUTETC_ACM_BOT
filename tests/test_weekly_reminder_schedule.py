@@ -91,6 +91,25 @@ async def test_actual_default_cron_generates_before_reminder_window(memory_db):
         await stop(bot)
 
 
+@pytest.mark.parametrize("hour_offsets,minute_offsets", [((48, 1), (30, 15)), ((24, 1), (2880, 15))])
+async def test_weekly_generation_precedes_custom_earliest_reminder(memory_db, monkeypatch, hour_offsets, minute_offsets):
+    monkeypatch.setattr(config, "REMIND_OFFSET_HOURS", hour_offsets)
+    monkeypatch.setattr(config, "CONTEST_REMIND_OFFSETS_MINUTES", minute_offsets)
+    before = datetime(2026, 10, 29, 18, 29, tzinfo=TZ)
+    monkeypatch.setattr(database, "_delivery_now", lambda value=None: value or before)
+    bot = new_bot()
+    try:
+        await bot._on_ready(now=before)
+        generation_at = bot.sched.get_job("weekly-contest").trigger.get_next_fire_time(None, before)
+        assert generation_at == datetime(2026, 10, 30, 18, 30, tzinfo=TZ)
+        plans = memory_db.execute(
+            "SELECT scheduled_at FROM reminder_deliveries WHERE remind_type='contest_start' ORDER BY scheduled_at",
+        ).fetchall()
+        assert plans and all(generation_at < datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ) for row in plans)
+    finally:
+        await stop(bot)
+
+
 async def test_startup_inside_last_scan_period_does_not_backfill_elapsed_nodes(memory_db, monkeypatch):
     now = datetime(2026, 11, 1, 18, 59, tzinfo=TZ)
     monkeypatch.setattr(database, "_delivery_now", lambda value=None: value or now)

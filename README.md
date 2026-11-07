@@ -48,6 +48,8 @@
 
 比赛报名截止、征集截止和课程开课统一使用 `ACM_REMIND_OFFSET_HOURS`（默认 `24,1`），每个节点单独去重；课程的每周实例也分别记录。开赛前提醒使用独立分钟节点，倒计时按实际发送时间计算；即使自定义的节点很短，开赛后也不补发。全部提醒使用本地自然文案，**0 次模型调用、0 token**。升级前已经发送的无节点旧记录继续阻止重发，新活动使用完整多节点。
 
+仅配置旧 `ACM_REMIND_BEFORE_HOURS`、未配置多节点的部署继续使用旧值；自动补齐 `.env` 不会擅自加入 `24,1`。希望切换多节点时请显式添加 `ACM_REMIND_OFFSET_HOURS`。节点必须是有限正数，非法值在启动时拒绝。周赛预生成会覆盖配置中最早的提醒窗口；其他周期扫描提醒使用很短或相近节点时，也应调小 `ACM_REMIND_CHECK_INTERVAL_MINUTES`。
+
 发布、修正、超管确认、定时提醒、直接回复共用统一通知入口。应用错误包括 `[validation]`、`[permission]`、`[internal]`、`[fetch]`、`[llm]`；投递错误包括 `[not_connected]`、`[disabled]`、`[target_not_allowed]`、`[authentication]`、`[forbidden]`、`[rate_limited]`、`[timeout_unknown]` 等。未知平台错误保留为 `[unknown]`，不会猜测成“额度用完”。网络超时存在平台已收但本地未确认的可能，重试不能保证严格 exactly-once。
 
 ### 双协议保持可切换

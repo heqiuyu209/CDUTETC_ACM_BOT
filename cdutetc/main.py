@@ -340,7 +340,8 @@ class ACMBot:
             _, start, _ = _weekly_contest_window(now)
             # 提醒窗口打开前一个扫描周期预生成，避免开赛时才生成及同刻调度竞争。
             generation_at = start - timedelta(
-                hours=config.REMIND_BEFORE_HOURS,
+                hours=max(config.REMIND_BEFORE_HOURS, *config.REMIND_OFFSET_HOURS,
+                          max(config.CONTEST_REMIND_OFFSETS_MINUTES) / 60),
                 minutes=config.REMIND_CHECK_INTERVAL_MINUTES,
             )
             sched.add_job(
