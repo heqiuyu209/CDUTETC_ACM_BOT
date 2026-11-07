@@ -16,10 +16,11 @@ async def test_obvious_question_skips_publish_classifier_model(monkeypatch, text
     chat.assert_not_awaited()
 
 
-async def test_publication_statement_keeps_small_classification_budget(monkeypatch):
+@pytest.mark.parametrize("text", ["本周日19:00进行ACM周赛，请大家提前准备", "新生选拔赛报名在机房登记", "本次邀请赛地点在B201"])
+async def test_publication_statement_keeps_small_classification_budget(monkeypatch, text):
     chat = AsyncMock(return_value='{"intent":"add_contest"}')
     monkeypatch.setattr(llm, "_chat_once", chat)
-    assert await llm.classify_intent("本周日19:00进行ACM周赛，请大家提前准备") == "add_contest"
+    assert await llm.classify_intent(text) == "add_contest"
     assert chat.await_args.kwargs == {"json_mode": True, "max_tokens": 32}
 
 

@@ -128,7 +128,12 @@ _choices: OrderedDict[tuple, tuple[float, int]] = OrderedDict()
 _inflight: dict[tuple, asyncio.Task] = {}
 
 
-async def find(group_id: str, question: str, faqs: list[dict]) -> dict | None:
+async def find(group_id: str, question: str, faqs: list[dict], *, exact_only: bool = False) -> dict | None:
+    if exact_only:
+        # 非问句只允许完整命中已录入的词条，既不模糊猜测，也不调用模型。
+        normalized = _features(question)[0]
+        matches = [faq for faq in faqs if normalized and _features(faq["question"])[0] == normalized]
+        return matches[0] if matches and len({faq["answer"] for faq in matches}) == 1 else None
     ranked = rank(question, faqs)
     matched = local_match(ranked)
     if matched is not None or not config.QA_FAQ_LLM_ENABLED:

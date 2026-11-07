@@ -135,6 +135,8 @@ async def classify_intent(text: str) -> str:
     """
     text = (text or "").strip()
     if (not text or content_filter.is_social_chat(text)
+            or not re.search(r"赛|icpc|ccpc|蓝桥杯|天梯|codeforces|atcoder", text, re.I)
+            or not re.search(r"https?://|\d|报名|通知|举行|举办|开赛|开始|进行|地点|明天|后天|周[一二三四五六日天]", text)
             or re.search(r"[?？]|什么时候|何时|几点|几号|在哪|哪里|怎么|如何|什么|是否|有没有|有没|能不能|能否|吗(?:[呀啊呢。！!~～]*)$", text)
             or (config.QA_SENSITIVE_GATE_ENABLED and content_filter.has_sensitive(text))):
         return "other"
@@ -301,12 +303,16 @@ _SOCIAL_REPLIES = {
     "thanks": ("不客气～能帮上忙就好。", "不用客气，有问题再叫我。"),
     "bye": ("回头见～", "拜拜，之后有事再叫我。"),
     "present": ("在呢，直接说就好。", "我在～你说。"),
+    "praise": ("嘿嘿，谢谢你呀～", "被你夸得有点开心了～"),
+    "laugh": ("哈哈，跟着你乐一下～", "嘿嘿～"),
+    "ack": ("好嘞～", "嗯嗯，有事再叫我～"),
 }
 
 
 def _local_social_reply(text: str) -> str:
     expressions = re.findall(
-        r"早上好|早安|中午好|下午好|晚上好|晚安|谢谢|多谢|辛苦了|再见|拜拜|在吗|thanks|thankyou",
+        r"早上好|早安|中午好|下午好|晚上好|晚安|谢谢|多谢|辛苦了|再见|拜拜|在吗|thanks|thankyou|"
+        r"可爱|厉害|真棒|赞|不错|哈哈|嘿嘿|嘻嘻|好的|好哒|好嘞|收到|明白了|知道了|懂了|嗯嗯",
         text.lower(),
     )
     kind = {
@@ -314,6 +320,10 @@ def _local_social_reply(text: str) -> str:
         "晚上好": "evening", "晚安": "night", "谢谢": "thanks", "多谢": "thanks",
         "辛苦了": "thanks", "thanks": "thanks", "thankyou": "thanks",
         "再见": "bye", "拜拜": "bye", "在吗": "present",
+        "可爱": "praise", "厉害": "praise", "真棒": "praise", "赞": "praise", "不错": "praise",
+        "哈哈": "laugh", "嘿嘿": "laugh", "嘻嘻": "laugh",
+        "好的": "ack", "好哒": "ack", "好嘞": "ack", "收到": "ack", "明白了": "ack",
+        "知道了": "ack", "懂了": "ack", "嗯嗯": "ack",
     }.get(expressions[-1] if expressions else "", "greeting")
     return random.choice(_SOCIAL_REPLIES[kind])
 

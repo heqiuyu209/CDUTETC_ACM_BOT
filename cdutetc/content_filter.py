@@ -182,8 +182,11 @@ def is_capability_query(text: str) -> bool:
 # 只接受完整的简短社交表达，不用「包含你好」放行整段任意指令。
 _SOCIAL_CHAT_RE = re.compile(
     r"(?:(?:你好|您好|嗨|哈喽|早上好|早安|中午好|下午好|晚上好|晚安|"
-    r"在吗|谢谢|多谢|辛苦了|再见|拜拜|hello|hi|hey|thanks|thankyou)"
-    r"[呀啊哦呢啦哈~～!！?？,，。.、\s]*)+", re.IGNORECASE,
+    r"在吗|谢谢|多谢|辛苦了|再见|拜拜|hello|hi|hey|thanks|thankyou|"
+    r"(?:你(?:也|还|真|好|太)?|还|真|好|太)?可爱(?:了|的|捏)?|"
+    r"好的|好哒|好嘞|收到|明白了|知道了|懂了|(?:你)?(?:厉害|真棒|赞|不错)|嗯嗯)"
+    r"[呀啊哦呢啦哈~～!！?？,，。.、\s]*)+"
+    r"|(?:哈{2,}|嘿{2,}|嘻{2,})[呀啊哦呢啦~～!！?？,，。.、\s]*", re.IGNORECASE,
 )
 
 
@@ -191,6 +194,41 @@ def is_social_chat(text: str) -> bool:
     """完整、短小的寒暄才进入无资料闲聊；混合队务问题仍按知识库处理。"""
     t = (text or "").strip()
     return bool(t and len(t) <= 60 and _SOCIAL_CHAT_RE.fullmatch(t))
+
+
+_REQUEST_RE = re.compile(
+    r"[?？]|请问|问一下|问下|想问|想知道|想了解|帮我查|查一下|查下|查询|查找|看看|告诉我|求助|求解|"
+    r"什么|啥|怎么|怎样|咋|如何|为什么|为啥|哪[里儿个些天]|何[时处]|"
+    r"在哪|几[点号天周节次个]|多少|谁|是否|能否|有没有|有没|是不是|能不能|可不可以|要不要|"
+    r"吗[呀啊呢。！!~～\s]*$|(?:有|能|要|带|行|可以|上课|比赛).*没[呀啊呢。！!~～\s]*$",
+    re.IGNORECASE,
+)
+_QUERY_FRAGMENT_RE = re.compile(
+    r"[\w\u4e00-\u9fff +#·（）()/-]{0,30}"
+    r"(?:时间|地点|位置|安排|流程|方式|方法|步骤|条件|要求|资格|费用|材料|入口|链接|名单|负责人|联系方式|课表)"
+    r"[呢呀啊。！!~～\s]*$",
+)
+_TOPIC_FRAGMENT_RE = re.compile(
+    r"(?:(?:本周|这周|下周|今天|明天|近期|最近|本次|本学期)的?)?"
+    r"(?:比赛|周赛|校赛|课程|集训课|训练|报名|招新|二机位|课表)[呢呀啊。！!~～\s]*$",
+)
+
+
+def is_information_request(text: str) -> bool:
+    """本地判断是否在查信息；不把未知陈述自动登记为问题。
+
+    明确疑问、查找请求和「校赛时间」等短查询均接受。不确定的表达由用户
+    补充或通过 /提问 显式登记，避免用模型分类每条消息。
+    """
+    t = (text or "").strip()
+    if not re.search(r"\w", t) or is_social_chat(t):
+        return False
+    if _REQUEST_RE.search(t):
+        return True
+    # 陈述句即使以「时间/安排」结尾，也不能当成短查询。
+    if re.search(r"我|你|已经|知道|收到|看过|觉得|感觉|确定了|真|太", t):
+        return False
+    return bool(_QUERY_FRAGMENT_RE.fullmatch(t) or _TOPIC_FRAGMENT_RE.fullmatch(t))
 
 
 # ----------------------------------------------------------------------

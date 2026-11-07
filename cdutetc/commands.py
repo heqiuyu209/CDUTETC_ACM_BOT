@@ -988,9 +988,9 @@ async def handle_command(text: str, group_id: str, sender: str) -> list[dict] | 
         return _error_reply(group_id, AppErrorCode.INTERNAL)
 
 
-async def match_faq(group_id: str, text: str) -> dict | None:
+async def match_faq(group_id: str, text: str, *, exact_only: bool = False) -> dict | None:
     """单次读取本群 FAQ；高置信本地匹配，模糊时按配置选择模型消歧。"""
-    return await faq_search.find(group_id, text, db.list_faq(group_id))
+    return await faq_search.find(group_id, text, db.list_faq(group_id), exact_only=exact_only)
 
 
 async def _answer_from_knowledge_base(text: str, group_id: str) -> str | None:
@@ -1101,17 +1101,23 @@ async def handle_non_command_message(text: str, group_id: str, sender: str,
                                      staff: bool = False) -> list[dict]:
     """非命令消息问答。
 
-    staff=False（普通成员）：队务只答库内已录入内容；纯寒暄可用轻量模型。
-        队务未命中则收集为未答问题转人工。
-    staff=True（老师/超管）：FAQ → 算法拦截 → 模型问答（可用未录入资料作答）。
+    闲聊本地回复，普通陈述不自动登记；非问句仅允许完整命中 FAQ 词条。
+    staff=False（普通成员）：真正的队务提问只答库内资料，未命中才收集为未答问题。
+    staff=True（老师/超管）：提问按 FAQ → 算法拦截 → 模型问答处理。
 
     text/group_id/sender 均由调用方校验完毕；本函数不做权限判断。
     """
-    if config.QA_SOCIAL_CHAT_ENABLED and content_filter.is_social_chat(text):
-        return [{"group_id": group_id, "text": await llm.answer_social_chat(text)}]
-    faq = await match_faq(group_id, text)
+    if content_filter.is_social_chat(text):
+        if config.QA_SOCIAL_CHAT_ENABLED:
+            return [{"group_id": group_id, "text": await llm.answer_social_chat(text)}]
+        return []
+    is_request = content_filter.is_information_request(text)
+    faq = await match_faq(group_id, text, exact_only=not is_request)
     if faq is not None:
         return [{"group_id": group_id, "text": faq['answer']}]
+    if not is_request:
+        return ([{"group_id": group_id, "text": "我在呢～有想问的直接说就好。"}]
+                if config.QA_SOCIAL_CHAT_ENABLED else [])
     # 能力类提问用固定话术，避免模型臆造「我不能自动提醒」这类错误结论
     if content_filter.is_capability_query(text):
         return [{"group_id": group_id, "text": CAPABILITY_TEXT}]
