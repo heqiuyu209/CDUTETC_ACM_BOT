@@ -33,7 +33,7 @@ def _error_reply(group_id: str, code: AppErrorCode, detail: str = "") -> list[di
     text = f"[{code.value}] {detail}" if detail else safe_error_hint(code)
     return [{"group_id": group_id, "text": text, "error_code": code.value}]
 
-_HELP_HEADER = "【CDUTETC ACM 事务助手 · 命令帮助】"
+_HELP_HEADER = "【使用帮助】"
 
 # 帮助文案在群里公开展示，只描述「能做什么」，不写实现细节。
 # 每项格式：(所需身份, 命令, 说明)；身份 1=群成员 2=老师/超管 3=超管。
@@ -41,7 +41,7 @@ _HELP_LEVEL_MEMBER, _HELP_LEVEL_TEACHER, _HELP_LEVEL_SUPER = 1, 2, 3
 
 _HELP_SECTIONS = (
     ("比赛", (
-        (2, "发布 <官网链接>", "把比赛链接发给机器人（需 @机器人）"),
+        (2, "@机器人 发布 名称和时间", "也可以直接发布官网链接"),
         (2, "/待确认列表", "查看等待确认的发布"),
     )),
     ("学校安排", (
@@ -99,10 +99,30 @@ _HELP_SECTIONS = (
     )),
 )
 
-_HELP_SUPER_FOOTER = """--- 私聊管理（超管） ---
-可私聊机器人发送 /FAQ添加 /FAQ删除 /课程添加 /课程取消 等命令，
-作用于默认管理群。
-私聊回复「同意 <编号>」或「拒绝 <编号>」处理发布确认。"""
+_HELP_SUPER_FOOTER = "私聊审批：先 /待确认列表，再回复 同意 编号 或 拒绝 编号。\n私聊管理命令作用于默认管理群。"
+
+_HELP_TOPICS = {
+    "比赛": ("比赛",),
+    "课程": ("课程与训练", "学校安排"),
+    "报名": ("征集登记",),
+    "问答": ("提问", "常见问题"),
+    "提醒": ("提醒与来源",),
+    "管理": ("身份信息", "群与老师管理（超管）"),
+    "修正": ("比赛修正（超管）",),
+}
+_HELP_TOPIC_ALIASES = {"征集": "报名", "训练": "课程", "FAQ": "问答", "faq": "问答",
+                       "常见问题": "问答", "老师": "管理", "超管": "管理", "管理员": "管理"}
+_HELP_EXAMPLES = {
+    "比赛": ((2, "例：@机器人 发布 ACM校赛，明天下午3点开始"),
+             (3, "确认发布：私聊 /待确认列表，再回复 同意 编号。")),
+    "课程": ((2, "例：/课程添加 算法训练 周三 19:00-21:00 机房"),),
+    "报名": ((1, "例：/报名 3；编号看老师发出的征集通知，需要资料时再追加 姓名=张三。"),
+             (2, "发起报名例：/征集 周末训练")),
+    "问答": ((1, "例：@机器人 蓝桥杯什么时候报名？"),
+             (2, "维护例：/FAQ添加 校赛在哪报名 = 在教务系统报名")),
+    "提醒": ((3, "群通知测试例：/通知测试 群 Markdown"),),
+    "修正": ((3, "改名称示例：/修正 3 name=新的比赛名"),),
+}
 
 
 def _role_level(member_id: str | None) -> int:
@@ -113,37 +133,43 @@ def _role_level(member_id: str | None) -> int:
     return _HELP_LEVEL_MEMBER
 
 
-_HELP_CMD_COLUMN = 30
-
-
-def _display_width(text: str) -> int:
-    """按终端/QQ 显示宽度计数：中日韩字符占 2 列，其余占 1 列。"""
-    return sum(2 if ord(ch) > 127 else 1 for ch in text)
-
-
-def _help_line(cmd: str, desc: str) -> str:
-    """命令与说明对齐；命令过长时说明换到下一行，避免挤压。"""
-    width = _display_width(cmd)
-    if width >= _HELP_CMD_COLUMN:
-        return f"{cmd}\n{' ' * 2}{desc}"
-    return f"{cmd}{' ' * (_HELP_CMD_COLUMN - width)}{desc}"
-
-
-def build_help(member_id: str | None) -> str:
-    """按身份生成帮助：只列出该身份可用的命令，同类命令不重复分节。"""
+def build_help(member_id: str | None, topic: str = "") -> str:
+    """默认给简短入口，指定主题时再显示对应身份的用法。"""
     level = _role_level(member_id)
-    lines = [_HELP_HEADER]
+    topic = topic.strip()
+    topic = _HELP_TOPIC_ALIASES.get(topic, topic)
+    if not topic:
+        lines = [_HELP_HEADER,
+                 "查比赛、问事情：在群里 @我 + 你的问题",
+                 "看课程：/课程列表",
+                 "报名：/报名 编号",
+                 "详细用法：",
+                 "/帮助 比赛｜/帮助 课程｜/帮助 报名｜/帮助 问答"]
+        if level >= _HELP_LEVEL_TEACHER:
+            lines.extend(("提醒检查：/帮助 提醒", "群和老师管理：/帮助 管理"))
+        if level >= _HELP_LEVEL_SUPER:
+            lines.append("发布审批：私聊 /待确认列表，再回复 同意 编号")
+        return "\n".join(lines)
+    if topic != "全部" and topic not in _HELP_TOPICS:
+        return "帮助主题：比赛、课程、报名、问答；老师/超管还可看 提醒、管理，超管可看 修正。\n例如：/帮助 比赛"
+    selected = _HELP_TOPICS.get(topic)
+    lines = [f"【{topic}用法】"]
     for title, rows in _HELP_SECTIONS:
+        if selected is not None and title not in selected:
+            continue
         visible = [(cmd, desc) for need, cmd, desc in rows if need <= level]
         if not visible:
             continue
-        lines.append(f"--- {title} ---")
+        if topic == "全部":
+            lines.append(f"【{title}】")
         for cmd, desc in visible:
-            lines.append(_help_line(cmd, desc))
-    if level >= _HELP_LEVEL_SUPER:
+            lines.append(f"{cmd} → {desc}")
+    if len(lines) == 1:
+        return "该主题没有你当前可用的命令，发送 /帮助 查看常用功能。"
+    lines.extend(example for need, example in _HELP_EXAMPLES.get(topic, ()) if need <= level)
+    if level >= _HELP_LEVEL_SUPER and topic in ("管理", "全部"):
         lines.append(_HELP_SUPER_FOOTER)
-    lines.append("--- 其他 ---")
-    lines.append(_help_line("/帮助", "显示本帮助"))
+    lines.append("返回：/帮助；完整命令：/帮助 全部")
     return "\n".join(lines)
 
 
@@ -903,9 +929,9 @@ async def handle_command(text: str, group_id: str, sender: str) -> list[dict] | 
         return None
     cmd, args = parse_command(text)
     if cmd is None:
-        return [{"group_id": group_id, "text": "无法识别的命令，用 /帮助 查看所有命令"}]
+        return [{"group_id": group_id, "text": "请写上命令名，例如 /帮助。"}]
     if cmd in ("help", "帮助"):
-        return [{"group_id": group_id, "text": build_help(sender)}]
+        return [{"group_id": group_id, "text": build_help(sender, args)}]
     handlers = {
         "修正": cmd_amend,
         "待审列表": cmd_pending_list,
@@ -948,7 +974,7 @@ async def handle_command(text: str, group_id: str, sender: str) -> list[dict] | 
                 handler = h
                 break
     if handler is None:
-        return [{"group_id": group_id, "text": f"命令 /{cmd} 暂不支持，用 /帮助 查看所有命令"}]
+        return [{"group_id": group_id, "text": "没有这个命令，发送 /帮助 查看用法。"}]
     try:
         result = handler(group_id, sender, args)
         if asyncio.iscoroutine(result):
