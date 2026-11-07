@@ -72,7 +72,7 @@ _HELP_SECTIONS = (
     )),
     ("提醒与来源", (
         (2, "/提醒状态", "查看提醒发送情况"),
-        (3, "/通知测试 [群|私聊] [目标标识]", "主动发送测试消息并显示错误码"),
+        (3, "/通知测试 [群|私聊] [目标标识]", "主动测试；官方群可在末尾加 Markdown 或 文本"),
         (2, "/抓取状态", "查看比赛来源更新情况"),
         (2, "/抓取一次", "立即检查一次比赛来源"),
     )),
@@ -828,6 +828,9 @@ def cmd_reminder_status(group_id: str, sender: str, args: str) -> list[dict]:
              f"开赛计划：提前 {'、'.join(str(x) for x in config.CONTEST_REMIND_OFFSETS_MINUTES)} 分钟；"
              f"每 {config.CONTEST_REMIND_CHECK_SECONDS} 秒检查；逾期超过 {config.CONTEST_REMIND_GRACE_SECONDS} 秒跳过",
              "投递统计：" + "｜".join(f"{label} {counts.get(status, 0)}" for status, label in labels.items())]
+    if config.BOT_PROTOCOL == "qqbot":
+        message_format = db.get_group_notification_format(config.BOT_PROTOCOL, group_id)
+        lines.insert(1, "本群主动通知格式：" + ("Markdown" if message_format == "markdown" else "文本"))
     block = db.get_group_notification_block(config.BOT_PROTOCOL, group_id)
     if block:
         lines.insert(1, f"平台主动发送：权限拒绝，已暂停该群通知 [{block['error_code']}/{block['platform_code']}]"

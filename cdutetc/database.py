@@ -346,6 +346,16 @@ CREATE TABLE IF NOT EXISTS group_notification_blocks (
 )
 """
 
+_GROUP_NOTIFICATION_SETTINGS_DDL = """
+CREATE TABLE IF NOT EXISTS group_notification_settings (
+    protocol       TEXT NOT NULL,
+    group_id       TEXT NOT NULL,
+    message_format TEXT NOT NULL CHECK(message_format IN ('text', 'markdown')),
+    tested_at      TEXT NOT NULL,
+    PRIMARY KEY (protocol, group_id)
+)
+"""
+
 _AUDIT_LOG_DDL = """
 CREATE TABLE IF NOT EXISTS audit_log (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -389,7 +399,8 @@ _ALL_DDL = (
     _ORG_EVENTS_DDL,
     _TRAINING_SESSIONS_DDL, _GROUP_FAQ_DDL, _UNANSWERED_DDL,
     _COLLECTIONS_DDL, _COLLECTION_RESPONSES_DDL,
-    _REMINDER_DELIVERIES_DDL, _REMINDER_SUCCESS_RECEIPTS_DDL, _GROUP_NOTIFICATION_BLOCKS_DDL, _AUDIT_LOG_DDL,
+    _REMINDER_DELIVERIES_DDL, _REMINDER_SUCCESS_RECEIPTS_DDL,
+    _GROUP_NOTIFICATION_BLOCKS_DDL, _GROUP_NOTIFICATION_SETTINGS_DDL, _AUDIT_LOG_DDL,
 )
 
 
@@ -2823,8 +2834,26 @@ def block_group_notifications(protocol: str, group_id: str, error_code: str, pla
         )
 
 
-def clear_group_notification_block(protocol: str, group_id: str) -> None:
+def get_group_notification_format(protocol: str, group_id: str) -> str:
     with _connect() as conn:
+        row = conn.execute(
+            "SELECT message_format FROM group_notification_settings WHERE protocol=? AND group_id=?",
+            (protocol, group_id),
+        ).fetchone()
+    return row[0] if row else "text"
+
+
+def confirm_group_notification_channel(protocol: str, group_id: str, message_format: str) -> None:
+    """真实主动测试成功后，在同一事务记住格式并解除权限暂停。"""
+    if message_format not in ("text", "markdown"):
+        raise ValueError("通知格式无效")
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO group_notification_settings (protocol, group_id, message_format, tested_at)"
+            " VALUES (?, ?, ?, ?) ON CONFLICT(protocol, group_id) DO UPDATE SET"
+            " message_format=excluded.message_format, tested_at=excluded.tested_at",
+            (protocol, group_id, message_format, now_str()),
+        )
         conn.execute("DELETE FROM group_notification_blocks WHERE protocol=? AND group_id=?", (protocol, group_id))
 
 

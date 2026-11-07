@@ -26,6 +26,7 @@ import logging
 import re
 import sqlite3
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -845,23 +846,51 @@ class ACMBot:
         if not is_super_admin(uid):
             return safe_error_hint(AppErrorCode.PERMISSION)
         parts = args.split()
+        formats = {"文本": "text", "text": "text", "markdown": "markdown"}
+        requested_format = formats.get(parts[-1].lower()) if parts else None
+        if requested_format:
+            parts.pop()
         kind = parts[0] if parts else ("群" if message is not None else "私聊")
         if len(parts) > 2 or kind not in ("群", "私聊"):
-            return "[validation] 用法：/通知测试 [群|私聊] [目标标识]"
+            return "[validation] 用法：/通知测试 [群|私聊] [目标标识]；官方群测试可在末尾加 文本 或 Markdown"
+        if requested_format and (kind != "群" or config.BOT_PROTOCOL != "qqbot"):
+            return "[validation] 文本/Markdown 格式选择仅用于官方群通知测试。"
         default_target = message.group_id if kind == "群" and message is not None else uid
         target = parts[1] if len(parts) == 2 else default_target
         if kind == "群" and message is None and len(parts) < 2:
             return "[validation] 私聊测试群通知时必须指定目标群标识。"
         text = "【通知通道测试】这是主动通知测试消息；收到本条才表示平台已投递到此会话。"
         if kind == "群":
-            result = await self._send_group_result(target, text, permission_probe=True)
+            result = await self._send_group_result(target, text, permission_probe=True,
+                                                   message_format=requested_format)
         else:
             # 特意不调用_send_private：该方法可能为当前入站生成被动回复。
             result = await notifications.send_private(self.client, target, text)
         code = getattr(result.code, "value", str(result.code))
         answer = f"通知测试：{'平台已接受' if result.ok else '未确认发送'} [{code}] {result.user_hint}"
         if kind == "群" and result.ok:
-            answer += " 主动通道本次测试通过，权限暂停已解除；仍有效的未来提醒会按计划发送。"
+            if result.detail == "channel_state_save_failed":
+                answer += " [internal] 平台已接受测试，但本地格式和暂停状态保存失败，尚未确认恢复，请检查数据库。"
+            else:
+                answer += " 主动通道本次测试通过，权限暂停已解除；仍有效的未来提醒会按计划发送。"
+        if kind == "群" and config.BOT_PROTOCOL == "qqbot" and code not in ("disabled", "target_not_allowed"):
+            used_format = requested_format or db.get_group_notification_format(config.BOT_PROTOCOL, target)
+            answer += "\n本次格式：" + ("Markdown" if used_format == "markdown" else "文本")
+            if result.ok and result.detail != "channel_state_save_failed":
+                answer += "，已记住本群格式，后续主动通知沿用。"
+            query = getattr(self.client, "get_group_active_permission", None)
+            try:
+                state = await asyncio.wait_for(query(target), timeout=6.0) if callable(query) else None
+            except Exception:  # noqa: BLE001 - 状态读取失败不能抹掉真实发送回执
+                state = None
+            if state is not None and state.allowed is not None:
+                answer += f"\n平台群设置：allow_proactive_msg={'true' if state.allowed else 'false'}"
+                answer += "（允许主动发言）。" if state.allowed else "（当前群不允许主动发言）。"
+            else:
+                query_code = state.code if state is not None else "unknown"
+                if state is not None and state.platform_code is not None:
+                    query_code += f"/{state.platform_code}"
+                answer += f"\n平台群设置：暂未核实 [{query_code}]；状态接口可能受白名单限制，不能据此认定群开关关闭。"
         return answer
 
     async def _send_private_result(self, user_id: str, text: str) -> DeliveryResult:
@@ -935,25 +964,40 @@ class ACMBot:
 
     # ---------- 定时任务回调 ----------
 
-    async def _send_group_result(self, group_id: str, text: str, *, permission_probe: bool = False):
+    async def _send_group_result(self, group_id: str, text: str, *, permission_probe: bool = False,
+                                 message_format: str | None = None):
         """主动通知唯一业务入口，返回可审计的结构化结果。"""
         from cdutetc.errors import DeliveryCode, DeliveryResult
         if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
             return DeliveryResult(False, DeliveryCode.TARGET_NOT_ALLOWED, config.BOT_PROTOCOL)
         if not config.GROUP_ACTIVE_MESSAGES_ENABLED:
             return DeliveryResult(False, DeliveryCode.DISABLED, config.BOT_PROTOCOL)
+        if message_format is not None and message_format not in ("text", "markdown"):
+            return DeliveryResult(False, DeliveryCode.INVALID_REQUEST, config.BOT_PROTOCOL,
+                                  detail="invalid_message_format")
         if config.BOT_PROTOCOL == "qqbot" and not permission_probe:
             block = db.get_group_notification_block(config.BOT_PROTOCOL, group_id)
             if block:
                 return DeliveryResult(False, DeliveryCode.ACTIVE_FORBIDDEN, config.BOT_PROTOCOL,
                                       detail="active_permission_paused", platform_code=block["platform_code"])
-        result = await notifications.send_group(self.client, group_id, text)
+        if config.BOT_PROTOCOL == "qqbot":
+            message_format = message_format or db.get_group_notification_format(config.BOT_PROTOCOL, group_id)
+        else:
+            message_format = "text"
+        if message_format == "markdown":
+            result = await notifications.send_group(self.client, group_id, text, message_format=message_format)
+        else:
+            result = await notifications.send_group(self.client, group_id, text)
         if config.BOT_PROTOCOL == "qqbot":
             if result.code == DeliveryCode.ACTIVE_FORBIDDEN:
                 db.block_group_notifications(config.BOT_PROTOCOL, group_id, result.code.value, result.platform_code)
                 logger.warning("QQ主动发送被平台拒绝，已持久暂停该群，需恢复权限后执行 /通知测试 群 验证 [40034105]")
             elif result.ok and permission_probe:
-                db.clear_group_notification_block(config.BOT_PROTOCOL, group_id)
+                try:
+                    db.confirm_group_notification_channel(config.BOT_PROTOCOL, group_id, message_format)
+                except sqlite3.Error:
+                    logger.exception("平台已接受主动测试，但本群通知格式和暂停状态保存失败")
+                    result = replace(result, detail="channel_state_save_failed")
         return result
 
     async def _send_group(self, group_id: str, text: str) -> bool:

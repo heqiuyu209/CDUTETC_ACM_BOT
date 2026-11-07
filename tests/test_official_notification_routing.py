@@ -53,7 +53,7 @@ async def test_active_notice_never_reuses_inbound_id(official_bot):
     assert await bot._safe_reply(group_message(), "被动回复")
     assert await bot._send_group("group-openid", "主动提醒")
     assert "msg_id" not in api.post_group_message.await_args.kwargs
-    assert "msg_seq" not in api.post_group_message.await_args.kwargs
+    assert 1 <= api.post_group_message.await_args.kwargs["msg_seq"] <= 2**31 - 1
 
 
 async def test_missing_inbound_id_does_not_fall_back_to_active(official_bot):

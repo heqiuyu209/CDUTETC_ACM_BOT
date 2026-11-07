@@ -19,7 +19,10 @@ botpy 采用延迟导入：未安装时本模块仍可被导入，只有真正�
 这样纯 OneBot 部署和单元测试都不受影响。
 """
 
+import asyncio
+from dataclasses import dataclass
 import logging
+import secrets
 import time
 from typing import Awaitable, Callable
 
@@ -27,6 +30,13 @@ logger = logging.getLogger("qqbot")
 
 MessageHandler = Callable[["QQBotMessage"], Awaitable[None]]
 ReadyHandler = Callable[[], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class GroupActivePermission:
+    allowed: bool | None = None
+    code: str = "unknown"
+    platform_code: int | None = None
 
 
 def _import_botpy():
@@ -120,6 +130,8 @@ class QQBotClient:
         self.on_ready: ReadyHandler | None = None
         self._client = None
         self._last_rx = time.monotonic()
+        # 主动消息不复用 SDK 的默认序号1；随机起点也减少重启后的序号重合。
+        self._active_msg_seq = secrets.randbelow(2**31 - 2) + 1
 
     # ---------- 生命周期 ----------
 
@@ -203,8 +215,41 @@ class QQBotClient:
                                   detail="missing_message_id")
         return DeliveryResult.sent(protocol, mode, message_id)
 
+    async def get_group_active_permission(self, group_id: str) -> GroupActivePermission:
+        """读取平台记录的本群主动发言开关；无白名单/缺字段时保持未知。"""
+        from cdutetc.errors import DeliveryMode, result_from_exception
+
+        if not str(group_id or "").strip():
+            return GroupActivePermission(code="invalid_target")
+        api = self._api()
+        if api is None:
+            return GroupActivePermission(code="not_connected")
+        http = getattr(api, "_http", None)
+        if not callable(getattr(http, "request", None)):
+            return GroupActivePermission(code="unsupported")
+        try:
+            # 复用已连接SDK的鉴权，兼容尚未封装bot_state方法的botpy版本。
+            from botpy.http import Route
+        except ImportError:
+            return GroupActivePermission(code="unsupported")
+        try:
+            route = Route("GET", "/v2/groups/{group_openid}/bot_state", group_openid=group_id)
+            response = await asyncio.wait_for(http.request(route), timeout=5.0)
+        except Exception as error:  # noqa: BLE001
+            failure = result_from_exception(error, protocol="qqbot", mode=DeliveryMode.ACTIVE)
+            return GroupActivePermission(code=failure.code.value, platform_code=failure.platform_code)
+        if isinstance(response, dict):
+            value = response.get("allow_proactive_msg")
+            if type(value) is bool:
+                return GroupActivePermission(allowed=value, code="ok")
+            code = response.get("code") or response.get("err_code")
+            if type(code) is int and code > 0:
+                return GroupActivePermission(code="platform_error", platform_code=code)
+        return GroupActivePermission()
+
     async def send_group_msg_result(self, group_id: str, text: str, *,
-                                    reply_to: str | None = None, reply_seq: int = 1):
+                                    reply_to: str | None = None, reply_seq: int = 1,
+                                    message_format: str = "text"):
         """主动发送默认不带 msg_id；被动回复必须显式提供 reply_to。"""
         from cdutetc.errors import DeliveryCode, DeliveryMode, DeliveryResult
 
@@ -214,14 +259,24 @@ class QQBotClient:
         if not str(group_id or "").strip():
             return DeliveryResult(False, DeliveryCode.INVALID_TARGET, "qqbot", mode,
                                   detail="empty_group_id")
+        if message_format not in ("text", "markdown"):
+            return DeliveryResult(False, DeliveryCode.INVALID_REQUEST, "qqbot", mode,
+                                  detail="invalid_message_format")
         if reply_to is not None and (not reply_to or type(reply_seq) is not int
                                      or not 1 <= reply_seq <= 5):
             return DeliveryResult(False, DeliveryCode.INVALID_REQUEST, "qqbot", mode,
                                   detail="invalid_passive_reply")
-        params = {"group_openid": group_id, "msg_type": 0, "content": text}
+        params = {"group_openid": group_id}
+        if message_format == "markdown":
+            params.update(msg_type=2, markdown={"content": text})
+        else:
+            params.update(msg_type=0, content=text)
         if reply_to is not None:
             params["msg_id"] = reply_to
             params["msg_seq"] = reply_seq
+        else:
+            self._active_msg_seq = self._active_msg_seq % (2**31 - 1) + 1
+            params["msg_seq"] = self._active_msg_seq
         return await self._post_result("post_group_message", mode=mode, **params)
 
     async def send_group_msg(self, group_id: str, text: str) -> bool:

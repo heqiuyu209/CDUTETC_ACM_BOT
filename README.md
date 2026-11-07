@@ -46,6 +46,8 @@
 - `/提醒状态` 显示计划时间、目标时间、状态、尝试次数和错误码；关闭主动消息时暂停投递、不消耗重试次数。暂停超过宽限的节点不会在开启后追发。
 - 超管可用 `/通知测试 群 <群标识>` 或 `/通知测试 私聊 [用户标识]` 主动发送一条测试消息，再在当前会话收到含错误码的结果。群内省略参数默认测本群，私聊省略参数默认测自己；测试会真实发一条消息，不自动触发。
 - 官方 QQ 返回 `40034105` 时，按群持久暂停主动通知，`/提醒状态` 显示权限拒绝和恢复步骤；跳过投递不增加尝试次数，其他群和当前消息的被动回复照常处理。修复平台权限后，由超管在目标群发送 `@机器人 /通知测试 群`；主动接口成功返回消息 ID 才解除暂停。恢复后仅投递仍有效的节点，已过期或重试耗尽的记录不会补发。
+- 官方群测试可在末尾选择格式：`@机器人 /通知测试 群 Markdown` 或 `@机器人 /通知测试 群 文本`；私聊测试群时先补目标群标识，例如 `/通知测试 群 <群OpenID> Markdown`。每次只发送一条指定格式的主动测试消息。成功回执后，在同一事务保存本群格式并解除暂停，后续发布与提醒沿用，重启后保留；失败或缺少消息 ID 不改原格式。不指定格式时沿用本群已验证格式，尚未测试的群默认文本；`/提醒状态` 可查看。
+- 官方群测试还会尝试读取目标群的 `bot_state.allow_proactive_msg`，显示平台记录的实际开关。该接口有白名单限制：无法读取、缺字段或返回类型不符均显示“暂未核实”，不能解释为开关关闭，也不会抹掉真实发送结果。一次读取最多等待5秒，不在定时任务中轮询；整个测试和提醒不调用 LLM。
 
 比赛报名截止、征集截止和课程开课统一使用 `ACM_REMIND_OFFSET_HOURS`（默认 `24,1`），每个节点单独去重；课程的每周实例也分别记录。开赛前提醒使用独立分钟节点，倒计时按实际发送时间计算；即使自定义的节点很短，开赛后也不补发。全部提醒使用本地自然文案，**0 次模型调用、0 token**。升级前已经发送的无节点旧记录继续阻止重发，新活动使用完整多节点。
 
@@ -61,10 +63,11 @@
 
 遇到 `40034105` 时先验证通道，再决定是否更换接入方式：
 
+- 已核对用户提供的 [acmerQQ-group-bot 赛前提醒](https://github.com/td1336065617/acmerQQ-group-bot/blob/master/src/scheduler.py) 与 [通知入口](https://github.com/td1336065617/acmerQQ-group-bot/blob/master/main.py)：截图中的洛谷赛前15分钟文案确实来自该实现，支持官方 QQ。它通过 AstrBot 的 `context.send_message` 进入官方适配器；[适配器源码](https://github.com/AstrBotDevs/AstrBot/blob/master/astrbot/core/platform/sources/qqofficial/qqofficial_platform_adapter.py) 默认使用原生 Markdown，群主动发送不带 `msg_id`，并生成独立 `msg_seq`。本项目已补充可选原生 Markdown、独立主动消息序号与成功格式记忆，用实际发送结果验证差异，不能把旧讨论中的平台限制泛化为“官方机器人都无法群主动发送”。
 - [官方群消息接口](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html) 将 `40034105` 定义为主动消息权限拒绝，`40034100` 才是主动消息频控。APScheduler 的 `Job executed successfully` 只表示任务函数正常返回，不能代替平台成功回执或群内收信。
 - [NoneBot QQ 适配器](https://github.com/nonebot/adapter-qq/blob/master/nonebot/adapters/qq/bot.py) 和 [官方 botpy](https://github.com/tencent-connect/botpy/blob/master/botpy/api.py) 同样调用 `POST /v2/groups/{group_openid}/messages`，主动消息不依赖 `msg_id`。本项目沿用这一路径；换 SDK 预计不能解决服务端权限拒绝。botpy 的部分异常只保留中文消息，本项目兼容识别该形状并保留受控错误码。
 - [AstrBot 的同类实测讨论](https://github.com/AstrBotDevs/AstrBot/issues/10454) 也报告群主动消息返回 `40034105`。`is_wakeup` 属于单聊召回能力，当前群发送接口没有这个字段，不作为群定时提醒的替代方案。旧版文档与当前文档存在差异，以现行接口和目标机器人的真实回执为准。
-- 腾讯官方插件的 [同类问题讨论](https://github.com/tencent-connect/openclaw-qqbot/issues/43) 中，维护者曾表示群主动发送受平台限制，2026年9月仍有直接调用接口返回 `40034105` 且找不到配置入口的反馈；[当前插件说明](https://github.com/tencent-connect/openclaw-qqbot/blob/main/README.zh.md) 也将定时通知与 QQ 主动消息能力绑定。因此，看到频控表或“支持定时推送”不代表当前应用已获授权。群内开关已开启且后台没有对应入口时，不猜测一定存在可自助开通的菜单；应通过官方文档页底的开发者社区，提供应用信息、请求时间和 `trace_id` 请平台核查。不要公开 AppSecret 或 access_token。
+- 腾讯官方插件的 [同类问题讨论](https://github.com/tencent-connect/openclaw-qqbot/issues/43) 曾有平台限制的维护者回复，也有找不到配置入口的用户反馈。这些历史案例不能证明当前所有应用都不可用。应先完成目标群、发送格式、独立序号和实际群开关的对照测试；仍被拒绝时，再通过官方文档页底的开发者社区，提供应用信息、请求时间和 `trace_id` 请平台核查，不凭空假定后台必有自助开通入口。不要公开 AppSecret 或 access_token。
 - 群里开启“允许主动发送”后，先执行主动测试；返回“平台已接受”且群内收到独立测试消息，再用未来的比赛验证定时投递。如果仍是 `40034105`，应继续核实平台权限，或评估已有的 NapCat/OneBot 接入。后者使用登录中的普通 QQ 账号，需要维护登录和重连；提醒、FAQ 与审批逻辑可沿用，但白名单及既有按群数据需要显式映射，不能直接把 OpenID 当 QQ 号使用。当前不会自动切换协议。
 
 ## 消息指令
@@ -245,7 +248,7 @@ python -m pytest -q
 
 - **启用群主动消息**：设置 `ACM_GROUP_ACTIVE_MESSAGES_ENABLED=1`，并确认当前协议已连接。OneBot 通过 NapCat 的 `send_group_msg` 发送；官方 QQ 通过群消息接口发送，还受机器人权限与目标群“允许主动发送”设置控制。仅返回有效消息 ID 才确认平台接受；权限、频控、超时或空回执均不标记为已发送。已有权限暂停的群需由超管主动测试成功后恢复。
 - **关闭与失败反馈**：设置 `ACM_GROUP_ACTIVE_MESSAGES_ENABLED=0` 时，发布和修正仍保存资料并回复触发群，跨群通知明确显示未发送；定时提醒暂停，不消耗投递重试次数。老师可用 `/提醒状态` 查看启用状态。启用后每个目标群独立投递，一个群失败不阻止其他群，结果显示已确认发送的数量。
-- **群通知与 @全体**：本项目使用普通群文本消息。公开接口没有 `@全体` 参数，因此不声称已触发全员提醒。参见 [官方群消息接口](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html) 与 [消息收发概述](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html)。
+- **群通知与 @全体**：本项目使用文本或本群已验证的原生 Markdown 发送普通通知，未实现全员提醒。参见 [官方群消息接口](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html) 与 [消息收发概述](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html)。
 - **老师身份来源**：目前老师白名单以 OneBot 的成员 QQ 号（`user_id`）为准，需在部署环境将老师 QQ 号配置进 `ACM_TEACHER_WHITELIST`；如 QQ 侧能提供群管理员角色字段，可进一步自动识别管理员。
 - **个人信息日志**：默认不记录群号、QQ 号和消息内容；初次部署采集白名单时可临时设置 `ACM_DEBUG_LOG_IDENTITY=1` 开启调试日志，采集完成后请关闭。
 - **公共来源抓取**：`/抓取一次` 与周期抓取会真实调用抓取层（SSRF 防护生效）；无法访问目标站点时记录 error，可用 `/抓取状态` 查看。v2 自动抓取结果不自动通知群。
