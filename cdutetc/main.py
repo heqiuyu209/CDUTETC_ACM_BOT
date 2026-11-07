@@ -46,6 +46,7 @@ from cdutetc.contest_fields import map_competition_info
 from cdutetc.database import create_published_competition_once, init_db
 from cdutetc.fetcher import FetchError, fetch_text
 from cdutetc.llm import extract_contest, normalize_time
+from cdutetc.publish_text import is_timed_contest_announcement, parse_simple_publication
 from cdutetc.reminder import check_general_reminders, check_reminders, check_contest_start_reminders
 from cdutetc.utils import (
     admin_group_id,
@@ -567,7 +568,7 @@ class ACMBot:
                     and not content_filter.is_social_chat(text)
                     and can_manage_group(member_id)
                 ):
-                    intent = await llm.classify_intent(text)
+                    intent = "add_contest" if is_timed_contest_announcement(text) else await llm.classify_intent(text)
                     if intent == "add_contest":
                         logger.info("识别为发布比赛意图，转发布流程")
                         await self._handle_publish(message, text, group_id, member_id)
@@ -713,7 +714,14 @@ class ACMBot:
             page = ""
 
         raw_text = f"链接正文：{page}\n老师原文：{text}" if page else f"老师原文：{text}"
-        info, err = await extract_contest(raw_text)
+        try:
+            info = None if url else parse_simple_publication(text, now=datetime.now(ZoneInfo(config.TZ_NAME)))
+        except ValueError as error:
+            await self._safe_reply(message, f"比赛时间未保存：{error}，请核对后再发。 [validation]")
+            return
+        err = None
+        if info is None:
+            info, err = await extract_contest(raw_text)
         if err is not None or not info:
             await self._safe_reply(
                 message,

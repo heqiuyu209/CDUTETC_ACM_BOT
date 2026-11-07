@@ -3,6 +3,7 @@
 import re
 
 from cdutetc import config
+from cdutetc.publish_text import is_publication_question, is_timed_reminder_request
 
 # QQ 群消息中的 @ 片段：OneBot CQ 码 [CQ:at,qq=...] 与旧格式 <@!...>
 _AT_PATTERN = re.compile(r"\[CQ:at,qq=[^\]]*\]|<@!?[^>]*>")
@@ -37,7 +38,8 @@ def contains_link(content: str) -> bool:
 
 # 发布命令的可用写法（老师习惯用斜杠，也习惯叫“添加比赛”）。
 # 顺序按长度从大到小，避免短前缀先命中长命令。
-_PUBLISH_PREFIXES = ("/添加比赛", "添加比赛", "/发布", "发布")
+_NATURAL_PUBLISH_PREFIXES = ("/添加一个比赛", "添加一个比赛", "/添加一场比赛", "添加一场比赛", "/添加个比赛", "添加个比赛")
+_PUBLISH_PREFIXES = (*_NATURAL_PUBLISH_PREFIXES, "/添加比赛", "添加比赛", "/发布", "发布")
 
 # 命令词后面允许出现的分隔符：空白与各种标点。
 # 中文输入法下「/添加比赛，15分钟…」很常见，不能因为它没空格就拒绝。
@@ -61,11 +63,13 @@ def match_publish_command(text: str, cmd: str = "发布") -> str | None:
         rest = s[len(prefix):]
         if not rest:
             return ""
+        if prefix in _NATURAL_PUBLISH_PREFIXES:
+            return None if is_publication_question(rest) else rest.strip(_CMD_SEPARATORS).strip()
         if (rest[0] in _CMD_SEPARATORS
                 or rest.startswith(("http://", "https://", "www."))):
             return rest.strip(_CMD_SEPARATORS).strip()
         continue
-    return None
+    return s if is_timed_reminder_request(s) else None
 
 
 def is_valid_account_id(value: str | None) -> bool:
