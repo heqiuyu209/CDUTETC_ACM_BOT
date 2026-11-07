@@ -512,8 +512,8 @@ class ACMBot:
             # 所有 @ 都不被识别、普通提问被静默丢弃。
             self_id = str(message.raw.get("self_id") or "")
             bot_qq = self_id or config.BOT_QQ
-            # 官方机器人的群消息本身就只在 @机器人 时推送，接入层会置
-            # always_addressed；OneBot 则要靠 CQ 码解析，两条路径都支持。
+            # 官方接入层根据事件类型或平台 is_you 标记判断 @；
+            # OneBot 则靠 CQ 码解析，两条路径都保留群内喊话要求。
             addressed = (
                 getattr(message, "always_addressed", False)
                 or (bool(bot_qq) and bot_qq in targets)
@@ -955,8 +955,8 @@ class ACMBot:
             _reply_sequence.set(seq)
             await notifications.send_group(
                 self.client, group_id,
-                f"本群尚未授权（群号 {group_id}）。\n"
-                f"请管理员在已授权群或私聊机器人发送：/加群 {group_id}",
+                "本群尚未授权。\n"
+                f"请超管私聊机器人发送：/加群 {group_id}",
                 reply_to=str(getattr(message, "id", "") or ""), reply_seq=seq,
             )
         except Exception:  # noqa: BLE001

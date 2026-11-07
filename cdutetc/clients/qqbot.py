@@ -10,8 +10,8 @@
 1. 官方机器人拿不到 QQ 号，只有 group_openid / member_openid。
    因此 ACM_ALLOWED_GROUPS / ACM_TEACHER_WHITELIST / ACM_SUPER_ADMIN
    里填的必须是 openid，不能填 QQ 号。
-2. 群消息只在「@机器人」时推送（on_group_at_message_create），
-   消息本身就已指向机器人，所以消息对象带 always_addressed=True。
+2. 群 @ 事件直接标记已指向机器人；全量群消息事件根据 mentions.is_you
+   判断是否 @ 本机器人，普通群聊仍由业务入口按需忽略。
 3. 被动回复需要带 msg_id；主动推送（定时提醒）不带 msg_id，
    受平台主动消息配额限制。
 
@@ -20,6 +20,7 @@ botpy 采用延迟导入：未安装时本模块仍可被导入，只有真正�
 """
 
 import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass
 import logging
 import secrets
@@ -78,25 +79,39 @@ class QQBotMessage:
         )
 
 
+def _field(data, name: str, default=None):
+    """兼容原始事件字典与 SDK 模型，保留旧 SDK 没有暴露的字段。"""
+    return data.get(name, default) if isinstance(data, dict) else getattr(data, name, default)
+
+
 def wrap_group_at_message(message) -> QQBotMessage:
     """把 botpy 的 GroupMessage（@机器人）转成统一消息对象。
 
     字段来源均做容错：不同 botpy 版本对 author 的嵌套略有差异。
     """
-    author = getattr(message, "author", None)
+    author = _field(message, "author")
     member_openid = (
-        getattr(author, "member_openid", "")
-        or getattr(message, "member_openid", "")
+        _field(author, "member_openid", "")
+        or _field(message, "member_openid", "")
     )
     return QQBotMessage(
         message,
         message_type="group",
-        group_id=getattr(message, "group_openid", "") or "",
+        group_id=_field(message, "group_openid", "") or "",
         user_id=member_openid or "",
-        content=getattr(message, "content", "") or "",
-        msg_id=getattr(message, "id", "") or "",
+        content=_field(message, "content", "") or "",
+        msg_id=_field(message, "id", "") or "",
         always_addressed=True,
     )
+
+
+def wrap_group_message(message) -> QQBotMessage:
+    """全量群事件不能当成群 @ 事件；只信平台明确的 is_you 布尔标记。"""
+    wrapped = wrap_group_at_message(message)
+    wrapped.always_addressed = any(
+        _field(mention, "is_you") is True for mention in (_field(message, "mentions", []) or [])
+    )
+    return wrapped
 
 
 def wrap_c2c_message(message) -> QQBotMessage:
@@ -132,6 +147,24 @@ class QQBotClient:
         self._last_rx = time.monotonic()
         # 主动消息不复用 SDK 的默认序号1；随机起点也减少重启后的序号重合。
         self._active_msg_seq = secrets.randbelow(2**31 - 2) + 1
+        self._recent_group_messages: OrderedDict[tuple[str, str], None] = OrderedDict()
+
+    async def _receive_group_message(self, wrapped: QQBotMessage) -> None:
+        self._last_rx = time.monotonic()
+        if self.group_msg_handler is None:
+            return
+        # 同一消息可能同时以群 @ 和全量事件到达；未 @ 消息不占用已处理记录。
+        if wrapped.always_addressed and wrapped.group_id and wrapped.id:
+            key = (wrapped.group_id, wrapped.id)
+            if key in self._recent_group_messages:
+                return
+            self._recent_group_messages[key] = None
+            if len(self._recent_group_messages) > 1024:
+                self._recent_group_messages.popitem(last=False)
+        try:
+            await self.group_msg_handler(wrapped)
+        except Exception:  # noqa: BLE001
+            logger.exception("群消息处理失败")
 
     # ---------- 生命周期 ----------
 
@@ -141,6 +174,17 @@ class QQBotClient:
         adapter = self
 
         class _Client(botpy.Client):
+            async def _bot_login(self, *args, **kwargs):
+                await super()._bot_login(*args, **kwargs)
+                # botpy 1.2.1 缺少此解析器。仅为本连接补缺，原生支持时不覆盖。
+                parsers = self._connection.parser
+                if "group_message_create" not in parsers:
+                    def parse_group_message(payload):
+                        # 直接保留原始体；旧 SDK 的 GroupMessage 会丢掉 mentions。
+                        self.ws_dispatch("group_message_create", payload.get("d", {}))
+                    parsers["group_message_create"] = parse_group_message
+                    logger.info("已启用 GROUP_MESSAGE_CREATE 事件兼容处理")
+
             async def on_ready(self):
                 logger.info("官方机器人已连接（AppID=%s）", adapter.appid)
                 adapter._last_rx = time.monotonic()
@@ -148,13 +192,10 @@ class QQBotClient:
                     await adapter.on_ready()
 
             async def on_group_at_message_create(self, message):
-                adapter._last_rx = time.monotonic()
-                wrapped = wrap_group_at_message(message)
-                if adapter.group_msg_handler is not None:
-                    try:
-                        await adapter.group_msg_handler(wrapped)
-                    except Exception:  # noqa: BLE001
-                        logger.exception("群消息处理失败")
+                await adapter._receive_group_message(wrap_group_at_message(message))
+
+            async def on_group_message_create(self, message):
+                await adapter._receive_group_message(wrap_group_message(message))
 
             async def on_c2c_message_create(self, message):
                 adapter._last_rx = time.monotonic()

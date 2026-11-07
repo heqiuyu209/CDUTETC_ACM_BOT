@@ -88,8 +88,8 @@ _HELP_SECTIONS = (
         (3, "/待审拒绝 <更新id> [原因]", "忽略来源更新"),
     )),
     ("群与老师管理（超管）", (
-        (3, "/加群 <群号> [备注]", "让机器人在该群工作"),
-        (3, "/删群 <群号>", "取消该群授权"),
+        (3, "/加群 <群标识> [备注]", "让机器人在该群工作"),
+        (3, "/删群 <群标识>", "取消该群授权"),
         (3, "/加老师 <QQ号> [备注]", "设置老师身份"),
         (3, "/删老师 <QQ号>", "取消老师身份"),
         (3, "/命名群 <标识> <名称>", "给群起名字，提示里显示名字而不是 openid"),
@@ -646,6 +646,9 @@ def cmd_group_add(group_id: str, sender: str, args: str) -> list[dict]:
     if not is_super_admin(sender):
         return [{"group_id": group_id, "text": "仅超管可添加群"}]
     gid, note = _split_id_note(args)
+    if config.BOT_PROTOCOL == "qqbot" and gid.isdecimal() and len(gid) <= 12:
+        return [{"group_id": group_id, "text": "官方接入不能用 QQ 群号授权。请先在目标群 @我 /帮助，"
+                 "再把我给出的 /加群 指令复制到私聊。"}]
     ok, msg = roles.add_group(gid, operator=sender, note=note)
     return [{"group_id": group_id, "text": msg, "notify_super_admin": ok}]
 

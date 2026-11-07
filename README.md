@@ -60,6 +60,10 @@
 
 `ACM_BOT_PROTOCOL=onebot` 使用 NapCat/OneBot；`qqbot` 使用 QQ 开放平台 botpy。配置协议后需重启，不会同时登录两个接入。两套身份标识不同：OneBot填QQ号/群号，官方填对应 openid，不能直接复用QQ号。
 
+官方群同时兼容 `GROUP_AT_MESSAGE_CREATE` 与 `GROUP_MESSAGE_CREATE`。后者可能包含未 @ 机器人的群聊，只有平台 `mentions.is_you=true` 才标记喊话；默认普通群聊不回复、不调用模型。同一群内同一消息的新旧事件去重处理。botpy 缺少全量事件解析器时，本项目在登录后、网关连接前为当前连接补齐，保留原始 `mentions`；已原生支持时不覆盖，也不修改已安装的 SDK 文件。解析入口对照 [官方 ConnectionState](https://github.com/tencent-connect/botpy/blob/master/botpy/connection.py) 与 [网关分发](https://github.com/tencent-connect/botpy/blob/master/botpy/gateway.py)，全量消息的 @ 判断对照 [AstrBot 官方 QQ 适配](https://github.com/AstrBotDevs/AstrBot/blob/master/astrbot/core/platform/sources/qqofficial/qqofficial_platform_adapter.py)。
+
+新群启用：先在目标群发送 `@机器人 /帮助`。未授权时，机器人会给出包含本群真实标识的 `/加群 ...`，由超管复制到私聊执行，再回群发送 `@机器人 你好`。官方群不能使用 QQ 客户端显示的群号授权；`/加群` 会拒绝常见的短数字群号。以前误加的数字记录可用 `/删群 原群号` 删除，不会自动改动既有白名单。若仍出现 `_parser unknown event group_message_create`，应更新本项目并重启服务；仅加白名单不能修复 SDK 的解析缺失。
+
 官方被动回复只关联当前入站消息的 `msg_id`，同一消息的多条回复递增 `msg_seq`；定时和跨群通知不借用历史消息ID，不把被动发送失败悄悄改成主动重发。官方主动消息仍受平台权限、频控和配额限制，创建计划不等于平台允许投递。实际可用性请用通知测试确认。参见 [官方消息收发文档](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html)。
 
 遇到 `40034105` 时先验证通道，再决定是否更换接入方式：
