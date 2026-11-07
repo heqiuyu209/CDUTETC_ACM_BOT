@@ -64,6 +64,7 @@
 - [官方群消息接口](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html) 将 `40034105` 定义为主动消息权限拒绝，`40034100` 才是主动消息频控。APScheduler 的 `Job executed successfully` 只表示任务函数正常返回，不能代替平台成功回执或群内收信。
 - [NoneBot QQ 适配器](https://github.com/nonebot/adapter-qq/blob/master/nonebot/adapters/qq/bot.py) 和 [官方 botpy](https://github.com/tencent-connect/botpy/blob/master/botpy/api.py) 同样调用 `POST /v2/groups/{group_openid}/messages`，主动消息不依赖 `msg_id`。本项目沿用这一路径；换 SDK 预计不能解决服务端权限拒绝。botpy 的部分异常只保留中文消息，本项目兼容识别该形状并保留受控错误码。
 - [AstrBot 的同类实测讨论](https://github.com/AstrBotDevs/AstrBot/issues/10454) 也报告群主动消息返回 `40034105`。`is_wakeup` 属于单聊召回能力，当前群发送接口没有这个字段，不作为群定时提醒的替代方案。旧版文档与当前文档存在差异，以现行接口和目标机器人的真实回执为准。
+- 腾讯官方插件的 [同类问题讨论](https://github.com/tencent-connect/openclaw-qqbot/issues/43) 中，维护者曾表示群主动发送受平台限制，2026年9月仍有直接调用接口返回 `40034105` 且找不到配置入口的反馈；[当前插件说明](https://github.com/tencent-connect/openclaw-qqbot/blob/main/README.zh.md) 也将定时通知与 QQ 主动消息能力绑定。因此，看到频控表或“支持定时推送”不代表当前应用已获授权。群内开关已开启且后台没有对应入口时，不猜测一定存在可自助开通的菜单；应通过官方文档页底的开发者社区，提供应用信息、请求时间和 `trace_id` 请平台核查。不要公开 AppSecret 或 access_token。
 - 群里开启“允许主动发送”后，先执行主动测试；返回“平台已接受”且群内收到独立测试消息，再用未来的比赛验证定时投递。如果仍是 `40034105`，应继续核实平台权限，或评估已有的 NapCat/OneBot 接入。后者使用登录中的普通 QQ 账号，需要维护登录和重连；提醒、FAQ 与审批逻辑可沿用，但白名单及既有按群数据需要显式映射，不能直接把 OpenID 当 QQ 号使用。当前不会自动切换协议。
 
 ## 消息指令
