@@ -35,6 +35,7 @@ from cdutetc.database import (
 )
 from cdutetc.database import list_collections_all as _list_collections_all
 from cdutetc.database import get_competition_notify_groups
+from cdutetc.database import get_group_notification_block
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,10 @@ def _countdown(target: datetime, now: datetime) -> str:
     return f"约{hours}小时" + (f"{remainder}分钟" if remainder else "")
 
 
+def _platform_paused(group_id: str) -> bool:
+    return config.BOT_PROTOCOL == "qqbot" and get_group_notification_block(config.BOT_PROTOCOL, group_id) is not None
+
+
 async def check_contest_start_reminders(send_group, now: datetime | None = None,
                                        max_attempts: int = _DELIVERY_MAX_ATTEMPTS) -> int:
     """投递事务创建的开赛前30/15分钟计划；不动态补建逾期节点。"""
@@ -147,6 +152,8 @@ async def check_contest_start_reminders(send_group, now: datetime | None = None,
     comps = {item["id"]: item for item in list_competitions(status="confirmed")}
     sent = 0
     for delivery in list_due_contest_start_deliveries(current, allowed):
+        if _platform_paused(delivery["group_id"]):
+            continue
         current = clock()
         competition = comps.get(delivery["obj_id"])
         if not competition:
@@ -172,6 +179,8 @@ async def check_contest_start_reminders(send_group, now: datetime | None = None,
             + "记得提前登录，检查好比赛环境。"
         )
         result = await _send_reminder_result(send_group, delivery["group_id"], text)
+        if not result[0]:
+            logger.warning("比赛 #%s 开赛提醒未发送 [%s]", delivery["obj_id"], result[2])
         try:
             receipt_saved = result[0] and record_delivery_success(key, token, now=current)
             finish_delivery(key, token, result[0], error=result[1], error_code=result[2],
@@ -231,7 +240,7 @@ async def check_reminders(send_group) -> int:
     sent = 0
     for contest in list_contests():
         group_id = contest.get("group_id") or ""
-        if not group_id:
+        if not group_id or _platform_paused(group_id):
             # 旧记录未归属任何群：隔离保留，不发送提醒
             continue
         for item in build_reminders([contest], now):
@@ -404,6 +413,8 @@ async def check_general_reminders(send_group, now: datetime | None = None,
     items.extend(build_training_reminders(sessions, current_time()))
     sent = 0
     for item in items:
+        if _platform_paused(item["group_id"]):
+            continue
         key = _delivery_key(item)
         token = claim_delivery(
             item["group_id"], item["obj_type"], item["obj_id"], item["remind_type"], item["target_str"],

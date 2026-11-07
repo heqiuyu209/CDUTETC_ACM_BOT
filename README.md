@@ -45,18 +45,26 @@
 - 审批时已经过去的节点不创建；改期时取消旧计划并创建新时间的未来节点；时间未定不排计划。停机恢复时只发送仍在120秒宽限内的节点，超过标记 expired，避免补刷过时消息。
 - `/提醒状态` 显示计划时间、目标时间、状态、尝试次数和错误码；关闭主动消息时暂停投递、不消耗重试次数。暂停超过宽限的节点不会在开启后追发。
 - 超管可用 `/通知测试 群 <群标识>` 或 `/通知测试 私聊 [用户标识]` 主动发送一条测试消息，再在当前会话收到含错误码的结果。群内省略参数默认测本群，私聊省略参数默认测自己；测试会真实发一条消息，不自动触发。
+- 官方 QQ 返回 `40034105` 时，按群持久暂停主动通知，`/提醒状态` 显示权限拒绝和恢复步骤；跳过投递不增加尝试次数，其他群和当前消息的被动回复照常处理。修复平台权限后，由超管在目标群发送 `@机器人 /通知测试 群`；主动接口成功返回消息 ID 才解除暂停。恢复后仅投递仍有效的节点，已过期或重试耗尽的记录不会补发。
 
 比赛报名截止、征集截止和课程开课统一使用 `ACM_REMIND_OFFSET_HOURS`（默认 `24,1`），每个节点单独去重；课程的每周实例也分别记录。开赛前提醒使用独立分钟节点，倒计时按实际发送时间计算；即使自定义的节点很短，开赛后也不补发。全部提醒使用本地自然文案，**0 次模型调用、0 token**。升级前已经发送的无节点旧记录继续阻止重发，新活动使用完整多节点。
 
 仅配置旧 `ACM_REMIND_BEFORE_HOURS`、未配置多节点的部署继续使用旧值；自动补齐 `.env` 不会擅自加入 `24,1`。希望切换多节点时请显式添加 `ACM_REMIND_OFFSET_HOURS`。节点必须是有限正数，非法值在启动时拒绝。周赛预生成会覆盖配置中最早的提醒窗口；其他周期扫描提醒使用很短或相近节点时，也应调小 `ACM_REMIND_CHECK_INTERVAL_MINUTES`。
 
-发布、修正、超管确认、定时提醒、直接回复共用统一通知入口。应用错误包括 `[validation]`、`[permission]`、`[internal]`、`[fetch]`、`[llm]`；投递错误包括 `[not_connected]`、`[disabled]`、`[target_not_allowed]`、`[authentication]`、`[forbidden]`、`[rate_limited]`、`[timeout_unknown]` 等。未知平台错误保留为 `[unknown]`，不会猜测成“额度用完”。网络超时存在平台已收但本地未确认的可能，重试不能保证严格 exactly-once。
+发布、修正、超管确认、定时提醒、直接回复共用统一通知入口。应用错误包括 `[validation]`、`[permission]`、`[internal]`、`[fetch]`、`[llm]`；投递错误包括 `[not_connected]`、`[disabled]`、`[target_not_allowed]`、`[authentication]`、`[forbidden]`、`[active_forbidden]`、`[rate_limited]`、`[timeout_unknown]` 等。未知平台错误保留为 `[unknown]`，不会猜测成“额度用完”。网络超时存在平台已收但本地未确认的可能，重试不能保证严格 exactly-once。
 
 ### 双协议保持可切换
 
 `ACM_BOT_PROTOCOL=onebot` 使用 NapCat/OneBot；`qqbot` 使用 QQ 开放平台 botpy。配置协议后需重启，不会同时登录两个接入。两套身份标识不同：OneBot填QQ号/群号，官方填对应 openid，不能直接复用QQ号。
 
 官方被动回复只关联当前入站消息的 `msg_id`，同一消息的多条回复递增 `msg_seq`；定时和跨群通知不借用历史消息ID，不把被动发送失败悄悄改成主动重发。官方主动消息仍受平台权限、频控和配额限制，创建计划不等于平台允许投递。实际可用性请用通知测试确认。参见 [官方消息收发文档](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html)。
+
+遇到 `40034105` 时先验证通道，再决定是否更换接入方式：
+
+- [官方群消息接口](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html) 将 `40034105` 定义为主动消息权限拒绝，`40034100` 才是主动消息频控。APScheduler 的 `Job executed successfully` 只表示任务函数正常返回，不能代替平台成功回执或群内收信。
+- [NoneBot QQ 适配器](https://github.com/nonebot/adapter-qq/blob/master/nonebot/adapters/qq/bot.py) 和 [官方 botpy](https://github.com/tencent-connect/botpy/blob/master/botpy/api.py) 同样调用 `POST /v2/groups/{group_openid}/messages`，主动消息不依赖 `msg_id`。本项目沿用这一路径；换 SDK 预计不能解决服务端权限拒绝。botpy 的部分异常只保留中文消息，本项目兼容识别该形状并保留受控错误码。
+- [AstrBot 的同类实测讨论](https://github.com/AstrBotDevs/AstrBot/issues/10454) 也报告群主动消息返回 `40034105`。`is_wakeup` 属于单聊召回能力，当前群发送接口没有这个字段，不作为群定时提醒的替代方案。旧版文档与当前文档存在差异，以现行接口和目标机器人的真实回执为准。
+- 群里开启“允许主动发送”后，先执行主动测试；返回“平台已接受”且群内收到独立测试消息，再用未来的比赛验证定时投递。如果仍是 `40034105`，应继续核实平台权限，或评估已有的 NapCat/OneBot 接入。后者使用登录中的普通 QQ 账号，需要维护登录和重连；提醒、FAQ 与审批逻辑可沿用，但白名单及既有按群数据需要显式映射，不能直接把 OpenID 当 QQ 号使用。当前不会自动切换协议。
 
 ## 消息指令
 
@@ -226,7 +234,7 @@ python -m pytest -q
 
 ## 已知问题
 
-- **未完成真实 QQ 联调**：所有行为验证均基于离线测试；真实群的消息格式、@ 解析、回复链路、审核与登记交互尚未实测，可能暴露平台差异。
+- **真实 QQ 验收未完成**：已收到云服务器群主动发送被 `40034105` 拒绝的日志；权限修复后的成功送达、回复链路、审核与登记交互仍需真实验收。离线回归通过不代表平台权限已开通。
 - **主动通知待真实联调**：真实发送接口已接入，默认开启（`ACM_GROUP_ACTIVE_MESSAGES_ENABLED=0` 可关闭）；平台未授权、接收群拒绝、机器人离线或频控均可能导致发送失败，反馈以接口回执为准。
 - **模型提取可能幻觉**：字段可能不准确，默认先由超管确认，发布后可 `/修正`；部署时关闭发布确认会跳过人工把关。
 - **旧库记录归属为空**：旧版 `contests` 表迁移后旧记录不归属任何群、不参与提醒，需管理员人工按需迁移。
@@ -234,7 +242,7 @@ python -m pytest -q
 
 ## 待平台授权 / 当前限制
 
-- **启用群主动消息**：先确认 NapCat 已连接且目标群允许接收主动消息，再设置 `ACM_GROUP_ACTIVE_MESSAGES_ENABLED=1` 并启动机器人。`main._send_group` 调用 OneBot 的 `send_group_msg`；仅返回有效消息 `message_id` 才视为发送成功。权限、频控、超时或空回执均不标记为已发送。
+- **启用群主动消息**：设置 `ACM_GROUP_ACTIVE_MESSAGES_ENABLED=1`，并确认当前协议已连接。OneBot 通过 NapCat 的 `send_group_msg` 发送；官方 QQ 通过群消息接口发送，还受机器人权限与目标群“允许主动发送”设置控制。仅返回有效消息 ID 才确认平台接受；权限、频控、超时或空回执均不标记为已发送。已有权限暂停的群需由超管主动测试成功后恢复。
 - **关闭与失败反馈**：设置 `ACM_GROUP_ACTIVE_MESSAGES_ENABLED=0` 时，发布和修正仍保存资料并回复触发群，跨群通知明确显示未发送；定时提醒暂停，不消耗投递重试次数。老师可用 `/提醒状态` 查看启用状态。启用后每个目标群独立投递，一个群失败不阻止其他群，结果显示已确认发送的数量。
 - **群通知与 @全体**：本项目使用普通群文本消息。公开接口没有 `@全体` 参数，因此不声称已触发全员提醒。参见 [官方群消息接口](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html) 与 [消息收发概述](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html)。
 - **老师身份来源**：目前老师白名单以 OneBot 的成员 QQ 号（`user_id`）为准，需在部署环境将老师 QQ 号配置进 `ACM_TEACHER_WHITELIST`；如 QQ 侧能提供群管理员角色字段，可进一步自动识别管理员。

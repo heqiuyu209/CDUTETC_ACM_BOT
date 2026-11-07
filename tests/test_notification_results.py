@@ -47,6 +47,32 @@ def test_error_serialization_does_not_leak_exception_text():
     assert safe_error_hint(AppErrorCode.VALIDATION).startswith("[validation]")
 
 
+class ServerError(RuntimeError):
+    """保留官方botpy ServerError的msgs形状，而非伪造HTTP status属性。"""
+    def __init__(self, message):
+        self.msgs = message
+
+
+@pytest.mark.parametrize("payload", [
+    "主动消息失败, 无权限", "主动消息发送失败，无权限",
+    {"code": 40034105, "message": "敏感会话资料不可泄漏"},
+    '{"err_code":40034105,"message":"不要输出原始请求或身份"}',
+])
+def test_official_active_permission_denial_is_not_server_failure(payload):
+    result = result_from_exception(ServerError(payload), protocol="qqbot", mode=DeliveryMode.ACTIVE)
+    assert result.code == DeliveryCode.ACTIVE_FORBIDDEN
+    assert result.platform_code == 40034105
+    assert "40034105" in result.user_hint
+    assert "敏感" not in str(result.to_dict()) and "原始请求" not in str(result.to_dict())
+
+
+def test_official_rate_limit_is_separate_from_permission_denial():
+    result = result_from_exception(ServerError({"code": 40034100}), protocol="qqbot", mode=DeliveryMode.ACTIVE)
+    assert result.code == DeliveryCode.RATE_LIMITED
+    assert result.platform_code == 40034100
+    assert classify_exception(ServerError("未知服务异常")) == DeliveryCode.PLATFORM_ERROR
+
+
 def test_onebot_receipt_requires_status_retcode_and_message_id():
     assert result_from_onebot(
         {"status": "ok", "retcode": 0, "data": {"message_id": 3}},

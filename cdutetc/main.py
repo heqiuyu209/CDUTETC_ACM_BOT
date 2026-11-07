@@ -854,12 +854,15 @@ class ACMBot:
             return "[validation] 私聊测试群通知时必须指定目标群标识。"
         text = "【通知通道测试】这是主动通知测试消息；收到本条才表示平台已投递到此会话。"
         if kind == "群":
-            result = await self._send_group_result(target, text)
+            result = await self._send_group_result(target, text, permission_probe=True)
         else:
             # 特意不调用_send_private：该方法可能为当前入站生成被动回复。
             result = await notifications.send_private(self.client, target, text)
         code = getattr(result.code, "value", str(result.code))
-        return f"通知测试：{'平台已接受' if result.ok else '未确认发送'} [{code}] {result.user_hint}"
+        answer = f"通知测试：{'平台已接受' if result.ok else '未确认发送'} [{code}] {result.user_hint}"
+        if kind == "群" and result.ok:
+            answer += " 主动通道本次测试通过，权限暂停已解除；仍有效的未来提醒会按计划发送。"
+        return answer
 
     async def _send_private_result(self, user_id: str, text: str) -> DeliveryResult:
         """当前私聊直接回复显式关联入站ID，其余调用均为主动通知。"""
@@ -932,14 +935,26 @@ class ACMBot:
 
     # ---------- 定时任务回调 ----------
 
-    async def _send_group_result(self, group_id: str, text: str):
+    async def _send_group_result(self, group_id: str, text: str, *, permission_probe: bool = False):
         """主动通知唯一业务入口，返回可审计的结构化结果。"""
         from cdutetc.errors import DeliveryCode, DeliveryResult
         if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
             return DeliveryResult(False, DeliveryCode.TARGET_NOT_ALLOWED, config.BOT_PROTOCOL)
         if not config.GROUP_ACTIVE_MESSAGES_ENABLED:
             return DeliveryResult(False, DeliveryCode.DISABLED, config.BOT_PROTOCOL)
-        return await notifications.send_group(self.client, group_id, text)
+        if config.BOT_PROTOCOL == "qqbot" and not permission_probe:
+            block = db.get_group_notification_block(config.BOT_PROTOCOL, group_id)
+            if block:
+                return DeliveryResult(False, DeliveryCode.ACTIVE_FORBIDDEN, config.BOT_PROTOCOL,
+                                      detail="active_permission_paused", platform_code=block["platform_code"])
+        result = await notifications.send_group(self.client, group_id, text)
+        if config.BOT_PROTOCOL == "qqbot":
+            if result.code == DeliveryCode.ACTIVE_FORBIDDEN:
+                db.block_group_notifications(config.BOT_PROTOCOL, group_id, result.code.value, result.platform_code)
+                logger.warning("QQ主动发送被平台拒绝，已持久暂停该群，需恢复权限后执行 /通知测试 群 验证 [40034105]")
+            elif result.ok and permission_probe:
+                db.clear_group_notification_block(config.BOT_PROTOCOL, group_id)
+        return result
 
     async def _send_group(self, group_id: str, text: str) -> bool:
         """兼容旧bool调用方；实际发送统一经过结构化入口。"""

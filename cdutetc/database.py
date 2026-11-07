@@ -335,6 +335,17 @@ CREATE TABLE IF NOT EXISTS reminder_success_receipts (
 )
 """
 
+_GROUP_NOTIFICATION_BLOCKS_DDL = """
+CREATE TABLE IF NOT EXISTS group_notification_blocks (
+    protocol      TEXT NOT NULL,
+    group_id      TEXT NOT NULL,
+    error_code    TEXT NOT NULL,
+    platform_code INTEGER,
+    blocked_at    TEXT NOT NULL,
+    PRIMARY KEY (protocol, group_id)
+)
+"""
+
 _AUDIT_LOG_DDL = """
 CREATE TABLE IF NOT EXISTS audit_log (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -378,7 +389,7 @@ _ALL_DDL = (
     _ORG_EVENTS_DDL,
     _TRAINING_SESSIONS_DDL, _GROUP_FAQ_DDL, _UNANSWERED_DDL,
     _COLLECTIONS_DDL, _COLLECTION_RESPONSES_DDL,
-    _REMINDER_DELIVERIES_DDL, _REMINDER_SUCCESS_RECEIPTS_DDL, _AUDIT_LOG_DDL,
+    _REMINDER_DELIVERIES_DDL, _REMINDER_SUCCESS_RECEIPTS_DDL, _GROUP_NOTIFICATION_BLOCKS_DDL, _AUDIT_LOG_DDL,
 )
 
 
@@ -2790,6 +2801,31 @@ def list_deliveries(group_id: str, *, statuses: tuple[str, ...] | None = None,
             [*args, limit],
         ).fetchall()
     return [_row_to_delivery(row) for row in rows]
+
+
+def get_group_notification_block(protocol: str, group_id: str) -> dict | None:
+    """平台权限暂停按协议和群持久保存，不影响被动回复或其他群。"""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT error_code, platform_code, blocked_at FROM group_notification_blocks WHERE protocol=? AND group_id=?",
+            (protocol, group_id),
+        ).fetchone()
+    return dict(zip(("error_code", "platform_code", "blocked_at"), row)) if row else None
+
+
+def block_group_notifications(protocol: str, group_id: str, error_code: str, platform_code: int | None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO group_notification_blocks (protocol, group_id, error_code, platform_code, blocked_at)"
+            " VALUES (?, ?, ?, ?, ?) ON CONFLICT(protocol, group_id) DO UPDATE SET"
+            " error_code=excluded.error_code, platform_code=excluded.platform_code",
+            (protocol, group_id, error_code, platform_code, now_str()),
+        )
+
+
+def clear_group_notification_block(protocol: str, group_id: str) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM group_notification_blocks WHERE protocol=? AND group_id=?", (protocol, group_id))
 
 
 def delivery_status_counts(group_id: str) -> dict[str, int]:

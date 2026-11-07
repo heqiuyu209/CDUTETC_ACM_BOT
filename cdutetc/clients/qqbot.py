@@ -192,7 +192,7 @@ class QQBotClient:
             response = await func(**params)
         except Exception as error:  # noqa: BLE001
             result = result_from_exception(error, protocol=protocol, mode=mode)
-            logger.warning("%s send failed (%s)", action, result.code.value)
+            logger.warning("%s send failed (%s, platform_code=%s)", action, result.code.value, result.platform_code)
             return result
         message_id = self._message_id(response)
         if response is None:

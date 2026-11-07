@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import json
+import re
 from typing import Any
 
 
@@ -38,6 +40,7 @@ class DeliveryCode(str, Enum):
     INVALID_REQUEST = "invalid_request"
     AUTHENTICATION = "authentication"
     FORBIDDEN = "forbidden"
+    ACTIVE_FORBIDDEN = "active_forbidden"
     NOT_FOUND = "not_found"
     RATE_LIMITED = "rate_limited"
     PLATFORM_ERROR = "platform_error"
@@ -61,6 +64,7 @@ _SAFE_HINTS = {
     DeliveryCode.INVALID_REQUEST: "[invalid_request] 平台拒绝了消息请求，请检查消息格式和目标参数。",
     DeliveryCode.AUTHENTICATION: "[authentication] 平台鉴权失败，请检查机器人凭证和授权状态。",
     DeliveryCode.FORBIDDEN: "[forbidden] 平台拒绝发送，请检查目标会话权限和机器人主动消息设置。",
+    DeliveryCode.ACTIVE_FORBIDDEN: "[active_forbidden] QQ平台拒绝主动消息（40034105）。请检查目标群/会话的“允许主动发送/主动通知”和机器人权限，修复后用 /通知测试 验证。",
     DeliveryCode.NOT_FOUND: "[not_found] 平台未找到目标会话，请确认机器人仍在目标群或会话有效。",
     DeliveryCode.RATE_LIMITED: "[rate_limited] 平台频率或配额限制了发送，请查看平台配额后再处理。",
     DeliveryCode.PLATFORM_ERROR: "[platform_error] 平台服务暂时无法确认发送结果，请检查平台状态。",
@@ -81,11 +85,12 @@ class DeliveryResult:
     mode: DeliveryMode = DeliveryMode.ACTIVE
     detail: str = ""
     message_id: str = ""
+    platform_code: int | None = None
 
     def __bool__(self) -> bool:
         return self.ok
 
-    def to_dict(self) -> dict[str, str | bool]:
+    def to_dict(self) -> dict[str, str | bool | int | None]:
         """Safe structured logging payload; excludes raw exception text."""
         return {
             "ok": self.ok,
@@ -94,6 +99,7 @@ class DeliveryResult:
             "mode": self.mode.value,
             "detail": self.detail,
             "message_id": self.message_id,
+            "platform_code": self.platform_code,
         }
 
     @property
@@ -105,9 +111,38 @@ class DeliveryResult:
         return cls(True, DeliveryCode.SENT, protocol, mode, message_id=message_id)
 
 
+def _platform_error_code(error: BaseException) -> int | None:
+    """优先读取业务码；botpy老版本丢掉响应码时只识别已知的精确消息。"""
+    payload = getattr(error, "msgs", None)
+    if isinstance(payload, str) and payload.lstrip().startswith("{") and len(payload) <= 4096:
+        try:
+            payload = json.loads(payload)
+        except (ValueError, RecursionError):
+            pass
+    values = [getattr(error, "err_code", None), getattr(error, "code", None)]
+    if isinstance(payload, dict):
+        values += [payload.get("err_code"), payload.get("code")]
+    for value in values:
+        if type(value) is int and value > 0:
+            return value
+        if isinstance(value, str) and re.fullmatch(r"[0-9]{1,9}", value):
+            return int(value)
+    # 官方botpy的HTTP 400会抛ServerError，只把data['message']留在msgs里。
+    if isinstance(payload, str):
+        normalized = re.sub(r"\s+", "", payload).replace("，", ",")
+        if normalized in ("主动消息失败,无权限", "主动消息发送失败,无权限"):
+            return 40034105
+    return None
+
+
 def classify_exception(error: BaseException) -> DeliveryCode:
     """Map documented SDK exception classes/statuses; unknown errors stay generic."""
     name = type(error).__name__.lower()
+    platform_code = _platform_error_code(error)
+    if platform_code == 40034105:
+        return DeliveryCode.ACTIVE_FORBIDDEN
+    if platform_code == 40034100:
+        return DeliveryCode.RATE_LIMITED
     status = getattr(error, "status", None)
     if status is None:
         status = getattr(error, "status_code", None)
@@ -141,7 +176,7 @@ def result_from_exception(error: BaseException, *, protocol: str,
                           mode: DeliveryMode) -> DeliveryResult:
     # Do not expose exception text: SDK errors may contain request data or identifiers.
     return DeliveryResult(False, classify_exception(error), protocol, mode,
-                          detail=type(error).__name__)
+                          detail=type(error).__name__, platform_code=_platform_error_code(error))
 
 
 def result_from_onebot(response: Any, *, action: str, connected: bool = True) -> DeliveryResult:

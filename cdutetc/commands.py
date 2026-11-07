@@ -828,6 +828,11 @@ def cmd_reminder_status(group_id: str, sender: str, args: str) -> list[dict]:
              f"开赛计划：提前 {'、'.join(str(x) for x in config.CONTEST_REMIND_OFFSETS_MINUTES)} 分钟；"
              f"每 {config.CONTEST_REMIND_CHECK_SECONDS} 秒检查；逾期超过 {config.CONTEST_REMIND_GRACE_SECONDS} 秒跳过",
              "投递统计：" + "｜".join(f"{label} {counts.get(status, 0)}" for status, label in labels.items())]
+    block = db.get_group_notification_block(config.BOT_PROTOCOL, group_id)
+    if block:
+        lines.insert(1, f"平台主动发送：权限拒绝，已暂停该群通知 [{block['error_code']}/{block['platform_code']}]"
+                     f"；暂停自 {block['blocked_at']}，跳过投递不增加尝试次数。")
+        lines.insert(2, "先检查群/机器人“允许主动发送”权限，再由超管执行 /通知测试 群 验证恢复；私聊执行需带群标识。")
     if not pending:
         lines.append("本群当前无待发送提醒")
     else:
