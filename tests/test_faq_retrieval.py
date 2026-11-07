@@ -50,6 +50,37 @@ async def test_equipment_synonym_and_exact_question_take_priority(kb):
     assert answer["answer"] == "最新安排：需要带电脑"
 
 
+@pytest.mark.parametrize("question,stored", [
+    ("校赛怎么报名", "周赛怎么报名"),
+    ("蓝桥杯报名条件是什么", "校赛报名条件是什么"),
+    ("周赛报名什么时候截止", "周赛什么时候"),
+    ("周赛什么时候报名", "周赛什么时候截止报名"),
+    ("周赛和校赛怎么报名", "校赛怎么报名"),
+    ("周赛周六举办吗", "周赛周日举办吗"),
+    ("周赛报名不用交钱吗", "周赛报名要交钱吗"),
+    ("第2届校赛怎么报名", "第1届校赛怎么报名"),
+    ("周赛2.5小时吗", "周赛25小时吗"),
+    ("青鸟杯怎么报名", "星河杯怎么报名"),
+    ("周赛什么时候", "周赛报名"),
+])
+async def test_different_objects_and_conditions_never_reuse_answer(kb, monkeypatch, question, stored):
+    database.add_faq("g1", stored, "这不是所问对象或条件的答案")
+    monkeypatch.setattr(config, "QA_FAQ_LLM_ENABLED", True)
+    assert await commands.match_faq("g1", question) is None
+    kb.assert_not_awaited()
+
+
+async def test_relevant_candidate_wins_over_similar_wrong_event(kb):
+    expected = database.add_faq("g1", "周赛怎么报名", "周赛登记表")
+    database.add_faq("g1", "校赛怎么报名", "校赛登记表")
+    assert (await commands.match_faq("g1", "请问周赛如何报名"))["id"] == expected
+
+
+async def test_equivalent_weekday_wording_still_matches(kb):
+    expected = database.add_faq("g1", "周赛周日举办吗", "本周日正常举办")
+    assert (await commands.match_faq("g1", "周赛星期天举办吗"))["id"] == expected
+
+
 async def test_member_reads_faq_once_and_records_unmatched_question(kb, monkeypatch):
     database.add_faq("g2", "本群课程地点", "另一群资料")
     read = Mock(wraps=database.list_faq)

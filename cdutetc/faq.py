@@ -30,6 +30,8 @@ _NOISE = re.compile(
     r"要求|条件|需要|要不要|是否|有没有|有没|是不是|可以|本周|这个|一下|"
     r"[吗呢呀啊的了有是要带]"
 )
+_OBJECTS = re.compile(r"校赛|周赛|选拔赛|训练赛|蓝桥杯|天梯赛|icpc|ccpc|codeforces|atcoder")
+_SCOPE_NOISE = re.compile(r"比赛|报名|参赛|参加|开始|开赛|截止|举办|进行|什么|条件|要求|费用|流程|方法|材料")
 
 
 @lru_cache(maxsize=4096)
@@ -37,9 +39,45 @@ def _features(text: str) -> tuple[str, str, frozenset[str]]:
     normalized = unicodedata.normalize("NFKC", text).lower()
     for source, target in _ALIASES:
         normalized = normalized.replace(source, target)
+    normalized = re.sub(r"(?:星期|礼拜)([一二三四五六日天])", r"周\1", normalized).replace("周天", "周日")
     normalized = re.sub(r"[^\w+#]+|_", "", normalized)
     intents = frozenset(name for name, pattern in _INTENTS.items() if re.search(pattern, normalized))
     return normalized, _NOISE.sub("", normalized), intents
+
+
+def _compatible(question: str, stored: str) -> bool:
+    """排除明确不同的对象、日期、否定条件及所问时间类型。"""
+    query, topic, intents = _features(question)
+    candidate, other_topic, other_intents = _features(stored)
+    if intents and not intents.issubset(other_intents):
+        return False
+    objects, other_objects = set(_OBJECTS.findall(query)), set(_OBJECTS.findall(candidate))
+    if objects and other_objects and objects != other_objects:
+        return False
+    for pattern in (r"周[一二三四五六日]", r"上周|下周|本周", r"国赛|省赛|初赛|决赛"):
+        left, right = set(re.findall(pattern, query)), set(re.findall(pattern, candidate))
+        if left and right and left != right:
+            return False
+    def numbers(text):
+        return tuple(value.lstrip("0") or "0" for value in re.findall(
+            r"\d+(?:\.\d+)?", unicodedata.normalize("NFKC", text),
+        ))
+    if numbers(question) != numbers(stored):
+        return False
+    if bool(re.search(r"不|无需|无须|禁止", query)) != bool(re.search(r"不|无需|无须|禁止", candidate)):
+        return False
+    if "time" in intents:
+        def time_kind(text):
+            if "截止" in text or "最晚" in text:
+                return "deadline"
+            return "registration" if "报名" in text else "start"
+        if time_kind(query) != time_kind(candidate):
+            return False
+    # 报名等通用词不应让两个不同的自定义比赛名称获得高分。
+    scope, other_scope = _SCOPE_NOISE.sub("", topic), _SCOPE_NOISE.sub("", other_topic)
+    if scope and other_scope and content_filter.text_similarity(scope, other_scope) < 0.40:
+        return False
+    return True
 
 
 def _score(question: str, stored: str) -> float:
@@ -48,17 +86,9 @@ def _score(question: str, stored: str) -> float:
     if not query or not candidate:
         return 0.0
     if query == candidate:
-        return 1.0
-    # 同一主题的“几点”和“在哪”不能互相充当答案。
-    if intents and other_intents and not intents.intersection(other_intents):
+        return 1.0 if _compatible(question, stored) else 0.0
+    if not _compatible(question, stored):
         return 0.0
-    if len(intents) > 1 and other_intents and not intents.issubset(other_intents):
-        return 0.0
-    for words in (("本周", "下周", "上周"), ("报名", "开赛")):
-        left = {word for word in words if word in query}
-        right = {word for word in words if word in candidate}
-        if left and right and left.isdisjoint(right):
-            return 0.0
     if not topic or not other_topic:
         return 0.0
     topic_score = content_filter.text_similarity(topic, other_topic)
@@ -112,7 +142,7 @@ async def find(group_id: str, question: str, faqs: list[dict]) -> dict | None:
     if not candidates or len(question) > 160:
         return None
     # 答案也纳入版本：老师在同一秒修改资料仍会立即失效，群之间不复用。
-    key = (group_id, _features(question)[0],
+    key = (group_id, unicodedata.normalize("NFKC", question).strip(),
            tuple((faq["id"], faq["question"], faq["answer"]) for faq in candidates))
     cached = _choices.get(key)
     if cached and cached[0] > time.monotonic():

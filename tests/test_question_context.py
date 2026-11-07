@@ -247,7 +247,7 @@ def test_question_context_empty_group_or_nonpositive_limit_returns_empty(memory_
 async def test_member_question_prefers_local_kb_without_model(bot, monkeypatch):
     client, replies = bot
     database.create_competition(_public(), status="confirmed")
-    database.add_faq("g1", "本群校赛报名", "本群知识库答案")
+    database.add_faq("g1", "本群校赛报名在哪里", "本群知识库答案")
     chat = AsyncMock(return_value="模型不应调用")
     monkeypatch.setattr(llm, "_chat_once", chat)
 
