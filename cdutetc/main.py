@@ -41,7 +41,7 @@ from cdutetc import database as db
 from cdutetc import llm
 from cdutetc import roles
 from cdutetc import notifications
-from cdutetc.errors import AppErrorCode, safe_error_hint
+from cdutetc.errors import AppErrorCode, DeliveryMode, DeliveryResult, result_from_exception, safe_error_hint
 from cdutetc.contest_fields import map_competition_info
 from cdutetc.database import create_published_competition_once, init_db
 from cdutetc.fetcher import FetchError, fetch_text
@@ -175,9 +175,10 @@ def _build_publish_receipt(info: dict, *, status: str, ref: int) -> str:
 
     remind_time = (info.get("official_time") or "").strip()
     if remind_time:
-        lines.append(
-            f"提醒：比赛开始前 {_format_remind_offsets()}会自动发到群里"
-        )
+        if status == "待超管确认":
+            lines.append(f"提醒：超管同意后安排开始前 {_format_remind_offsets()}的未来节点，已错过的节点不补发")
+        else:
+            lines.append(f"提醒：按开始前 {_format_remind_offsets()}的未来有效节点发到群里")
     else:
         lines.append("提醒：时间未定，补上比赛时间后才会自动提醒")
     return "\n".join(lines)
@@ -198,7 +199,7 @@ def _build_publish_review(pending: dict) -> str:
         value = (info.get(key) or "").strip()
         lines.append(f"{label}：{value or '未提供'}")
     if (info.get("official_time") or "").strip():
-        lines.append(f"提醒计划：开始前 {_format_remind_offsets()}各一次")
+        lines.append(f"提醒计划：同意后安排开始前 {_format_remind_offsets()}的未来节点，已错过的不补发")
     lines.append(f"来源群：{db.describe_account('group', pending.get('group_id') or '')}")
     lines.append(f"提交人：{db.describe_account('user', pending.get('submitted_by') or '')}")
     if pending.get("duplicate_note"):
@@ -781,20 +782,22 @@ class ACMBot:
             pending = db.get_pending_publication(pid) or {}
             review = _build_publish_review(pending)
             sent = 0
+            failures = []
             for admin in sorted(config.SUPER_ADMIN):
-                if await self._send_private(admin, review):
+                result = await self._send_private_result(admin, review)
+                if result.ok:
                     sent += 1
-            if sent:
-                await self._safe_reply(
-                    message,
-                    _build_publish_receipt(competition_info, status="待超管确认", ref=pid),
-                )
+                else:
+                    failures.append(result.code.value)
+                    logger.warning("发布申请 #%s 确认私聊推送失败 [%s]", pid, result.code.value)
+            receipt = _build_publish_receipt(competition_info, status="待超管确认", ref=pid)
+            if not failures:
+                receipt += f"\n确认单已向{sent}位超管提交发送，请在私聊回复“同意 {pid}”或“拒绝 {pid}”。"
             else:
-                await self._safe_reply(
-                    message,
-                    _build_publish_receipt(competition_info, status="待超管确认", ref=pid)
-                    + "\n（超管私聊推送失败，请提醒超管查看 /待确认列表）",
-                )
+                codes = "、".join(f"[{code}]" for code in sorted(set(failures)))
+                receipt += (f"\n超管私聊推送失败（成功{sent}/{len(config.SUPER_ADMIN)}）：{codes}。"
+                            f"申请 #{pid} 已保留，超管可私聊发送 /待确认列表 后回复“同意 {pid}”。")
+            await self._safe_reply(message, receipt)
             logger.info("发布申请 #%s 已提交超管确认：%s", pid, info.get("name"))
             return
 
@@ -858,7 +861,7 @@ class ACMBot:
         code = getattr(result.code, "value", str(result.code))
         return f"通知测试：{'平台已接受' if result.ok else '未确认发送'} [{code}] {result.user_hint}"
 
-    async def _send_private(self, user_id: str, text: str) -> bool:
+    async def _send_private_result(self, user_id: str, text: str) -> DeliveryResult:
         """当前私聊直接回复显式关联入站ID，其余调用均为主动通知。"""
         context = _private_reply_context.get()
         kwargs = {}
@@ -868,8 +871,16 @@ class ACMBot:
             _private_reply_context.set((uid, msg_id, seq))
             if msg_id:
                 kwargs = {"reply_to": msg_id, "reply_seq": seq}
-        result = await notifications.send_private(self.client, user_id, text, **kwargs)
-        return bool(result)
+        try:
+            return await notifications.send_private(self.client, user_id, text, **kwargs)
+        except Exception as error:
+            logger.warning("私聊发送异常 [%s]", type(error).__name__)
+            mode = DeliveryMode.PASSIVE if config.BOT_PROTOCOL == "qqbot" and kwargs else DeliveryMode.ACTIVE
+            return result_from_exception(error, protocol=config.BOT_PROTOCOL, mode=mode)
+
+    async def _send_private(self, user_id: str, text: str) -> bool:
+        """保留其他私聊调用方的布尔结果，确认推送可读取完整错误码。"""
+        return bool(await self._send_private_result(user_id, text))
 
     async def _safe_reply(self, message: OneBotMessage, content: str) -> bool:
         """只回复当前入站群消息，官方适配不得复用历史ID或转主动重发。"""

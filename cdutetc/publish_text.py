@@ -15,7 +15,7 @@ _CLOCK = re.compile(
     rf"[点时](?:(?P<part>半|一刻|三刻)|\s*(?P<minute>{_NUMBER})\s*分?)?"
     r"|:(?P<colon_minute>\d+))"
 )
-_DATE = re.compile(r"(?P<year>\d{4})[年/.-](?P<month>\d{1,2})[月/.-](?P<day>\d{1,2})[日号]?")
+_DATE = re.compile(r"(?<!\d)(?P<year>\d{4})[年/.-](?P<month>\d{1,2})[月/.-](?P<day>\d{1,2})[日号]?(?!\d)")
 _MONTH_DAY = re.compile(r"(?P<month>\d{1,2})月(?P<day>\d{1,2})[日号]?")
 _RELATIVE = re.compile(r"今天|今日|今早|今晚|明天|明日|明早|明晚|后天|昨天|昨日|前天")
 _WEEKDAY = re.compile(r"(?P<week>下周|本周|这周|周|星期|礼拜)(?P<day>[一二三四五六日天])")
@@ -66,6 +66,12 @@ def parse_local_time(text: str, now: datetime | None = None) -> tuple[str, str] 
     relatives = list(_RELATIVE.finditer(text))
     if len(dates) > 1 or len(relatives) > 1 or (dates and relatives):
         return None
+    if re.search(r"明年|后年|去年|下个月|下月|下学期|左右|大约|待定|待通知|不确定", text):
+        return None
+    if (re.search(r"下周|本周|这周|周末", text) and not _WEEKDAY.search(text)) or (
+        re.search(r"\d+年", text) and not dates
+    ):
+        return None
     current = _reference(now)
     notes = ""
     try:
@@ -76,15 +82,21 @@ def parse_local_time(text: str, now: datetime | None = None) -> tuple[str, str] 
         period = clock["period"] or ""
         if not period and relatives:
             period = "晚上" if relatives[0][0] in ("今晚", "明晚") else ("早上" if relatives[0][0] in ("今早", "明早") else "")
+        next_midnight = False
         if period:
-            if not 1 <= hour <= 12:
-                raise ValueError("带上午/下午等时段的小时须为1至12")
-            if period in ("下午", "傍晚", "晚上", "晚间") and hour < 12:
+            if not (1 <= hour <= 12 or period == "凌晨" and hour == 0 or period == "下午" and 13 <= hour <= 23):
+                raise ValueError("钟点与时段不一致")
+            if period in ("晚上", "晚间") and hour == 12:
+                hour, next_midnight = 0, True
+            elif period in ("下午", "傍晚", "晚上", "晚间") and hour < 12:
                 hour += 12
-            elif period in ("凌晨", "早上", "早晨", "上午") and hour == 12:
+            elif period == "凌晨" and hour == 12:
                 hour = 0
-            elif period == "中午" and hour < 11:
-                hour += 12
+            elif period == "中午":
+                if hour in (1, 2):
+                    hour += 12
+                elif hour not in (11, 12):
+                    raise ValueError("中午的钟点有歧义")
         target_date = current.date()
         if dates:
             date = dates[0]
@@ -106,6 +118,9 @@ def parse_local_time(text: str, now: datetime | None = None) -> tuple[str, str] 
             target_date += timedelta(days=delta)
         else:
             notes = "未写日期，按今天（北京时间）解析。"
+        if next_midnight:
+            target_date += timedelta(days=1)
+            notes += "晚上12点按次日00点解析。"
         target = datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=TZ)
     except (ValueError, KeyError, OverflowError) as error:
         raise ValueError("日期或钟点无效，请核对比赛时间") from error

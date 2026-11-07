@@ -10,6 +10,7 @@ import pytest
 from cdutetc import commands, config, database, llm, main, reminder
 from cdutetc.clients.onebot import OneBotClient, OneBotMessage
 from cdutetc.clients.qqbot import QQBotClient, QQBotMessage
+from cdutetc.errors import DeliveryCode, DeliveryMode, DeliveryResult
 from cdutetc.publish_text import parse_simple_publication
 from cdutetc.utils import match_publish_command
 
@@ -32,10 +33,10 @@ def group_message(protocol, text, member="admin"):
                           "group_id": "g1", "user_id": member, "raw_message": f"[CQ:at,qq=bot] {text}"})
 
 
-def private_message(protocol, text):
+def private_message(protocol, text, msg_id="approve-inbound"):
     if protocol == "qqbot":
-        return QQBotMessage(None, message_type="private", user_id="admin", content=text, msg_id="approve-inbound")
-    return OneBotMessage({"message_type": "private", "message_id": "approve-inbound", "user_id": "admin", "raw_message": text})
+        return QQBotMessage(None, message_type="private", user_id="admin", content=text, msg_id=msg_id)
+    return OneBotMessage({"message_type": "private", "message_id": msg_id, "user_id": "admin", "raw_message": text})
 
 
 @pytest.fixture(params=["onebot", "qqbot"])
@@ -143,6 +144,51 @@ async def test_ordinary_member_cannot_publish_or_trigger_review(app):
     app.chat.assert_not_awaited()
 
 
+async def test_forbidden_active_review_keeps_pending_and_private_query_can_approve(app, monkeypatch):
+    real_send = app.bot.client.send_private_msg_result
+    async def active_forbidden(user_id, text, **kwargs):
+        if kwargs.get("reply_to") is None:
+            return DeliveryResult(False, DeliveryCode.FORBIDDEN, app.protocol, DeliveryMode.ACTIVE)
+        return await real_send(user_id, text, **kwargs)
+    monkeypatch.setattr(app.bot.client, "send_private_msg_result", active_forbidden)
+    await app.bot.on_group_at_message_create(group_message(app.protocol, USER_PHRASES[0]))
+    pending = database.list_pending_publications()
+    assert len(pending) == 1 and pending[0]["official_time"] == "2026-11-07 10:15"
+    assert database.list_competitions() == []
+    assert any("私聊推送失败" in text and "[forbidden]" in text and "申请 #1 已保留" in text
+               for text in app.group_texts())
+    await app.bot.on_private_message_create(private_message(app.protocol, "/待确认列表", msg_id="list-inbound"))
+    assert "#1" in app.private_calls()[-1]["content"] and "2026-11-07 10:15" in app.private_calls()[-1]["content"]
+    await app.bot.on_private_message_create(private_message(app.protocol, "同意 1"))
+    assert database.list_competitions(status="confirmed")[0]["official_time"] == "2026-11-07 10:15"
+
+
+async def test_one_admin_error_does_not_stop_other_review_recipients(app, monkeypatch):
+    monkeypatch.setattr(config, "SUPER_ADMIN", {"admin", "another-admin"})
+    real_send = app.bot.client.send_private_msg_result
+    async def one_timeout(user_id, text, **kwargs):
+        if user_id == "admin":
+            raise TimeoutError("platform timeout")
+        return await real_send(user_id, text, **kwargs)
+    monkeypatch.setattr(app.bot.client, "send_private_msg_result", one_timeout)
+    await app.bot.on_group_at_message_create(group_message(app.protocol, USER_PHRASES[0]))
+    assert len(database.list_pending_publications()) == 1
+    assert app.private_calls()[0]["openid"] == "another-admin"
+    assert any("成功1/2" in text and "[timeout_unknown]" in text for text in app.group_texts())
+
+
+def test_pending_receipt_does_not_claim_reminders_are_already_scheduled():
+    receipt = main._build_publish_receipt({"name": "临时比赛", "official_time": "2026-11-07 10:15"},
+                                         status="待超管确认", ref=1)
+    assert "超管同意后" in receipt and "已错过的节点不补发" in receipt
+
+
+@pytest.mark.parametrize("text", ["下个月上午10点比赛开始", "明年11月7号10点比赛开始", "下周10点比赛开始",
+                                  "今天10点左右比赛开始", "今天9点开场，明天10点正式比赛开始"])
+def test_uncertain_or_multiple_times_are_not_guessed_by_local_parser(text):
+    assert parse_simple_publication(text, now=NOW) is None
+
+
 @pytest.mark.parametrize("text", ["添加一个比赛怎么操作", "添加一个比赛什么时候开始", "10点15分比赛会开始吗", "不要添加一个比赛今天10点开始"])
 def test_queries_and_negated_requests_are_not_explicit_publish_commands(text):
     assert match_publish_command(text) is None
@@ -155,12 +201,17 @@ def test_queries_and_negated_requests_are_not_explicit_publish_commands(text):
     ("2026年11月7号上午10点15acm算法比赛开始", "2026-11-07 10:15"),
     ("明早10:15比赛开始", "2026-11-08 10:15"),
     ("下周一上午9点比赛开始", "2026-11-09 09:00"),
+    ("今天上午12点比赛开始", "2026-11-07 12:00"),
+    ("今天凌晨12点比赛开始", "2026-11-07 00:00"),
+    ("今天晚上12点比赛开始", "2026-11-08 00:00"),
+    ("明晚12点比赛开始", "2026-11-09 00:00"),
+    ("今天下午13点比赛开始", "2026-11-07 13:00"),
 ])
 def test_chinese_and_relative_time_are_beijing_based(text, expected):
     assert parse_simple_publication(text, now=NOW.astimezone(timezone.utc))["contest_time"] == expected
 
 
-@pytest.mark.parametrize("text", ["今天25点比赛开始", "今天上午10点70比赛开始", "2026年2月30号10点比赛开始"])
+@pytest.mark.parametrize("text", ["今天25点比赛开始", "今天上午10点70比赛开始", "2026年2月30号10点比赛开始", "今天中午10点比赛开始"])
 def test_invalid_dates_and_clocks_are_not_silently_recorded(text):
     with pytest.raises(ValueError):
         parse_simple_publication(text, now=NOW)
