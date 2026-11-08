@@ -71,7 +71,7 @@ _HELP_SECTIONS = (
         (2, "/FAQ删除 <id>", "删除一条常见问题"),
     )),
     ("提醒与来源", (
-        (2, "/提醒状态", "查看提醒发送情况"),
+        (2, "/提醒状态 [页码]", "查看未来7天的提醒时间和投递状态"),
         (3, "/通知测试 [群|私聊] [目标标识]", "主动测试；官方群可在末尾加 Markdown 或 文本"),
         (2, "/抓取状态", "查看比赛来源更新情况"),
         (2, "/抓取一次", "立即检查一次比赛来源"),
@@ -847,41 +847,12 @@ def cmd_fetch_status(group_id: str, sender: str, args: str) -> list[dict]:
 def cmd_reminder_status(group_id: str, sender: str, args: str) -> list[dict]:
     if not can_manage_group(sender):
         return [{"group_id": group_id, "text": "仅老师/超管可查看提醒状态"}]
-    db.reconcile_deliveries(allowed_groups=set(config.ALLOWED_GROUPS))
-    pending = db.list_deliveries(group_id, statuses=("pending", "sending"), limit=20)
-    counts = db.delivery_status_counts(group_id)
-    state = "主动群消息：已启用" if config.GROUP_ACTIVE_MESSAGES_ENABLED else "主动群消息：未启用（定时提醒暂停）"
-    labels = {"pending": "待发送", "sending": "发送中", "sent": "已发送",
-              "failed": "重试耗尽", "cancelled": "已取消", "expired": "已过期"}
-    lines = [state,
-             f"开赛计划：提前 {'、'.join(str(x) for x in config.CONTEST_REMIND_OFFSETS_MINUTES)} 分钟；"
-             f"每 {config.CONTEST_REMIND_CHECK_SECONDS} 秒检查；逾期超过 {config.CONTEST_REMIND_GRACE_SECONDS} 秒跳过",
-             "投递统计：" + "｜".join(f"{label} {counts.get(status, 0)}" for status, label in labels.items())]
-    if config.BOT_PROTOCOL == "qqbot":
-        message_format = db.get_group_notification_format(config.BOT_PROTOCOL, group_id)
-        lines.insert(1, "本群主动通知格式：" + ("Markdown" if message_format == "markdown" else "文本"))
-    block = db.get_group_notification_block(config.BOT_PROTOCOL, group_id)
-    if block:
-        lines.insert(1, f"平台主动发送：权限拒绝，已暂停该群通知 [{block['error_code']}/{block['platform_code']}]"
-                     f"；暂停自 {block['blocked_at']}，跳过投递不增加尝试次数。")
-        lines.insert(2, "先检查群/机器人“允许主动发送”权限，再由超管执行 /通知测试 群 验证恢复；私聊执行需带群标识。")
-    if not pending:
-        lines.append("本群当前无待发送提醒")
-    else:
-        lines.append("待发送/发送中提醒：")
-        for d in pending:
-            lines.append(f"{d['obj_type']}#{d['obj_id']}｜{labels[d['status']]}｜{d['remind_type']}"
-                         f"｜计划 {d.get('scheduled_at') or '按窗口扫描'}｜目标 {d['target_time']}"
-                         f"｜已尝试 {d['attempts']} 次"
-                         + (f"｜错误 [{d['error_code']}]" if d.get('error_code') else ""))
-    failures = db.list_deliveries(group_id, statuses=("failed", "expired"), limit=5)
-    if failures:
-        lines.append("最近失败/过期：")
-        for d in failures:
-            lines.append(f"{d['obj_type']}#{d['obj_id']}｜{labels[d['status']]}"
-                         f"｜计划 {d.get('scheduled_at') or d['target_time']}"
-                         f"｜错误 [{d.get('error_code') or d['status']}]")
-    return [{"group_id": group_id, "text": "\n".join(lines)}]
+    from cdutetc import reminder_view
+    try:
+        page = int(args.strip() or "1")
+    except ValueError:
+        return [{"group_id": group_id, "text": "用法：/提醒状态 [页码]"}]
+    return [{"group_id": group_id, "text": reminder_view.render(group_id, page=page)}]
 
 
 async def cmd_trigger_fetch(group_id: str, sender: str, args: str) -> list[dict]:
