@@ -25,6 +25,13 @@ def build_preview(group_id: str, now: datetime | None = None, days: int = 7) -> 
         scheduled = target - timedelta(hours=offset)
         key = db.delivery_dedup_key(group_id, kind, oid, field, target_text, offset)
         row = deliveries.get(key) or deliveries.get(db.delivery_dedup_key(group_id, kind, oid, field, target_text))
+        if persisted and row:
+            stored = _parse_time(row.get("scheduled_at") or "")
+            expires = _parse_time(row.get("expires_at") or "")
+            if stored is not None and expires is not None:
+                scheduled = stored
+            else:
+                row = None
         if scheduled > until:
             return
         if scheduled < now:

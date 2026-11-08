@@ -88,6 +88,10 @@ _HELP_SECTIONS = (
         (3, "/待审拒绝 <更新id> [原因]", "忽略来源更新"),
     )),
     ("群与老师管理（超管）", (
+        (3, "/群配置 <群名或标识>", "私聊查看该群比赛、负责老师和提醒"),
+        (3, "/群提醒 <群名或标识> [页码]", "私聊查看指定群的提醒计划"),
+        (3, "/周赛设置 <群名或标识> 开启|关闭", "只修改这个群的周赛开关"),
+        (3, "/群老师 <群名或标识> [老师标识,老师标识|清空]", "登记本群负责老师"),
         (3, "/加群 <群标识> [备注]", "让机器人在该群工作"),
         (3, "/删群 <群标识>", "取消该群授权"),
         (3, "/加老师 <QQ号> [备注]", "设置老师身份"),
@@ -99,7 +103,7 @@ _HELP_SECTIONS = (
     )),
 )
 
-_HELP_SUPER_FOOTER = "私聊审批：先 /待确认列表，再回复 同意 编号 或 拒绝 编号。\n私聊管理命令作用于默认管理群。"
+_HELP_SUPER_FOOTER = "私聊审批：先 /待确认列表，再回复 同意 编号 或 拒绝 编号。\n私聊用 /群配置 群名 查看指定群；其他管理命令仍作用于默认管理群。"
 
 _HELP_TOPICS = {
     "比赛": ("比赛",),
@@ -735,7 +739,7 @@ def cmd_label_list(group_id: str, sender: str, args: str) -> list[dict]:
 
 
 def cmd_notify_groups(group_id: str, sender: str, args: str) -> list[dict]:
-    """设置某场比赛只通知哪些群（超管）。用于把周赛限制在集训队群。"""
+    """普通比赛按场设置范围；自动周赛的唯一配置入口是逐群周赛开关。"""
     if not is_super_admin(sender):
         return [{"group_id": group_id, "text": "仅超管可设置比赛通知群"}]
     parts = (args or "").strip().split(None, 1)
@@ -751,6 +755,11 @@ def cmd_notify_groups(group_id: str, sender: str, args: str) -> list[dict]:
     comp = db.get_competition(cid)
     if comp is None:
         return [{"group_id": group_id, "text": f"比赛 #{cid} 不存在"}]
+    if db.is_weekly_competition(cid):
+        targets = db.get_competition_target_groups(cid)
+        return [{"group_id": group_id, "text": "这是自动周赛，范围由各群周赛开关决定。\n"
+                 + "当前目标：" + ("、".join(sorted(targets)) or "尚无启用群")
+                 + "\n请用 /周赛设置 群名或标识 开启|关闭，其他场次的 /通知群 用法不变。"}]
     current = db.get_competition_notify_groups(cid)
     if len(parts) == 1:
         scope = "、".join(sorted(current)) if current else "全部允许群"
@@ -906,7 +915,12 @@ async def handle_command(text: str, group_id: str, sender: str) -> list[dict] | 
         return [{"group_id": group_id, "text": "请写上命令名，例如 /帮助。"}]
     if cmd in ("help", "帮助"):
         return [{"group_id": group_id, "text": build_help(sender, args)}]
+    from cdutetc import group_admin
     handlers = {
+        "群配置": lambda gid, uid, value: group_admin.handle_command("群配置", value, uid, gid),
+        "群提醒": lambda gid, uid, value: group_admin.handle_command("群提醒", value, uid, gid),
+        "周赛设置": lambda gid, uid, value: group_admin.handle_command("周赛设置", value, uid, gid),
+        "群老师": lambda gid, uid, value: group_admin.handle_command("群老师", value, uid, gid),
         "修正": cmd_amend,
         "待审列表": cmd_pending_list,
         "待审批准": cmd_pending_apply,
@@ -1085,6 +1099,13 @@ async def handle_non_command_message(text: str, group_id: str, sender: str,
         if config.QA_SOCIAL_CHAT_ENABLED:
             return [{"group_id": group_id, "text": await llm.answer_social_chat(text)}]
         return []
+    if re.fullmatch(r"(?:请问|查一下|看看)?(?:本群|我们群|群里|这周|本周|近期|最近|现在|今天|接下来)?"
+                    r"(?:有什么|有哪些|有没有|有啥)(?:比赛|竞赛)(?:安排)?[吗呢啊呀?？。！!\s]*", text.strip()):
+        from cdutetc import group_admin
+        items = group_admin.contests(group_id, this_week=bool(re.search(r"这周|本周", text)))
+        lines = ["本群比赛：" if items else "本群暂无符合条件的已登记比赛。"]
+        lines.extend(f"· {item['name']}｜{item.get('contest_time') or '时间待定'}" for item in items[:10])
+        return [{"group_id": group_id, "text": "\n".join(lines)}]
     is_request = content_filter.is_information_request(text)
     faq = await match_faq(group_id, text, exact_only=not is_request)
     if faq is not None:

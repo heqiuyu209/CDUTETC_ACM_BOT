@@ -27,6 +27,7 @@ BUSINESS_TABLES = (
 CONFIG_TABLES = (
     "runtime_allowed_groups", "runtime_teachers", "account_labels",
     "group_notification_settings", "group_notification_blocks",
+    "group_weekly_settings", "group_teacher_assignments",
 )
 
 
@@ -120,7 +121,7 @@ def main(argv=None) -> int:
     for table, count in result.cleared.items():
         print(f"  {table}: {count}")
     print(f"共 {sum(result.cleared.values())} 条业务记录。")
-    print("保留：.env 中的超管与机器人参数、群/老师权限、标识名称、通知格式及权限暂停设置、历史编号。")
+    print("保留：.env 中的超管与机器人参数、群/老师权限、周赛开关、负责老师、标识名称、通知设置、历史编号。")
     if result.backup:
         print(f"完整备份：{result.backup}")
         print("清理完成，可以启动机器人服务。")

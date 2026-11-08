@@ -387,6 +387,14 @@ class ACMBot:
                     return
             if content.strip().startswith("/") and is_super_admin(uid):
                 cmd, args = parse_command(content)
+                from cdutetc import group_admin
+                if cmd in group_admin.COMMANDS:
+                    replies = group_admin.handle_command(cmd, args, uid)
+                    if any(reply.get("refresh_weekly") for reply in replies or []):
+                        await self._weekly_contest_job()
+                    for reply in replies or []:
+                        await self._send_private(uid, reply["text"])
+                    return
                 if cmd == "通知测试":
                     await self._send_private(uid, await self._notification_test(uid, args))
                     return
@@ -407,7 +415,11 @@ class ACMBot:
                     if reply.get("text"):
                         await self._send_private(uid, reply["text"])
                 return
-            await self._send_private(uid, f"收到（{uid}）")
+            from cdutetc import group_admin
+            if is_super_admin(uid):
+                await self._send_private(uid, group_admin.answer_private(content, uid))
+            else:
+                await self._send_private(uid, "你好～群内问题请在群里 @我，私聊管理仅向超管开放。")
         except Exception:
             logger.exception("私聊处理失败 [%s]", AppErrorCode.INTERNAL)
         finally:
@@ -554,6 +566,8 @@ class ACMBot:
                 await self._safe_reply(message, await self._notification_test(member_id, args, message=message))
                 return
             replies = await commands.handle_command(text, group_id, member_id)
+            if any(reply.get("refresh_weekly") for reply in replies or []):
+                await self._weekly_contest_job()
             if replies is None:
                 # 先限流和检查输入，再考虑模型意图识别，避免被拒绝的问题仍产生费用。
                 allowed, gate_reply = self._qa_gate(member_id, text)
@@ -1058,11 +1072,9 @@ class ACMBot:
         except ValueError as e:
             logger.warning("自动周赛生成失败: %s", e)
             return
-        # 周赛通知范围完全由配置决定：每次运行都对齐（含清空），
-        # 这样改 ACM_WEEKLY_CONTEST_GROUPS 后对本周已生成的记录也立即生效。
-        # 注意不要与 ALLOWED_GROUPS 求交后写回：若交集为空会变成「空=全部群」，
-        # 反而把周赛推给所有群。这里按配置原样写入，取不到有效群时宁可不提醒。
-        desired = set(config.WEEKLY_CONTEST_GROUPS)
+        # 周赛范围以环境基线和逐群持久开关为准，启动/再次调度也对齐已有记录。
+        # 存储原始配置标识；可见和投递时再与授权群求交，空范围始终不广播。
+        desired = db.get_weekly_groups()
         try:
             if db.get_competition_notify_groups(cid) != desired:
                 db.set_competition_notify_groups(cid, desired, operator="weekly:auto")

@@ -59,6 +59,15 @@ def test_current_grace_window_is_visible_before_real_send(store):
     assert "开赛前15分钟｜待发送" in text
 
 
+def test_persisted_schedule_is_displayed_instead_of_recalculating_the_queue(store):
+    with db._connect() as conn:
+        conn.execute("UPDATE reminder_deliveries SET scheduled_at='2026-11-08 18:40:00', expires_at='2026-11-08 18:42:00'"
+                     " WHERE scheduled_at='2026-11-08 18:30:00'")
+    text = reminder_view.render("team", now=NOW)
+    assert "11-08 18:40｜集训周赛" in text
+    assert "11-08 18:30｜集训周赛" not in text
+
+
 def test_preview_pages_do_not_drop_plans(store):
     for i in range(7):
         db.create_collection("team", f"征集{i}", deadline="2026-11-10 12:00")

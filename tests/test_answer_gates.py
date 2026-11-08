@@ -330,7 +330,7 @@ def test_common_word_does_not_cause_false_match():
     assert score < config.QA_KB_MATCH_MIN_SCORE
 
 
-async def test_member_weekly_question_answered_without_model(monkeypatch):
+async def test_member_weekly_question_answered_without_model(memory_db, monkeypatch):
     """普通成员问周赛：命中已录入记录，且不产生模型调用。"""
     contest = {
         "name": "ACM 周赛（本周）",
@@ -416,7 +416,7 @@ def test_normal_question_is_not_capability_query():
         assert not content_filter.is_capability_query(question)
 
 
-async def test_capability_question_uses_fixed_text_without_model(monkeypatch):
+async def test_capability_question_uses_fixed_text_without_model(memory_db, monkeypatch):
     """能力类问题必须走固定话术，不产生模型调用（否则会说不能提醒）。"""
     chat = AsyncMock(return_value="我这边不能主动定时自动提醒")
     monkeypatch.setattr(llm, "_chat_once", chat)

@@ -387,6 +387,13 @@ _INDEX_DDL = (
 )
 
 _ALL_DDL = (
+    """CREATE TABLE IF NOT EXISTS group_weekly_settings (
+        group_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+        updated_by TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '')""",
+    """CREATE TABLE IF NOT EXISTS group_teacher_assignments (
+        group_id TEXT NOT NULL, user_id TEXT NOT NULL,
+        updated_by TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY(group_id,user_id))""",
     _MAIN_DDL, _REMIND_DDL,
     _COMPETITIONS_DDL, _WEEKLY_CONTEST_RUNS_DDL, _PUBLICATION_CLAIMS_DDL,
     _PENDING_PUBLICATIONS_DDL,
@@ -813,7 +820,7 @@ def create_weekly_competition(week_start: str, info: dict) -> tuple[int, bool]:
         ).fetchone()
         if existing is not None:
             return existing[0], False
-        weekly_groups = set(config.WEEKLY_CONTEST_GROUPS)
+        weekly_groups = _weekly_groups_on(conn)
         cid = _create_competition_on(conn, info, "confirmed", "weekly:auto", notify_groups=weekly_groups)
         conn.execute(
             "INSERT INTO weekly_contest_runs (week_start, competition_id, created_at)"
@@ -821,6 +828,67 @@ def create_weekly_competition(week_start: str, info: dict) -> tuple[int, bool]:
             (week_start, cid, now_str()),
         )
     return cid, True
+
+
+def _weekly_groups_on(conn: sqlite3.Connection) -> set[str]:
+    groups = set(config.WEEKLY_CONTEST_GROUPS)
+    for gid, enabled in conn.execute("SELECT group_id, enabled FROM group_weekly_settings"):
+        if enabled:
+            groups.add(gid)
+        else:
+            groups.discard(gid)
+    return groups
+
+
+def get_weekly_groups() -> set[str]:
+    """配置文件作基线，每个群的显式开启/关闭持久覆盖该群，新增群不会继承。"""
+    with _connect() as conn:
+        return _weekly_groups_on(conn)
+
+
+def is_weekly_competition(competition_id: int) -> bool:
+    with _connect() as conn:
+        return conn.execute("SELECT 1 FROM weekly_contest_runs WHERE competition_id=?", (competition_id,)).fetchone() is not None
+
+
+def set_weekly_group_enabled(group_id: str, enabled: bool, operator: str = "") -> None:
+    if group_id not in config.ALLOWED_GROUPS or type(enabled) is not bool:
+        raise ValueError("请选择已授权群，并明确开启或关闭")
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT INTO group_weekly_settings(group_id,enabled,updated_by,updated_at) VALUES (?,?,?,?)"
+                     " ON CONFLICT(group_id) DO UPDATE SET enabled=excluded.enabled,"
+                     " updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+                     (group_id, int(enabled), operator, now_str()))
+        groups = _weekly_groups_on(conn)
+        # 改配置也立即更新未来已生成场次；不等待下周 cron，不补发过去节点。
+        rows = conn.execute("SELECT c.id FROM competitions c JOIN weekly_contest_runs w ON w.competition_id=c.id"
+                            " WHERE c.official_time>=?", (_delivery_now().strftime("%Y-%m-%d %H:%M"),)).fetchall()
+        for (cid,) in rows:
+            _set_competition_scope_on(conn, cid, groups)
+            _sync_contest_start_reminders(conn, cid)
+        add_audit(operator, group_id, "weekly_setting", "group", group_id, "", str(enabled), conn=conn)
+
+
+def set_group_teachers(group_id: str, user_ids, operator: str = "") -> None:
+    teachers = {_as_str(uid) for uid in user_ids}
+    if group_id not in config.ALLOWED_GROUPS:
+        raise ValueError("群尚未授权")
+    if not teachers.issubset(set(config.TEACHER_WHITELIST) | set(config.SUPER_ADMIN)):
+        raise ValueError("包含未授权的老师，请先 /加老师，再登记负责群；本操作不会授予老师权限")
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DELETE FROM group_teacher_assignments WHERE group_id=?", (group_id,))
+        conn.executemany("INSERT INTO group_teacher_assignments(group_id,user_id,updated_by,updated_at) VALUES (?,?,?,?)",
+                         [(group_id, uid, operator, now_str()) for uid in sorted(teachers)])
+        add_audit(operator, group_id, "set_group_teachers", "group", group_id, "", ",".join(sorted(teachers)), conn=conn)
+
+
+def get_group_teachers(group_id: str) -> list[str]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT user_id FROM group_teacher_assignments WHERE group_id=? ORDER BY user_id", (group_id,)).fetchall()
+    authorized = set(config.TEACHER_WHITELIST) | set(config.SUPER_ADMIN)
+    return [row[0] for row in rows if row[0] in authorized]
 
 
 def get_competition(cid: int) -> dict | None:
@@ -861,7 +929,7 @@ def get_competition_target_groups(competition_id: int) -> set[str]:
 
 def set_competition_notify_groups(competition_id: int, group_ids,
                                   operator: str = "") -> int:
-    """设置比赛的通知群范围。传空集合表示恢复为「全部允许群」。
+    """设置范围；公共比赛空集合为全部允许群，自动周赛空集合为无目标群。
 
     Returns:
         实际写入的群数（0 表示已清空为全局）。
