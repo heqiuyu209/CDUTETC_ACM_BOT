@@ -617,6 +617,9 @@ def list_question_contests(group_id: str, limit: int = 5) -> list[dict]:
                         SELECT 1 FROM competition_notify_groups ng
                         WHERE ng.competition_id = c.id
                     )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM weekly_contest_runs wr WHERE wr.competition_id = c.id
+                    )
                     OR EXISTS (
                         SELECT 1 FROM competition_notify_groups ng2
                         WHERE ng2.competition_id = c.id AND ng2.group_id = ?
@@ -777,7 +780,7 @@ def _create_competition_on(conn: sqlite3.Connection, info: dict,
     if status == "confirmed":
         if notify_groups is not None:
             groups = _set_competition_scope_on(conn, cid, notify_groups)
-            _sync_contest_start_reminders(conn, cid, groups or None)
+            _sync_contest_start_reminders(conn, cid, groups)
         else:
             _sync_contest_start_reminders(conn, cid)
     return cid
@@ -829,13 +832,31 @@ def get_competition(cid: int) -> dict | None:
 
 
 def get_competition_notify_groups(competition_id: int) -> set[str]:
-    """返回该比赛指定的通知群；空集合表示「通知全部允许群」。"""
+    """返回显式范围；计算实际可见/投递群应使用 get_competition_target_groups。"""
     with _connect() as conn:
         rows = conn.execute(
             "SELECT group_id FROM competition_notify_groups WHERE competition_id = ?",
             (competition_id,),
         ).fetchall()
     return {r[0] for r in rows}
+
+
+def _competition_target_groups_on(conn: sqlite3.Connection, competition_id: int) -> set[str]:
+    groups = {r[0] for r in conn.execute(
+        "SELECT group_id FROM competition_notify_groups WHERE competition_id=?", (competition_id,),
+    )}
+    if groups:
+        return groups & set(config.ALLOWED_GROUPS)
+    if (conn.execute("SELECT 1 FROM weekly_contest_runs WHERE competition_id=?", (competition_id,)).fetchone()
+            or not conn.execute("SELECT 1 FROM competitions WHERE id=?", (competition_id,)).fetchone()):
+        return set()
+    return set(config.ALLOWED_GROUPS)
+
+
+def get_competition_target_groups(competition_id: int) -> set[str]:
+    """公共比赛可共享；自动周赛只对明确指定的群可见，空范围绝不回退全群。"""
+    with _connect() as conn:
+        return _competition_target_groups_on(conn, competition_id)
 
 
 def set_competition_notify_groups(competition_id: int, group_ids,
@@ -2319,11 +2340,11 @@ def _sync_contest_start_reminders(conn: sqlite3.Connection, competition_id: int,
     except (TypeError, ValueError):
         grace_seconds = 120
     target = _delivery_parse_time(row[1] or "")
-    groups = {str(g).strip() for g in (group_ids or []) if str(g).strip()}
-    if group_ids is None:
-        groups = set(config.ALLOWED_GROUPS)
-    if row[0] != "confirmed" or target is None:
-        groups = set()
+    groups = set()
+    if row[0] == "confirmed" and target is not None:
+        groups = _competition_target_groups_on(conn, competition_id)
+        if group_ids is not None:
+            groups &= {str(g).strip() for g in group_ids if str(g).strip()}
     current = _delivery_now(now)
     desired: set[str] = set()
     if target is not None and row[0] == "confirmed":
@@ -2555,11 +2576,7 @@ def _delivery_invalid_status(conn: sqlite3.Connection, delivery: dict,
         row = conn.execute(f"SELECT status, {field} FROM competitions WHERE id = ?", (delivery["obj_id"],)).fetchone()
         if row is None or row[0] != "confirmed" or _canonical_time(row[1]) != delivery["target_time"]:
             return "cancelled"
-        scoped = {r[0] for r in conn.execute(
-            "SELECT group_id FROM competition_notify_groups WHERE competition_id = ?",
-            (delivery["obj_id"],),
-        ).fetchall()}
-        if scoped and delivery["group_id"] not in scoped:
+        if delivery["group_id"] not in _competition_target_groups_on(conn, delivery["obj_id"]):
             return "cancelled"
     elif delivery["obj_type"] == "training_session":
         if delivery["remind_type"] != "start_time" or not delivery["group_id"]:

@@ -470,10 +470,9 @@ class ACMBot:
         info = json.loads(pending_item.get("fields_json") or "{}")
         notice = _build_publish_notice(info, cid)
         try:
-            scope = db.get_competition_notify_groups(cid)
+            targets = sorted(db.get_competition_target_groups(cid))
         except (sqlite3.Error, ValueError):
-            scope = set()
-        targets = sorted(scope & config.ALLOWED_GROUPS) if scope else sorted(config.ALLOWED_GROUPS)
+            targets = []
         results = []
         for gid in targets:
             results.append(await self._send_group_result(gid, notice))
@@ -823,10 +822,9 @@ class ACMBot:
         notice = _build_publish_notice(competition_info, cid)
         # 只发该比赛的通知范围（默认即发布它的群），不再全群广播
         try:
-            scope = db.get_competition_notify_groups(cid)
+            targets = sorted(db.get_competition_target_groups(cid))
         except (sqlite3.Error, ValueError):
-            scope = set()
-        targets = sorted(scope & config.ALLOWED_GROUPS) if scope else sorted(config.ALLOWED_GROUPS)
+            targets = []
         results = [await self._send_group_result(gid, notice) for gid in targets]
         failures = [result for result in results if not result.ok]
         if failures:

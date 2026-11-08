@@ -103,7 +103,7 @@ async def test_unreadable_scope_never_broadcasts_and_other_objects_continue(db, 
     database.create_collection("g2", "另一群正常报名", deadline=target)
     def unavailable(*args):
         raise sqlite3.OperationalError("scope unavailable")
-    monkeypatch.setattr(reminder, "get_competition_notify_groups", unavailable)
+    monkeypatch.setattr(reminder, "get_competition_target_groups", unavailable)
     sender = AsyncMock(return_value=True)
     assert await reminder.check_general_reminders(sender, now=TARGET - timedelta(hours=1)) == 1
     sender.assert_awaited_once()

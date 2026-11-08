@@ -179,7 +179,7 @@ python scripts/export_collection.py --group-id '群openid' --collection-id 1 --o
 | `ACM_WEEKLY_CONTEST_WEEKDAY` | 否 | `6` | 周赛星期（0=周一 … 6=周日） |
 | `ACM_WEEKLY_CONTEST_START` / `_END` | 否 | `19:00` / `21:00` | 周赛起止时间 |
 | `ACM_WEEKLY_CONTEST_TEMPLATE` | 否 | `ACM 周赛（本周）` | 周赛记录名称模板 |
-| `ACM_WEEKLY_CONTEST_GROUPS` | 否 | 空 | 周赛只通知哪些群（逗号分隔）。**留空 = 通知所有允许群**；填集训队群号即可不打扰新生群 |
+| `ACM_WEEKLY_CONTEST_GROUPS` | 否 | 空 | 周赛仅对这些群可见并提醒（逗号分隔）；留空不对任何群开放，官方群填 OpenID |
 | `ACM_LLM_BASE_URL` | 否 | `https://api.deepseek.com/v1` | 大模型接口地址 |
 | `ACM_LLM_MODEL` | 否 | `deepseek-chat` | 模型名 |
 | `ACM_LLM_MAX_INPUT_CHARS` | 否 | `6000` | 单次模型请求输入上限 |

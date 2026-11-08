@@ -377,8 +377,8 @@ WEEKLY_CONTEST_TEMPLATE = os.getenv(
     "ACM_WEEKLY_CONTEST_TEMPLATE",
     "ACM 周赛（本周）",
 )
-# 周赛只通知哪些群（逗号分隔）。留空 = 通知所有允许群。
-# 典型用法：周赛属于集训队，填集训队群号即可不打扰新生群。
+# 周赛只对明确指定的群可见并提醒。留空时不对任何群开放。
+# 官方接入填写群 OpenID，不能填 QQ 群号。
 WEEKLY_CONTEST_GROUPS = {
     g.strip() for g in os.getenv("ACM_WEEKLY_CONTEST_GROUPS", "").split(",") if g.strip()
 }

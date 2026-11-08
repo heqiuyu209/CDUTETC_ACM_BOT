@@ -458,8 +458,7 @@ def test_competition_without_scope_notifies_all_groups(monkeypatch):
     target = (now + timedelta(hours=5)).strftime("%Y-%m-%d %H:%M")
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"TRAIN", "FRESH"})
     monkeypatch.setattr(config, "REMIND_OFFSET_HOURS", (24.0, 1.0))
-    monkeypatch.setattr(database, "get_competition_notify_groups", lambda cid: set())
-    monkeypatch.setattr(reminder, "get_competition_notify_groups", database.get_competition_notify_groups)
+    monkeypatch.setattr(reminder, "get_competition_target_groups", lambda cid: {"TRAIN", "FRESH"})
     comps = [{"id": 1, "name": "蓝桥杯报名", "status": "confirmed",
               "official_reg_deadline": target, "official_time": "", "official_site": ""}]
     items = reminder.build_general_reminders([], comps, now)
@@ -478,8 +477,7 @@ def test_competition_scope_limits_reminder_groups(monkeypatch):
     target = (now + timedelta(hours=5)).strftime("%Y-%m-%d %H:%M")
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"TRAIN", "FRESH"})
     monkeypatch.setattr(config, "REMIND_OFFSET_HOURS", (24.0, 1.0))
-    monkeypatch.setattr(database, "get_competition_notify_groups", lambda cid: {"TRAIN"})
-    monkeypatch.setattr(reminder, "get_competition_notify_groups", database.get_competition_notify_groups)
+    monkeypatch.setattr(reminder, "get_competition_target_groups", lambda cid: {"TRAIN"})
     comps = [{"id": 1, "name": "校赛报名", "status": "confirmed",
               "official_reg_deadline": target, "official_time": "", "official_site": ""}]
     items = reminder.build_general_reminders([], comps, now)
@@ -507,8 +505,7 @@ def test_scope_pointing_to_unknown_group_sends_nothing(monkeypatch):
     target = (now + timedelta(hours=5)).strftime("%Y-%m-%d %H:%M")
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"TRAIN", "FRESH"})
     monkeypatch.setattr(config, "REMIND_OFFSET_HOURS", (24.0, 1.0))
-    monkeypatch.setattr(database, "get_competition_notify_groups", lambda cid: {"GONE"})
-    monkeypatch.setattr(reminder, "get_competition_notify_groups", database.get_competition_notify_groups)
+    monkeypatch.setattr(reminder, "get_competition_target_groups", lambda cid: set())
     comps = [{"id": 1, "name": "校赛报名", "status": "confirmed",
               "official_reg_deadline": target, "official_time": "", "official_site": ""}]
     assert reminder.build_general_reminders([], comps, now) == []

@@ -34,7 +34,7 @@ from cdutetc.database import (
     validate_delivery_claim,
 )
 from cdutetc.database import list_collections_all as _list_collections_all
-from cdutetc.database import get_competition_notify_groups
+from cdutetc.database import get_competition_target_groups
 from cdutetc.database import get_group_notification_block
 
 logger = logging.getLogger(__name__)
@@ -304,18 +304,11 @@ def build_general_reminders(collections: list[dict], competitions: list[dict],
         # 这样「周赛」可以只发集训队群，不打扰新生群。
         # 读取失败不能退回全群广播；该比赛留待下轮，其余对象继续。
         try:
-            scoped = get_competition_notify_groups(c["id"])
+            targets = get_competition_target_groups(c["id"])
         except (sqlite3.Error, OSError):
             logger.warning("比赛 #%s 的通知范围无法读取，跳过本轮提醒", c["id"])
             continue
-        targets = scoped & config.ALLOWED_GROUPS if scoped else set(config.ALLOWED_GROUPS)
         if not targets:
-            # 指定了通知群但都不在允许列表里：宁可不提醒，也不要退回全群广播
-            if scoped:
-                logger.warning(
-                    "比赛 #%s 的通知群 %s 均不在允许列表中，跳过提醒",
-                    c["id"], ",".join(sorted(scoped)),
-                )
             continue
         for kind, field in _COMP_FIELDS.items():
             target = _parse_time(c.get(field) or "")
