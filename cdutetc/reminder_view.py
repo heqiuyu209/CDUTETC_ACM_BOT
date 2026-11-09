@@ -90,7 +90,7 @@ def render(group_id: str, *, page: int = 1, now: datetime | None = None) -> str:
     block = db.get_group_notification_block(config.BOT_PROTOCOL, group_id)
     if block:
         lines.append(f"平台权限拒绝，已暂停 [{block['error_code']}/{block['platform_code']}]")
-        lines.append("恢复群主授权后，由超管执行 /通知测试 群 验证。")
+        lines.append("每五分钟允许待发消息重试一次；恢复群主授权后也可用 /通知测试 群 立即验证。")
     if config.BOT_PROTOCOL == "qqbot":
         fmt = db.get_group_notification_format(config.BOT_PROTOCOL, group_id)
         lines.append("本群主动通知格式：" + ("Markdown" if fmt == "markdown" else "文本"))

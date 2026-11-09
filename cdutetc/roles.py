@@ -28,6 +28,8 @@ def refresh() -> None:
     teachers.update(item["user_id"] for item in db.list_runtime_teachers())
     config.ALLOWED_GROUPS = groups
     config.TEACHER_WHITELIST = teachers
+    # 先加载动态群，再修复旧库/新增群的未来计划，避免有查询权限却没有提醒。
+    db.sync_future_contest_start_reminders()
     logger.info(
         "白名单已刷新：群 %d 个（基线 %d + 动态 %d），老师 %d 人（基线 %d + 动态 %d）",
         len(groups), len(config.ENV_ALLOWED_GROUPS),

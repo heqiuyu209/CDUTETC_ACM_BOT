@@ -342,6 +342,7 @@ CREATE TABLE IF NOT EXISTS group_notification_blocks (
     error_code    TEXT NOT NULL,
     platform_code INTEGER,
     blocked_at    TEXT NOT NULL,
+    retry_after   TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (protocol, group_id)
 )
 """
@@ -540,6 +541,9 @@ def init_db() -> None:
         for ddl in _INDEX_DDL:
             conn.execute(ddl)
         _migrate_source_activity(conn)
+        block_columns = {r[1] for r in conn.execute("PRAGMA table_info(group_notification_blocks)")}
+        if "retry_after" not in block_columns:
+            conn.execute("ALTER TABLE group_notification_blocks ADD COLUMN retry_after TEXT NOT NULL DEFAULT ''")
 
 
 # =====================================================================
@@ -2394,6 +2398,19 @@ def amend_competition(cid: int, info: dict, operator: str = "", note: str = "", 
         return True
 
 
+def sync_future_contest_start_reminders(now: datetime | None = None) -> None:
+    """启动和授权变化后补齐未来计划；不补过去节点、不重置发送历史。"""
+    current = _delivery_now(now)
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT id FROM competitions WHERE status='confirmed' AND official_time>=?",
+            (current.strftime("%Y-%m-%d %H:%M"),),
+        ).fetchall()
+        for (cid,) in rows:
+            _sync_contest_start_reminders(conn, cid, now=current)
+
+
 def _sync_contest_start_reminders(conn: sqlite3.Connection, competition_id: int,
                                   group_ids=None, *, now: datetime | None = None) -> None:
     """在业务写事务中同步比赛开赛前节点；过去节点不创建、不补发。"""
@@ -2903,19 +2920,57 @@ def get_group_notification_block(protocol: str, group_id: str) -> dict | None:
     """平台权限暂停按协议和群持久保存，不影响被动回复或其他群。"""
     with _connect() as conn:
         row = conn.execute(
-            "SELECT error_code, platform_code, blocked_at FROM group_notification_blocks WHERE protocol=? AND group_id=?",
+            "SELECT error_code, platform_code, blocked_at, retry_after FROM group_notification_blocks WHERE protocol=? AND group_id=?",
             (protocol, group_id),
         ).fetchone()
-    return dict(zip(("error_code", "platform_code", "blocked_at"), row)) if row else None
+    return dict(zip(("error_code", "platform_code", "blocked_at", "retry_after"), row)) if row else None
+
+
+_GROUP_PERMISSION_RETRY_SECONDS = 300
+
+
+def _group_retry_time(block: dict) -> datetime:
+    retry_after = _delivery_parse_time(block.get("retry_after") or "")
+    if retry_after is not None:
+        return retry_after
+    blocked_at = _delivery_parse_time(block.get("blocked_at") or "") or _delivery_now()
+    return blocked_at + timedelta(seconds=_GROUP_PERMISSION_RETRY_SECONDS)
+
+
+def group_notification_paused(protocol: str, group_id: str, now: datetime | None = None) -> bool:
+    block = get_group_notification_block(protocol, group_id)
+    return block is not None and _delivery_now(now) < _group_retry_time(block)
+
+
+def claim_group_notification_retry(protocol: str, group_id: str) -> bool:
+    """跨任务/进程共用五分钟冷却；领取不解除暂停，成功回执才解除。"""
+    current = _delivery_now()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT blocked_at, retry_after FROM group_notification_blocks WHERE protocol=? AND group_id=?",
+            (protocol, group_id),
+        ).fetchone()
+        if row is None:
+            return True
+        if current < _group_retry_time(dict(zip(("blocked_at", "retry_after"), row))):
+            return False
+        conn.execute(
+            "UPDATE group_notification_blocks SET retry_after=? WHERE protocol=? AND group_id=?",
+            ((current + timedelta(seconds=_GROUP_PERMISSION_RETRY_SECONDS)).strftime("%Y-%m-%d %H:%M:%S"),
+             protocol, group_id),
+        )
+        return True
 
 
 def block_group_notifications(protocol: str, group_id: str, error_code: str, platform_code: int | None) -> None:
+    retry_after = (_delivery_now() + timedelta(seconds=_GROUP_PERMISSION_RETRY_SECONDS)).strftime("%Y-%m-%d %H:%M:%S")
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO group_notification_blocks (protocol, group_id, error_code, platform_code, blocked_at)"
-            " VALUES (?, ?, ?, ?, ?) ON CONFLICT(protocol, group_id) DO UPDATE SET"
-            " error_code=excluded.error_code, platform_code=excluded.platform_code",
-            (protocol, group_id, error_code, platform_code, now_str()),
+            "INSERT INTO group_notification_blocks (protocol, group_id, error_code, platform_code, blocked_at, retry_after)"
+            " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(protocol, group_id) DO UPDATE SET"
+            " error_code=excluded.error_code, platform_code=excluded.platform_code, retry_after=excluded.retry_after",
+            (protocol, group_id, error_code, platform_code, now_str(), retry_after),
         )
 
 
