@@ -261,10 +261,10 @@ def _parse_amend_fields(text: str) -> dict[str, str]:
 
 
 def _broadcast_to_groups(competition_name: str, cid: int, text: str, exclude: str = "") -> list[dict]:
-    """向全部允许群广播一条通知（排除触发群可选）。订阅体系已移除，修正/发布影响全体群。"""
+    """修正通知沿用该比赛的当前范围，不能绕过普通比赛或周赛的群隔离。"""
     return [
-        {"group_id": gid, "text": text}
-        for gid in sorted(config.ALLOWED_GROUPS)
+        {"group_id": gid, "text": text, "active_group": True}
+        for gid in sorted(db.get_competition_target_groups(cid))
         if gid != exclude
     ]
 

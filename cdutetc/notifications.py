@@ -6,8 +6,36 @@ or passive mode is explicit. No passive-to-active fallback is performed.
 
 from __future__ import annotations
 
+import asyncio
+
 from cdutetc import config
 from cdutetc.errors import DeliveryCode, DeliveryMode, DeliveryResult
+
+
+async def map_by_group(items, handle, *, concurrency: int = 4):
+    """不同群有界并发，同群保持顺序；返回值仍与输入逐项对应。"""
+    items = list(items)
+    groups = {}
+    for index, item in enumerate(items):
+        groups.setdefault(item["group_id"], []).append((index, item))
+    results = [None] * len(items)
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def worker(entries):
+        for index, item in entries:
+            async with semaphore:
+                results[index] = await handle(item)
+
+    tasks = [asyncio.create_task(worker(entries)) for entries in groups.values()]
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        # 扫描任务取消/异常时收回子任务，不能让上一轮在后台继续发送。
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return results
 
 
 def _unsupported(mode: DeliveryMode) -> DeliveryResult:

@@ -18,6 +18,7 @@ from math import ceil
 from zoneinfo import ZoneInfo
 
 from cdutetc import config
+from cdutetc.notifications import map_by_group
 from cdutetc.config import REMIND_TYPES, TZ_NAME
 from cdutetc.database import (
     claim_delivery,
@@ -35,7 +36,7 @@ from cdutetc.database import (
 )
 from cdutetc.database import list_collections_all as _list_collections_all
 from cdutetc.database import get_competition_target_groups
-from cdutetc.database import get_group_notification_block
+from cdutetc.database import group_notification_paused
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +132,7 @@ def _countdown(target: datetime, now: datetime) -> str:
 
 
 def _platform_paused(group_id: str) -> bool:
-    return config.BOT_PROTOCOL == "qqbot" and get_group_notification_block(config.BOT_PROTOCOL, group_id) is not None
+    return config.BOT_PROTOCOL == "qqbot" and group_notification_paused(config.BOT_PROTOCOL, group_id)
 
 
 async def check_contest_start_reminders(send_group, now: datetime | None = None,
@@ -150,18 +151,19 @@ async def check_contest_start_reminders(send_group, now: datetime | None = None,
     allowed = set(config.ALLOWED_GROUPS)
     reconcile_deliveries(current, max_attempts=max_attempts, allowed_groups=allowed)
     comps = {item["id"]: item for item in list_competitions(status="confirmed")}
-    sent = 0
-    for delivery in list_due_contest_start_deliveries(current, allowed):
+
+    async def deliver(delivery):
         if _platform_paused(delivery["group_id"]):
-            continue
+            return 0
         current = clock()
+        allowed = set(config.ALLOWED_GROUPS)
         competition = comps.get(delivery["obj_id"])
         if not competition:
-            continue
+            return 0
         scheduled = _parse_time(delivery.get("scheduled_at") or "")
         expires = _parse_time(delivery.get("expires_at") or "")
         if scheduled is None or expires is None or not scheduled <= current <= expires:
-            continue
+            return 0
         key = delivery["dedup_key"]
         token = claim_delivery(
             delivery["group_id"], "competition", delivery["obj_id"], "contest_start",
@@ -170,7 +172,7 @@ async def check_contest_start_reminders(send_group, now: datetime | None = None,
             offset_hours=_contest_offset_hours(delivery),
         )
         if token is None or not validate_delivery_claim(key, token, now=clock(), allowed_groups=allowed):
-            continue
+            return 0
         target = _parse_time(delivery["target_time"])
         text = (
             f"【开赛提醒】「{competition['name']}」还有{_countdown(target, clock())}就开始啦。\n"
@@ -182,15 +184,22 @@ async def check_contest_start_reminders(send_group, now: datetime | None = None,
         if not result[0]:
             logger.warning("比赛 #%s 开赛提醒未发送 [%s]", delivery["obj_id"], result[2])
         try:
-            receipt_saved = result[0] and record_delivery_success(key, token, now=current)
+            receipt_saved = result[0] and record_delivery_success(key, token, now=clock())
             finish_delivery(key, token, result[0], error=result[1], error_code=result[2],
-                            now=current, max_attempts=max_attempts)
+                            now=clock(), max_attempts=max_attempts)
         except sqlite3.Error:
             logger.exception("开赛提醒回执写入异常: %s", key)
-            continue
-        if result[0] and receipt_saved:
-            sent += 1
-    return sent
+            return 0
+        return int(result[0] and receipt_saved)
+
+    async def isolated(delivery):
+        try:
+            return await deliver(delivery)
+        except sqlite3.Error:
+            logger.exception("开赛提醒读取/领取失败: %s", delivery["dedup_key"])
+            return 0
+
+    return sum(await map_by_group(list_due_contest_start_deliveries(current, allowed), isolated))
 
 
 def _contest_offset_minutes(delivery: dict) -> int:
@@ -404,10 +413,10 @@ async def check_general_reminders(send_group, now: datetime | None = None,
     sessions = [session for gid in sorted(config.ALLOWED_GROUPS)
                 for session in list_training_sessions(gid, active_only=False)]
     items.extend(build_training_reminders(sessions, current_time()))
-    sent = 0
-    for item in items:
+
+    async def deliver(item):
         if _platform_paused(item["group_id"]):
-            continue
+            return 0
         key = _delivery_key(item)
         token = claim_delivery(
             item["group_id"], item["obj_type"], item["obj_id"], item["remind_type"], item["target_str"],
@@ -417,26 +426,32 @@ async def check_general_reminders(send_group, now: datetime | None = None,
         if token is None or not validate_delivery_claim(
             key, token, now=current_time(), allowed_groups=set(config.ALLOWED_GROUPS),
         ):
-            continue
+            return 0
         ok, error, error_code = await _send_reminder_result(send_group, item["group_id"], item["text"])
         # 接收到成功回执即先持久化事实，后续状态收尾抛错也不重复发送。
         try:
             receipt_saved = ok and record_delivery_success(key, token, now=current_time())
         except sqlite3.Error:
             logger.exception("消息已发送但成功事实写入失败，保留 sending 等待恢复: %s", key)
-            continue
+            return 0
         try:
             finish_delivery(key, token, ok, error=error, error_code=error_code,
                             now=current_time(), max_attempts=max_attempts)
         except sqlite3.Error:
             logger.exception("提醒回执写入异常: %s", key)
-            if receipt_saved:
-                sent += 1
-            continue
-        if ok and receipt_saved:
-            sent += 1
-        elif not ok:
+            return int(bool(receipt_saved))
+        if not ok:
             logger.warning("通用提醒发送失败: %s", key)
+        return int(ok and receipt_saved)
+
+    async def isolated(item):
+        try:
+            return await deliver(item)
+        except sqlite3.Error:
+            logger.exception("通用提醒读取/领取失败: %s", _delivery_key(item))
+            return 0
+
+    sent = sum(await map_by_group(items, isolated))
     if sent:
         logger.info("本次通用提醒成功发送 %d 条", sent)
     return sent
