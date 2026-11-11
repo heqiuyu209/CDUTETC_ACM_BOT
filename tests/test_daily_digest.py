@@ -158,6 +158,38 @@ def test_digest_omits_empty_sections(env):
 
 # --------------------------------------------------------------- 搭便车
 
+@pytest.mark.parametrize("reason", ["quota", "disabled", "cancelled", "sent"])
+def test_piggyback_contest_does_not_require_active_delivery(env, monkeypatch, reason):
+    cid = _contest(official_time="2026-11-11 19:30")
+    if reason == "quota":
+        db.block_group_notifications("qqbot", "g1", DeliveryCode.QUOTA_EXHAUSTED.value, 11253)
+    elif reason == "disabled":
+        monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", False)
+    else:
+        with db._connect() as conn:
+            conn.execute("UPDATE reminder_deliveries SET status=? WHERE obj_type='competition' AND obj_id=?",
+                         (reason, cid))
+
+    assert daily_digest.build_daily_digest("g1", NOW) is None
+    assert "Codeforces Round 990" in daily_digest.build_piggyback_notice("g1", NOW)
+
+
+def test_piggyback_contest_keeps_scope_status_and_time_filters(env):
+    _contest(group_id="g2", name="其他群比赛", official_time="2026-11-11 19:00")
+    db.create_competition({"name": "未确认比赛", "official_time": "2026-11-11 19:00"}, status="draft")
+    _contest(name="已经开赛", official_time="2026-11-11 17:59")
+    assert daily_digest.build_piggyback_notice("g1", NOW) is None
+
+
+def test_piggyback_weekly_respects_current_subscription(env, monkeypatch):
+    monkeypatch.setattr(config, "WEEKLY_CONTEST_GROUPS", {"g1"})
+    db.create_weekly_competition("2026-11-09", {"name": "周赛", "official_time": "2026-11-11 19:00"})
+    assert "周赛" in daily_digest.build_piggyback_notice("g1", NOW)
+    db.set_weekly_group_enabled("g1", False)
+    assert daily_digest.build_piggyback_notice("g1", NOW) is None
+    assert daily_digest.build_piggyback_notice("g2", NOW) is None
+
+
 def test_piggyback_prefers_most_urgent(env):
     _collection(title="天梯赛选拔", deadline="2026-11-12 05:00", capacity=2)   # 11h 后
     _collection(title="周末讲座报名", deadline="2026-11-14 12:00")             # 超出 12h
