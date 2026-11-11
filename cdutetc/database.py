@@ -547,6 +547,7 @@ def init_db() -> None:
 # =====================================================================
 
 
+# LEGACY(P1): contests/reminders 旧表读写，仅供历史数据迁移与清理；新代码请用 competitions 新链。
 def save_contest(group_id: str, info: dict) -> int:
     """写入一条群级比赛记录，返回新记录 id。字段必须是字符串，否则抛 ValueError。"""
     values = (
@@ -580,6 +581,7 @@ def _row_to_contest(r: sqlite3.Row) -> dict:
     }
 
 
+# LEGACY(P1): contests/reminders 旧表读写，仅供历史数据迁移与清理；新代码请用 competitions 新链。
 def list_contests(group_id: str | None = None) -> list[dict]:
     """查询群级比赛记录。
 
@@ -645,6 +647,7 @@ def list_question_contests(group_id: str, limit: int = 5) -> list[dict]:
     return [dict(zip(fields, row)) for row in rows]
 
 
+# LEGACY(P1): contests/reminders 旧表读写，仅供历史数据迁移与清理；新代码请用 competitions 新链。
 def delete_contest(group_id: str, cid: int) -> bool:
     """按 id 删除某群的群级比赛（仅限本群记录）。"""
     with _connect() as conn:
@@ -657,6 +660,7 @@ def delete_contest(group_id: str, cid: int) -> bool:
 # ---------- 提醒去重（阶段一兼容） ----------
 
 
+# LEGACY(P1): contests/reminders 旧表读写，仅供历史数据迁移与清理；新代码请用 competitions 新链。
 def has_reminded(group_id: str, contest_id: int, remind_type: str, target_time: str) -> bool:
     """是否已对该（比赛, 类型, 目标时间）发过提醒。"""
     target_time = _canonical_time(target_time)
@@ -668,6 +672,7 @@ def has_reminded(group_id: str, contest_id: int, remind_type: str, target_time: 
         return row is not None
 
 
+# LEGACY(P1): contests/reminders 旧表读写，仅供历史数据迁移与清理；新代码请用 competitions 新链。
 def mark_reminded(group_id: str, contest_id: int, remind_type: str, target_time: str) -> bool:
     """标记已提醒（发送成功后才可调用）。"""
     target_time = _canonical_time(target_time)
@@ -925,6 +930,15 @@ def get_competition_target_groups(competition_id: int) -> set[str]:
     """公共比赛可共享；自动周赛只对明确指定的群可见，空范围绝不回退全群。"""
     with _connect() as conn:
         return _competition_target_groups_on(conn, competition_id)
+
+
+def list_group_competitions(group_id: str, status: str | None = "confirmed") -> list[dict]:
+    """列出对指定群可见的比赛（公共比赛对全部允许群可见，周赛仅指定群可见）。"""
+    gid = str(group_id).strip()
+    return [
+        competition for competition in list_competitions(status)
+        if gid in get_competition_target_groups(competition["id"])
+    ]
 
 
 def set_competition_notify_groups(competition_id: int, group_ids,
@@ -3007,6 +3021,7 @@ def list_audit(group_id: str | None = None, limit: int = 50) -> list[dict]:
 # =====================================================================
 
 
+# LEGACY(P1): contests/reminders 旧表读写，仅供历史数据迁移与清理；新代码请用 competitions 新链。
 def list_unclaimed_contests() -> list[dict]:
     """未归属任何群的旧记录（group_id=''），仅管理员可见并显式迁移。"""
     with _connect() as conn:
@@ -3016,6 +3031,7 @@ def list_unclaimed_contests() -> list[dict]:
     return [_row_to_contest(r) for r in rows]
 
 
+# LEGACY(P1): contests/reminders 旧表读写，仅供历史数据迁移与清理；新代码请用 competitions 新链。
 def claim_contest(contest_id: int, group_id: str) -> bool:
     """将旧记录显式归属到指定群。"""
     group_id = _as_str(group_id)

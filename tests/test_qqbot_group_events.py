@@ -94,7 +94,7 @@ def app(monkeypatch, tmp_path):
 async def test_new_event_reaches_real_hello_route_with_passive_receipt(app, sdk, native):
     adapter, _ = app
     async def scenario(client):
-        await client.feed("group_message_create", body("<@!bot-openid> 你好"))
+        await client.feed("group_message_create", body("<@bot-openid> 你好"))
         client.api.post_group_message.assert_awaited_once()
         sent = client.api.post_group_message.call_args.kwargs
         assert sent["group_openid"] == "group-openid"

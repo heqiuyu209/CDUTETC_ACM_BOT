@@ -18,16 +18,14 @@ from math import ceil
 from zoneinfo import ZoneInfo
 
 from cdutetc import config
-from cdutetc.config import REMIND_TYPES, TZ_NAME
+from cdutetc.clients.base import active_capabilities, active_protocol
+from cdutetc.config import TZ_NAME
 from cdutetc.database import (
     claim_delivery,
     delivery_dedup_key,
     finish_delivery,
-    has_reminded,
     list_competitions,
-    list_contests,
     list_training_sessions,
-    mark_reminded,
     record_delivery_success,
     reconcile_deliveries,
     training_occurrence_times,
@@ -40,7 +38,6 @@ from cdutetc.database import get_group_notification_block
 logger = logging.getLogger(__name__)
 
 TZ = ZoneInfo(TZ_NAME)
-_LABELS = {"reg_deadline": "报名截止", "contest_time": "比赛开始"}
 _TIME_FORMATS = ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M")
 _DELIVERY_MAX_ATTEMPTS = 3
 _DELIVERY_LEASE_SECONDS = 120
@@ -80,44 +77,6 @@ def _due_offset_hours(delta: timedelta) -> float | None:
     return min(candidates) if candidates else None
 
 
-def build_reminders(contests: list[dict], now: datetime) -> list[dict]:
-    """计算当前应提醒的清单（纯函数，便于离线测试）。
-
-    条件：目标时间在未来，且已进入 config.REMIND_OFFSET_HOURS 中某个节点窗口。
-    """
-    out: list[dict] = []
-    for c in contests:
-        for field in REMIND_TYPES:
-            target = _parse_time(c.get(field))
-            if target is None:
-                continue
-            offset = _due_offset_hours(target - now)
-            if offset is None:
-                continue
-            out.append(
-                {
-                    "group_id": c.get("group_id") or "",
-                    "contest_id": c["id"],
-                    "name": c["name"],
-                    "remind_type": field,
-                    "label": _LABELS[field],
-                    "target_str": c[field],
-                    "offset_hours": offset,
-                    "mode": c.get("mode"),
-                    "location": c.get("location"),
-                }
-            )
-    return out
-
-
-def format_remind(item: dict) -> str:
-    return (
-        f"【提醒】{item['name']} {item['label']}时间：{item['target_str']}\n"
-        f"形式：{item['mode'] or '待定'}  地点：{item['location'] or '待定'}\n"
-        "记得留好时间，别错过啦。"
-    )
-
-
 def _countdown(target: datetime, now: datetime) -> str:
     """按发送时刻计算剩余时间，避免延迟投递仍照抄节点分钟数。"""
     seconds = (target - now).total_seconds()
@@ -131,7 +90,10 @@ def _countdown(target: datetime, now: datetime) -> str:
 
 
 def _platform_paused(group_id: str) -> bool:
-    return config.BOT_PROTOCOL == "qqbot" and get_group_notification_block(config.BOT_PROTOCOL, group_id) is not None
+    """该群是否被平台暂停主动推送（仅存在主动权限约束的接入才可能有记录）。"""
+    if not active_capabilities().supports_passive_reply:
+        return False
+    return get_group_notification_block(active_protocol(), group_id) is not None
 
 
 async def check_contest_start_reminders(send_group, now: datetime | None = None,
@@ -219,43 +181,6 @@ async def _send_reminder_result(send_group, group_id: str, text: str) -> tuple[b
     except Exception as error:
         logger.warning("提醒发送异常 [%s]", type(error).__name__)
         return False, "[unknown] 发送结果无法确认，请检查平台连接", "unknown"
-
-
-async def _send_reminder(send_group, group_id: str, text: str) -> tuple[bool, str]:
-    """两代提醒共用有界发送；单条异常不阻断同轮其他提醒。"""
-    ok, error, _ = await _send_reminder_result(send_group, group_id, text)
-    return ok, error
-
-
-async def check_reminders(send_group) -> int:
-    """扫描一次全部群记录并发送提醒。
-
-    Args:
-        send_group: 异步回调 async (group_id, text) -> bool，返回是否发送成功。
-
-    Returns:
-        本次成功发送并标记去重的条数。
-    """
-    now = datetime.now(TZ)
-    sent = 0
-    for contest in list_contests():
-        group_id = contest.get("group_id") or ""
-        if not group_id or _platform_paused(group_id):
-            # 旧记录未归属任何群：隔离保留，不发送提醒
-            continue
-        for item in build_reminders([contest], now):
-            key = (group_id, item["contest_id"], item["remind_type"], item["target_str"])
-            if has_reminded(*key):
-                continue
-            ok, error = await _send_reminder(send_group, group_id, format_remind(item))
-            if ok:
-                mark_reminded(*key)
-                sent += 1
-            else:
-                logger.warning("提醒发送失败，留待下次重试: %s（%s）", item["name"], error)
-    if sent:
-        logger.info("本次检查成功发送 %d 条提醒", sent)
-    return sent
 
 
 # ---------------------------------------------------------------------

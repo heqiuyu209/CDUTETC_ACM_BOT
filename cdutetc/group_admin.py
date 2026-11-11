@@ -5,8 +5,10 @@ import re
 import shlex
 from zoneinfo import ZoneInfo
 
-from cdutetc import config, database as db, reminder_view
+from cdutetc import config
+from cdutetc import database as db, reminder_view
 from cdutetc.utils import is_super_admin
+from cdutetc.clients.base import active_protocol
 
 COMMANDS = frozenset({"群配置", "群提醒", "周赛设置", "群老师"})
 TZ = ZoneInfo(config.TZ_NAME)
@@ -80,7 +82,7 @@ def describe(gid: str, *, this_week: bool = False, now: datetime | None = None, 
             lines.append("自动生成周赛已关闭；已有比赛和提醒仍按计划执行。")
     lines.append(f"负责老师：{_teacher_names(gid)}")
     lines.append("主动提醒总开关：" + ("已启用" if config.GROUP_ACTIVE_MESSAGES_ENABLED else "已暂停"))
-    block = db.get_group_notification_block(config.BOT_PROTOCOL, gid)
+    block = db.get_group_notification_block(active_protocol(), gid)
     if block:
         lines.append(f"本群因平台权限拒绝暂停提醒 [{block['error_code']}/{block['platform_code']}]")
     items = contests(gid, this_week=this_week, now=now)

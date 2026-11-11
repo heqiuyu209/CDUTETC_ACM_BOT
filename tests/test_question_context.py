@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -42,7 +43,10 @@ def bot(memory_db, monkeypatch, onebot_client):
         replies.append((message.group_id, content))
 
     monkeypatch.setattr(client, "_safe_reply", reply)
-    monkeypatch.setattr(client, "_send_group", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        client, "_send_group_result",
+        AsyncMock(return_value=SimpleNamespace(ok=False)),
+    )
     return client, replies
 
 

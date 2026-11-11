@@ -91,7 +91,7 @@ async def test_active_send_gate_never_calls_onebot(bot, monkeypatch, enabled, gr
     client, api = bot
     monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", enabled)
 
-    assert await client._send_group(group, "通知") is False
+    assert not await client._send_group_result(group, "通知")
     api.call_api.assert_not_awaited()
 
 
@@ -103,7 +103,7 @@ async def test_active_send_requires_confirmed_response_and_correct_target(bot, r
     client, api = bot
     api.call_api.return_value = response
 
-    assert await client._send_group("g2", "跨群通知") is True
+    assert await client._send_group_result("g2", "跨群通知")
     api.call_api.assert_awaited_once_with(
         "send_group_msg", group_id="g2", message="跨群通知",
     )
@@ -124,7 +124,7 @@ async def test_active_send_requires_confirmed_response_and_correct_target(bot, r
 async def test_active_send_rejects_missing_or_error_receipts(bot, response):
     client, api = bot
     api.call_api.return_value = response
-    assert await client._send_group("g2", "通知") is False
+    assert not await client._send_group_result("g2", "通知")
 
 
 async def test_transport_exception_returns_false_for_active_send_and_reply(bot):
@@ -132,7 +132,7 @@ async def test_transport_exception_returns_false_for_active_send_and_reply(bot):
     api = OneBotClient("ws://127.0.0.1:3001")
     api._ws = SimpleNamespace(send=AsyncMock(side_effect=RuntimeError("模拟发送失败")))
     client = main.ACMBot(api)
-    assert await client._send_group("g2", "通知") is False
+    assert not await client._send_group_result("g2", "通知")
     assert await client._safe_reply(_message(), "回复") is False
     assert api._pending == {}
 
@@ -293,15 +293,15 @@ async def test_actual_sender_failure_retries_then_marks_reminder_sent_once(bot, 
     _use_fixed_general_reminders(monkeypatch)
     api.call_api.side_effect = [None, {"status": "ok", "retcode": 0, "data": {"message_id": 12345}}]
 
-    await client._remind_job()
+    await client._general_remind_job()
     delivery = database.list_pending_deliveries()[0]
     assert delivery["attempts"] == 1 and delivery["status"] == "pending"
 
-    await client._remind_job()
+    await client._general_remind_job()
     assert database.list_pending_deliveries() == []
     row = memory_db.execute("SELECT status, attempts FROM reminder_deliveries").fetchone()
     assert row == ("sent", 2)
-    await client._remind_job()
+    await client._general_remind_job()
     assert api.call_api.await_count == 2
     assert [call["group_id"] for call in _active_calls(client, api)] == ["g1", "g1"]
 
@@ -313,13 +313,13 @@ async def test_disabled_reminder_job_preserves_retry_budget_until_enabled(bot, m
     monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", False)
 
     for _ in range(4):
-        await client._remind_job()
+        await client._general_remind_job()
 
     api.call_api.assert_not_awaited()
     assert memory_db.execute("SELECT COUNT(*) FROM reminder_deliveries").fetchone()[0] == 0
 
     monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
-    await client._remind_job()
+    await client._general_remind_job()
     assert memory_db.execute("SELECT status, attempts FROM reminder_deliveries").fetchone() == ("sent", 1)
     api.call_api.assert_awaited_once()
 

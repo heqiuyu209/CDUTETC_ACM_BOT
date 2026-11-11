@@ -12,9 +12,11 @@
 import asyncio
 import logging
 import re
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from cdutetc import config
+from cdutetc.clients.base import capabilities_of
 from cdutetc import content_filter
 from cdutetc import crawler
 from cdutetc import database as db
@@ -46,6 +48,7 @@ _HELP_SECTIONS = (
     )),
     ("学校安排", (
         (1, "/校安排", "查看学校统一安排"),
+        (1, "/通知列表", "汇总本群近期的比赛、学校安排、课程和报名中的征集"),
     )),
     ("课程与训练", (
         (1, "/课程列表", "查看本群课程安排"),
@@ -531,6 +534,105 @@ def cmd_training_list(group_id: str, sender: str, args: str) -> list[dict]:
     return [{"group_id": group_id, "text": "\n".join(lines)}]
 
 
+_NOTICE_WINDOW_DAYS = 30
+_NOTICE_TIME_FORMATS = ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M")
+
+
+def _parse_notice_time(text: str | None) -> datetime | None:
+    """解析存档时间文本（与提醒模块同一套格式）；空值或解析失败返回 None。"""
+    if not text:
+        return None
+    for fmt in _NOTICE_TIME_FORMATS:
+        try:
+            return datetime.strptime(str(text).strip(), fmt).replace(tzinfo=TZ)
+        except ValueError:
+            continue
+    return None
+
+
+def _is_upcoming(now: datetime, *values: str | None) -> bool:
+    """判断某条安排是否属于「近期」。
+
+    任一时间落在 now～now+30 天内即算近期（含报名中）；时间全部缺失时保留，
+    因为「时间待定」的安排仍需让群成员看到；有可解析时间但全部已过期则剔除。
+    """
+    horizon = now + timedelta(days=_NOTICE_WINDOW_DAYS)
+    parsed = [t for t in (_parse_notice_time(v) for v in values) if t is not None]
+    if not parsed:
+        return True
+    return any(now <= t <= horizon for t in parsed)
+
+
+def cmd_notice_list(group_id: str, sender: str, args: str) -> list[dict]:
+    """查看本群近期通知（比赛、学校安排、课程、报名中的征集）。
+
+    只读命令，普通成员即可使用：仅读取本群已有记录做聚合展示，
+    不做权限校验之外的任何写操作，也不调用模型生成内容。
+    """
+    now = datetime.now(TZ)
+    contests = [
+        c for c in db.list_group_competitions(group_id, status="confirmed")
+        if _is_upcoming(now, c.get("official_time"), c.get("official_reg_deadline"))
+    ]
+    org_events = [
+        e for e in db.list_org_events(status="confirmed", shareable_only=True)
+        if _is_upcoming(now, e.get("contest_time"), e.get("reg_deadline"))
+    ]
+    sessions = db.list_training_sessions(group_id)
+    collections = [
+        c for c in db.list_collections(group_id, status="open")
+        if _is_upcoming(now, c.get("deadline"))
+    ]
+    if not (contests or org_events or sessions or collections):
+        return [{"group_id": group_id, "text": "本群近期暂无通知。发送 /帮助 看看还能做什么。"}]
+
+    lines = ["本群近期通知："]
+    if contests:
+        lines.append(f"【比赛】{len(contests)} 条")
+        for c in contests:
+            extra = []
+            if c.get("official_time"):
+                extra.append(f"比赛 {c['official_time']}")
+            if c.get("official_reg_deadline"):
+                extra.append(f"报名截止 {c['official_reg_deadline']}")
+            if c.get("edition"):
+                extra.append(c["edition"])
+            lines.append("· " + (c.get("name") or "未命名比赛") + ("｜" + "｜".join(extra) if extra else ""))
+    if org_events:
+        lines.append(f"【学校安排】{len(org_events)} 条")
+        for e in org_events:
+            extra = []
+            t = e.get("contest_time") or e.get("reg_deadline") or ""
+            if t:
+                extra.append(t)
+            extra.append(e.get("location") or "地点待定")
+            lines.append("· " + (e.get("title") or "未命名安排") + "｜" + "｜".join(extra))
+    if sessions:
+        lines.append(f"【课程安排】{len(sessions)} 条")
+        for s in sessions:
+            need = "（需带电脑）" if s.get("needs_laptop") else ""
+            lines.append(
+                "· " + f"{s.get('title') or '课程'}{need}"
+                f"｜{s.get('weekday') or ''} {s.get('start_time') or ''}-{s.get('end_time') or ''}"
+                f"｜{s.get('location') or '地点待定'}"
+            )
+    if collections:
+        lines.append(f"【报名中的征集】{len(collections)} 条")
+        for c in collections:
+            extra = []
+            if c.get("deadline"):
+                extra.append(f"截止 {c['deadline']}")
+            if c.get("capacity"):
+                extra.append(f"名额 {c['capacity']}")
+            lines.append(
+                "· " + f"#{c['id']} {c.get('title') or '未命名征集'}"
+                + ("｜" + "｜".join(extra) if extra else "")
+                + f"｜报名回复 /报名 {c['id']}"
+            )
+    lines.append("详细用法：/帮助 课程｜/帮助 报名")
+    return [{"group_id": group_id, "text": "\n".join(lines)}]
+
+
 def cmd_training_add(group_id: str, sender: str, args: str) -> list[dict]:
     if not can_manage_group(sender):
         return [{"group_id": group_id, "text": "仅老师/超管可添加课程"}]
@@ -646,11 +748,12 @@ def _split_id_note(args: str) -> tuple[str, str]:
     return parts[0], parts[1].strip() if len(parts) > 1 else ""
 
 
-def cmd_group_add(group_id: str, sender: str, args: str) -> list[dict]:
+def cmd_group_add(group_id: str, sender: str, args: str, client=None) -> list[dict]:
     if not is_super_admin(sender):
         return [{"group_id": group_id, "text": "仅超管可添加群"}]
     gid, note = _split_id_note(args)
-    if config.BOT_PROTOCOL == "qqbot" and gid.isdecimal() and len(gid) <= 12:
+    # 群号形态是否可用是客户端的能力，不由业务层猜字符串规则。
+    if not capabilities_of(client).accepts_group_id(gid):
         return [{"group_id": group_id, "text": "官方接入不能用 QQ 群号授权。请先在目标群 @我 /帮助，"
                  "再把我给出的 /加群 指令复制到私聊。"}]
     ok, msg = roles.add_group(gid, operator=sender, note=note)
@@ -900,7 +1003,8 @@ async def cmd_trigger_fetch(group_id: str, sender: str, args: str) -> list[dict]
 # 分发器
 # ---------------------------------------------------------------------
 
-async def handle_command(text: str, group_id: str, sender: str) -> list[dict] | None:
+async def handle_command(text: str, group_id: str, sender: str,
+                         client=None) -> list[dict] | None:
     """处理一条命令消息。
 
     - 非命令消息返回 None（由上层走 FAQ 匹配 / 模型问答 / 未答问题收集）。
@@ -930,6 +1034,8 @@ async def handle_command(text: str, group_id: str, sender: str) -> list[dict] | 
         "征集汇总": cmd_collection_summary,
         "征集关闭": cmd_collection_close,
         "校安排": cmd_org_events,
+        "通知列表": cmd_notice_list,
+        "通知": cmd_notice_list,
         "课程列表": cmd_training_list,
         "课程添加": cmd_training_add,
         "课程取消": cmd_training_cancel,
@@ -937,7 +1043,7 @@ async def handle_command(text: str, group_id: str, sender: str) -> list[dict] | 
         "FAQ添加": cmd_faq_add,
         "FAQ删除": cmd_faq_delete,
         "待确认列表": cmd_pub_pending_list,
-        "加群": cmd_group_add,
+        "加群": lambda gid, uid, value: cmd_group_add(gid, uid, value, client=client),
         "删群": cmd_group_remove,
         "群列表": cmd_group_list,
         "命名群": cmd_label_group,

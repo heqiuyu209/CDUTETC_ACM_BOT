@@ -84,17 +84,16 @@ async def test_block_does_not_disable_passive_status_or_another_group(app):
     assert passive["msg_id"] == "fresh-status-id"
     assert "40034105" in passive["content"] and "暂停" in passive["content"]
     assert "通知测试" in passive["content"]
-    assert await app.bot._send_group("g2", "其他群正常主动通知")
+    assert await app.bot._send_group_result("g2", "其他群正常主动通知")
     assert app.api.post_group_message.await_args.kwargs["group_openid"] == "g2"
     assert database.get_group_notification_block("qqbot", "g2") is None
 
 
-async def test_blocked_general_and_legacy_reminders_do_not_consume_attempts(app):
+async def test_blocked_general_reminders_do_not_consume_attempts(app):
     await app.bot._contest_remind_job()
     database.create_collection("g1", "本群报名", deadline=TARGET)
     database.create_collection("g2", "另一群报名", deadline=TARGET)
-    database.save_contest("g1", {"name": "旧比赛", "reg_deadline": TARGET})
-    await app.bot._remind_job()
+    await app.bot._general_remind_job()
     assert len([call for call in app.api.post_group_message.await_args_list
                 if call.kwargs["group_openid"] == "g1"]) == 1
     assert not any(row["obj_type"] == "collection" for row in database.list_deliveries("g1"))
@@ -150,7 +149,7 @@ async def test_qq_permission_pause_is_not_reused_by_onebot(app, monkeypatch):
     client = OneBotClient("ws://127.0.0.1:3001")
     client._ws = object()
     client.call_api = AsyncMock(return_value={"status": "ok", "retcode": 0, "data": {"message_id": 1}})
-    assert await main.ACMBot(client)._send_group("g1", "切换协议后正常发送")
+    assert await main.ACMBot(client)._send_group_result("g1", "切换协议后正常发送")
     client.call_api.assert_awaited_once()
 
 
@@ -251,7 +250,8 @@ async def test_format_selection_rejects_other_protocol_and_unallowed_target(app,
     assert "target_not_allowed" in await app.bot._notification_test("admin", "群 other Markdown")
     app.api.post_group_message.assert_not_awaited()
     assert database.get_group_notification_format("qqbot", "other") == "text"
-    monkeypatch.setattr(config, "BOT_PROTOCOL", "onebot")
+    # 能力位由客户端声明：代理不支持 markdown 时必须拒绝，业务层不再看配置协议
+    monkeypatch.setattr(app.client, "supports_markdown", False)
     assert "validation" in await app.bot._notification_test("admin", "群 g1 Markdown")
     app.api.post_group_message.assert_not_awaited()
 

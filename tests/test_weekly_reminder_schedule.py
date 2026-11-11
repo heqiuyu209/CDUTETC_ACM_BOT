@@ -117,7 +117,6 @@ async def test_startup_inside_last_scan_period_does_not_backfill_elapsed_nodes(m
         return await reminder.check_general_reminders(sender, now=now)
     async def check_contest_at_startup(sender):
         return await reminder.check_contest_start_reminders(sender, now=now)
-    monkeypatch.setattr(main, "check_reminders", AsyncMock(return_value=0))
     monkeypatch.setattr(main, "check_general_reminders", check_at_startup)
     monkeypatch.setattr(main, "check_contest_start_reminders", check_contest_at_startup)
     bot = new_bot()
@@ -128,7 +127,7 @@ async def test_startup_inside_last_scan_period_does_not_backfill_elapsed_nodes(m
         assert remind_job.next_run_time == now
         assert remind_job.trigger.interval == timedelta(seconds=30)
         await remind_job.func()
-        await bot.sched.get_job("remind-check").func()
+        await bot.sched.get_job("general-remind-check").func()
         bot.client.send_group_msg_result.assert_not_awaited()
         assert memory_db.execute(
             "SELECT COUNT(*) FROM reminder_deliveries WHERE remind_type='contest_start'"
@@ -186,7 +185,7 @@ async def test_repeated_ready_keeps_scheduler_and_week_record(memory_db):
         await bot._on_ready(now=now)
         assert bot.sched is scheduler
         assert {job.id for job in bot.sched.get_jobs()} == {
-            "remind-check", "contest-remind-check", "source-crawl", "weekly-contest",
+            "general-remind-check", "contest-remind-check", "source-crawl", "weekly-contest",
         }
         assert len(bot.sched.get_jobs()) == 4
         assert len(database.list_competitions()) == 1
@@ -207,15 +206,18 @@ async def test_disabled_weekly_does_not_create_startup_record_or_job(memory_db, 
 
 async def test_running_scheduler_checks_reminders_without_waiting_first_interval(memory_db, monkeypatch):
     checked = asyncio.Event()
-    monkeypatch.setattr(main, "check_reminders", AsyncMock(return_value=0))
+    calls: list[str] = []
+
     async def check_general(sender):
+        calls.append("general")
         checked.set()
         return 0
+
     monkeypatch.setattr(main, "check_general_reminders", check_general)
     bot = new_bot()
     try:
         await bot._on_ready()
         await asyncio.wait_for(checked.wait(), timeout=2)
-        main.check_reminders.assert_awaited_once()
+        assert calls == ["general"]
     finally:
         await stop(bot)

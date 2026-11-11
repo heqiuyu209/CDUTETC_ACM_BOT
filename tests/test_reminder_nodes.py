@@ -68,12 +68,11 @@ async def test_main_general_reminder_keeps_platform_error_code(db, monkeypatch):
         def now(cls, tz=None):
             return TARGET - timedelta(hours=1)
     monkeypatch.setattr(reminder, "datetime", Clock)
-    monkeypatch.setattr(main, "check_reminders", AsyncMock(return_value=0))
     bot = main.ACMBot()
     monkeypatch.setattr(bot, "_send_group_result", AsyncMock(return_value=DeliveryResult(
         False, DeliveryCode.FORBIDDEN, "onebot",
     )))
-    await bot._remind_job()
+    await bot._general_remind_job()
     row = database.list_deliveries("g1")[0]
     assert (row["status"], row["attempts"], row["error_code"]) == ("pending", 1, "forbidden")
 

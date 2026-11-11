@@ -295,11 +295,11 @@ async def test_dns_connect_read_and_writer_cleanup_share_one_timeout(monkeypatch
         await asyncio.Event().wait()
 
     writer.wait_closed = wait_closed
-    monkeypatch.setattr(fetcher.config, "FETCH_TIMEOUT", 0.06)
+    monkeypatch.setattr(fetcher.config, "FETCH_TIMEOUT", 0.25)
     monkeypatch.setattr(fetcher, "_resolve_public_ips", resolve)
     monkeypatch.setattr(fetcher, "_connect", connect)
     started = time.monotonic()
     with pytest.raises(FetchError, match="超时"):
         await fetcher.fetch_text(URL)
     assert calls and writer.closed
-    assert time.monotonic() - started < 0.15
+    assert time.monotonic() - started < 0.6

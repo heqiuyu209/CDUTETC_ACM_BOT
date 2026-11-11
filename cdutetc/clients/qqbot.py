@@ -27,6 +27,8 @@ import secrets
 import time
 from typing import Awaitable, Callable
 
+from cdutetc.clients.base import BaseBotClient
+
 logger = logging.getLogger("qqbot")
 
 MessageHandler = Callable[["QQBotMessage"], Awaitable[None]]
@@ -55,11 +57,11 @@ class QQBotMessage:
     """与 OneBotMessage 字段对齐的消息封装。"""
 
     __slots__ = ("raw", "source", "id", "message_type", "group_id", "user_id",
-                 "content", "always_addressed")
+                 "content", "always_addressed", "mentions")
 
     def __init__(self, data, *, message_type: str, group_id: str = "",
                  user_id: str = "", content: str = "", msg_id: str = "",
-                 always_addressed: bool = False):
+                 always_addressed: bool = False, mentions=None):
         # raw 保持「字典」形态，与 OneBotMessage 一致（main 里会调用 raw.get）。
         # 原始 botpy 对象另存到 source，便于排查问题。
         self.raw = {}
@@ -71,6 +73,12 @@ class QQBotMessage:
         self.content = content or ""
         # 官方机器的群消息本身就是 @ 消息，无需再解析 CQ 码
         self.always_addressed = always_addressed
+        # 统一 @ 载体：把平台 mentions 规范成 [{"id": ..., "is_you": bool}]，
+        # 业务层只读本字段判定是否 @ 到本机器人（官方协议下 CQ 码不存在）。
+        self.mentions = [_normalize_mention(item) for item in (mentions or [])]
+        if always_addressed and not any(item["is_you"] for item in self.mentions):
+            # 事件类型本身即「群里 @ 机器人」，平台未下发 is_you 时按命中自身处理。
+            self.mentions.append({"id": "", "is_you": True})
 
     def __repr__(self):
         return (
@@ -82,6 +90,17 @@ class QQBotMessage:
 def _field(data, name: str, default=None):
     """兼容原始事件字典与 SDK 模型，保留旧 SDK 没有暴露的字段。"""
     return data.get(name, default) if isinstance(data, dict) else getattr(data, name, default)
+
+
+def _normalize_mention(item) -> dict:
+    """把平台 mention 规范成 {"id", "is_you"}：不同 SDK 版本字段名不一致。"""
+    ident = (
+        _field(item, "member_openid", "")
+        or _field(item, "user_openid", "")
+        or _field(item, "id", "")
+        or ""
+    )
+    return {"id": str(ident), "is_you": _field(item, "is_you", False) is True}
 
 
 def wrap_group_at_message(message) -> QQBotMessage:
@@ -102,14 +121,25 @@ def wrap_group_at_message(message) -> QQBotMessage:
         content=_field(message, "content", "") or "",
         msg_id=_field(message, "id", "") or "",
         always_addressed=True,
+        mentions=_field(message, "mentions", []) or [],
     )
 
 
 def wrap_group_message(message) -> QQBotMessage:
     """全量群事件不能当成群 @ 事件；只信平台明确的 is_you 布尔标记。"""
-    wrapped = wrap_group_at_message(message)
-    wrapped.always_addressed = any(
-        _field(mention, "is_you") is True for mention in (_field(message, "mentions", []) or [])
+    mentions = _field(message, "mentions", []) or []
+    wrapped = QQBotMessage(
+        message,
+        message_type="group",
+        group_id=_field(message, "group_openid", "") or "",
+        user_id=(
+            _field(_field(message, "author"), "member_openid", "")
+            or _field(message, "member_openid", "")
+        ),
+        content=_field(message, "content", "") or "",
+        msg_id=_field(message, "id", "") or "",
+        always_addressed=any(_field(item, "is_you") is True for item in mentions),
+        mentions=mentions,
     )
     return wrapped
 
@@ -132,8 +162,16 @@ def wrap_c2c_message(message) -> QQBotMessage:
     )
 
 
-class QQBotClient:
+class QQBotClient(BaseBotClient):
     """官方机器人客户端，接口与 OneBotClient 对齐。"""
+
+    protocol = "qqbot"
+    # 官方协议靠入站 msg_id + msg_seq 做被动回复。
+    supports_passive_reply = True
+    # 群标识是平台下发的 group_openid，不是 QQ 群号。
+    supports_numeric_group_id = False
+    # 主动群消息支持 markdown 消息体。
+    supports_markdown = True
 
     def __init__(self, appid: str, secret: str, idle_timeout: float = 180.0):
         self.appid = appid

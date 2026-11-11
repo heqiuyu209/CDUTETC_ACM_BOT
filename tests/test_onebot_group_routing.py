@@ -63,7 +63,7 @@ async def test_unaddressed_messages_have_no_side_effects(bot, monkeypatch, conte
     bot.client.send_group_msg_result.assert_not_awaited()
 
 
-@pytest.mark.parametrize("content", ["[CQ:at,qq=111111] /帮助", "<@!111111> /帮助"])
+@pytest.mark.parametrize("content", ["[CQ:at,qq=111111] /帮助", "<@111111> /帮助"])
 async def test_addressed_explicit_commands_preserve_group_and_sender(bot, monkeypatch, content):
     command = AsyncMock(return_value=[{"group_id": "123456", "text": "帮助文本"}])
     monkeypatch.setattr(main.commands, "handle_command", command)
@@ -135,8 +135,9 @@ async def test_only_addressed_questions_reach_model_and_question_storage(bot, mo
         conn.close()
 
 
-async def test_missing_configured_id_uses_onebot_self_id(bot, monkeypatch):
+async def test_missing_configured_id_uses_client_self_id(bot, monkeypatch):
     monkeypatch.setattr(config, "BOT_QQ", "")
+    bot.client.self_id = "111111"
     command = AsyncMock(return_value=None)
     question = AsyncMock(return_value=[{"group_id": "123456", "text": "回答"}])
     monkeypatch.setattr(main.commands, "handle_command", command)
@@ -145,19 +146,21 @@ async def test_missing_configured_id_uses_onebot_self_id(bot, monkeypatch):
     question.assert_awaited_once_with("时间是什么", "123456", "654321", staff=True)
 
 
-async def test_missing_bot_identity_ignores_mentions_but_allows_legacy_commands(bot, monkeypatch):
+async def test_missing_bot_identity_ignores_mentions_but_allows_unmentioned_commands(bot, monkeypatch):
     monkeypatch.setattr(config, "BOT_QQ", "")
     command = AsyncMock(return_value=[])
     question = AsyncMock()
     monkeypatch.setattr(main.commands, "handle_command", command)
     monkeypatch.setattr(main.commands, "handle_non_command_message", question)
 
-    await bot.on_group_at_message_create(message("[CQ:at,qq=111111] 时间是什么", self_id=None))
+    # 客户端与配置都给不出自身标识时，无法判断 @ 的是不是自己，问答链路沉默
+    await bot.on_group_at_message_create(message("[CQ:at,qq=111111] 时间是什么"))
     command.assert_not_awaited()
     question.assert_not_awaited()
 
+    # 但关闭 @ 门槛后，不带 @ 的显式命令仍可执行
     monkeypatch.setattr(config, "GROUP_REQUIRE_AT", False)
-    await bot.on_group_at_message_create(message("/帮助", self_id=None))
+    await bot.on_group_at_message_create(message("/帮助"))
     command.assert_awaited_once_with("/帮助", "123456", "654321")
 
 
@@ -222,5 +225,7 @@ async def test_original_group_and_private_content_not_logged(bot, caplog):
 
 
 def test_mentions_match_exact_ids_and_allow_cq_extra_parameters():
-    assert mentioned_user_ids("[CQ:at,qq=111111,name=老师] <@!222222>") == {"111111", "222222"}
+    assert mentioned_user_ids("[CQ:at,qq=111111,name=老师] <@222222>") == {"111111", "222222"}
+    # legacy <@!id> 语法已下线（P1 清理），不再识别
+    assert mentioned_user_ids("<@!222222>") == set()
     assert mentioned_user_ids("&#91;CQ:at,qq=111111&#93;") == set()

@@ -54,11 +54,11 @@ async def test_course_command_enters_actual_main_reminder_job(db, monkeypatch):
         return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
     ))
     bot = main.ACMBot(client)
-    await bot._remind_job()
+    await bot._general_remind_job()
     client.send_group_msg_result.assert_awaited_once()
     group, text = client.send_group_msg_result.await_args.args
     assert group == "123456" and TARGET in text and "B201" in text
-    await bot._remind_job()
+    await bot._general_remind_job()
     assert client.send_group_msg_result.await_count == 1
 
 

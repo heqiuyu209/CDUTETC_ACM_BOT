@@ -5,9 +5,11 @@ import re
 from cdutetc import config
 from cdutetc.publish_text import is_publication_question, is_timed_reminder_request
 
-# QQ 群消息中的 @ 片段：OneBot CQ 码 [CQ:at,qq=...] 与旧格式 <@!...>
-_AT_PATTERN = re.compile(r"\[CQ:at,qq=[^\]]*\]|<@!?[^>]*>")
-_AT_TARGET_PATTERN = re.compile(r"\[CQ:at,qq=([^,\]]+)(?:,[^\]]*)?\]|<@!?([^>]*)>")
+# QQ 群消息中的 @ 片段：OneBot CQ 码 [CQ:at,qq=...] 与官方协议 <@id>。
+# 官方协议的 id 是 openid（非纯数字），因此不能按数字匹配；
+# 旧版 botpy 的 <@!id> 文本语法不会再产生，故不再兼容解析（(?!\!) 排除）。
+_AT_PATTERN = re.compile(r"\[CQ:at,qq=[^\]]*\]|<@(?!\!)[^>\s]+>")
+_AT_TARGET_PATTERN = re.compile(r"\[CQ:at,qq=([^,\]]+)(?:,[^\]]*)?\]|<@(?!\!)([^>\s]+)>")
 # 链接匹配
 _LINK_PATTERN = re.compile(r"https?://\S+")
 
@@ -18,11 +20,44 @@ def strip_at(content: str) -> str:
 
 
 def mentioned_user_ids(content: str) -> set[str]:
-    """读取 CQ / 旧格式的 @ 目标，按完整账号标识匹配。"""
-    return {
-        match.group(1) or match.group(2)
-        for match in _AT_TARGET_PATTERN.finditer(content)
-    }
+    """读取 @ 目标（CQ 码或 <@id>），按完整账号标识匹配。"""
+    return {m.group(1) or m.group(2) for m in _AT_TARGET_PATTERN.finditer(content)}
+
+
+def message_mentions(message) -> list[dict]:
+    """读取消息的统一 @ 载体。
+
+    客户端适配层已把平台 mention 规范成 ``[{"id", "is_you"}]``
+    （契约见 ``clients/base.py``）；缺失该字段的旧对象回退解析文本 @ 片段。
+    """
+    mentions = getattr(message, "mentions", None)
+    # 适配层未给出（或给不出）@ 目标时，回退解析正文，避免客户端解析口径不全导致漏判。
+    if not mentions:
+        content = getattr(message, "content", "") or ""
+        return [{"id": target, "is_you": False} for target in mentioned_user_ids(content)]
+    normalized: list[dict] = []
+    for item in mentions:
+        if isinstance(item, dict):
+            ident, is_you = item.get("id"), item.get("is_you")
+        else:
+            ident, is_you = getattr(item, "id", ""), getattr(item, "is_you", False)
+        normalized.append({"id": str(ident or ""), "is_you": is_you is True})
+    return normalized
+
+
+def is_addressed_to_bot(message, bot_identity: str = "") -> bool:
+    """判定本条消息是否 @ 到本机器人（协议无关）。
+
+    官方协议的 mention 带平台 is_you 标记，直接采信；OneBot 的 @ 目标是
+    QQ 号，用自身账号比对。两条路径统一走本函数，业务层不再自解析。
+    """
+    identity = str(bot_identity or "")
+    mentions = message_mentions(message)
+    if any(item["is_you"] for item in mentions):
+        return True
+    if identity and any(item["id"] == identity for item in mentions):
+        return True
+    return bool(getattr(message, "always_addressed", False))
 
 
 def extract_url(content: str) -> str | None:
