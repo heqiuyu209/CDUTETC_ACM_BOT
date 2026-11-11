@@ -580,6 +580,25 @@ class ACMBot:
                     (message.content or "")[:50],
                 )
             if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
+                text = strip_at(message.content or "")
+                cmd, _ = parse_command(text)
+                member_id = self._extract_member_id(message)
+                addressed = is_addressed_to_bot(message, self.bot_identity)
+                targets = {item["id"] for item in message_mentions(message) if item["id"]}
+                if (cmd == "认领此群" and is_super_admin(member_id)
+                        and (addressed or (not config.GROUP_REQUIRE_AT and not targets))):
+                    replies = await commands.handle_command(text, group_id, member_id)
+                    for reply in replies or []:
+                        if reply.get("text"):
+                            if self.supports_passive_reply and not getattr(message, "id", ""):
+                                continue
+                            seq = _clamp_reply_seq(_reply_sequence.get() + 1)
+                            _reply_sequence.set(seq)
+                            await notifications.send_group(
+                                self.client, group_id, reply["text"],
+                                reply_to=str(getattr(message, "id", "") or ""), reply_seq=seq,
+                            )
+                    return
                 logger.info("非授权群消息已忽略: %s", group_id)
                 await self._notice_unauthorized_group(message, group_id)
                 return
