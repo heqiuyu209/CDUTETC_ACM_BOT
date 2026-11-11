@@ -186,8 +186,9 @@ async def test_repeated_ready_keeps_scheduler_and_week_record(memory_db):
         assert bot.sched is scheduler
         assert {job.id for job in bot.sched.get_jobs()} == {
             "general-remind-check", "contest-remind-check", "source-crawl", "weekly-contest",
+            "daily-digest",
         }
-        assert len(bot.sched.get_jobs()) == 4
+        assert len(bot.sched.get_jobs()) == 5
         assert len(database.list_competitions()) == 1
     finally:
         await stop(bot)

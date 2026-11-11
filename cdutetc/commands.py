@@ -35,6 +35,54 @@ def _error_reply(group_id: str, code: AppErrorCode, detail: str = "") -> list[di
     text = f"[{code.value}] {detail}" if detail else safe_error_hint(code)
     return [{"group_id": group_id, "text": text, "error_code": code.value}]
 
+# ---------------------------------------------------------------------
+# 被动搭便车（piggyback）：只读查询的被动回复尾部追加一条最紧急待办
+# ---------------------------------------------------------------------
+
+# 只有「只读查询」类命令才搭车：它们不改变任何状态，尾部追加一行提示不会被
+# 误读成操作结果；写操作（/报名、/课程添加 等）不搭车，避免语义混淆。
+PIGGYBACK_COMMANDS = frozenset({
+    "帮助", "help", "课程列表", "FAQ列表", "校安排", "通知列表",
+    "比赛状态", "群状态", "提醒状态",
+})
+
+# 单群冷却：避免群员高频查询时每帧都刷同一句提示。
+PIGGYBACK_COOLDOWN_SECONDS = 600
+
+_piggyback_sent_at: dict[str, datetime] = {}
+
+
+def reset_piggyback_cooldown() -> None:
+    """清空搭便车冷却记录（单测与热重载用）。"""
+    _piggyback_sent_at.clear()
+
+
+def append_piggyback_notice(group_id: str, reply_text: str,
+                            now: datetime | None = None) -> str:
+    """被动回复尾部追加「最紧急的一条待办」；冷却中或无待办时原样返回。
+
+    调用前提：本次回复走被动通道（reply_to 存在），因此不消耗主动额度。
+    写库只发生在内存冷却表中，不触碰业务数据。
+    """
+    if not reply_text:
+        return reply_text
+    gid = (group_id or "").strip()
+    if not gid:
+        return reply_text
+    current = now or datetime.now(TZ)
+    current = current.replace(tzinfo=TZ) if current.tzinfo is None else current.astimezone(TZ)
+    last = _piggyback_sent_at.get(gid)
+    if last is not None and (current - last) < timedelta(seconds=PIGGYBACK_COOLDOWN_SECONDS):
+        return reply_text
+    from cdutetc import daily_digest
+
+    notice = daily_digest.build_piggyback_notice(gid, current)
+    if not notice:
+        return reply_text
+    _piggyback_sent_at[gid] = current
+    return f"{reply_text.rstrip()}\n{notice}"
+
+
 _HELP_HEADER = "【使用帮助】"
 
 # 帮助文案在群里公开展示，只描述「能做什么」，不写实现细节。

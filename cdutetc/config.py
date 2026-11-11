@@ -383,6 +383,29 @@ WEEKLY_CONTEST_GROUPS = {
     g.strip() for g in os.getenv("ACM_WEEKLY_CONTEST_GROUPS", "").split(",") if g.strip()
 }
 
+# ================= 每日聚合晨报（主动额度节流） =================
+# 官方协议每群每天主动消息额度只有 1~4 条，因此把「当日课程 + 临近截止征集 +
+# 临近赛事」合并为每天一条晨报，代替过去多次主动推送。
+DAILY_DIGEST_ENABLED = os.getenv("ACM_DAILY_DIGEST_ENABLED", "1") != "0"
+
+
+def _digest_clock() -> tuple[int, int]:
+    """解析晨报时刻（HH:MM）；非法值回落到 08:30，不让机器人因配置笔误起不来。"""
+    raw = os.getenv("ACM_DAILY_DIGEST_TIME", "08:30").strip()
+    try:
+        hour_text, minute_text = raw.split(":", 1)
+        hour, minute = int(hour_text), int(minute_text)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError(raw)
+        return hour, minute
+    except (ValueError, AttributeError):
+        return 8, 30
+
+
+DAILY_DIGEST_HOUR, DAILY_DIGEST_MINUTE = _digest_clock()
+# 群员只读查询的被动回复尾部是否搭便车附带最紧急待办（零主动额度消耗）。
+DAILY_DIGEST_PIGGYBACK_ENABLED = os.getenv("ACM_DAILY_DIGEST_PIGGYBACK_ENABLED", "1") != "0"
+
 # ================= 公共来源低频集中抓取（v2，默认关闭） =================
 # 自动抓取默认关闭：开启后同一来源两次抓取的最小间隔（分钟）由下值控制。
 AUTO_FETCH_ENABLED = os.getenv("ACM_AUTO_FETCH_ENABLED", "0") != "0"

@@ -54,6 +54,15 @@
 
 仅配置旧 `ACM_REMIND_BEFORE_HOURS`、未配置多节点的部署继续使用旧值；自动补齐 `.env` 不会擅自加入 `24,1`。希望切换多节点时请显式添加 `ACM_REMIND_OFFSET_HOURS`。节点必须是有限正数，非法值在启动时拒绝。周赛预生成会覆盖配置中最早的提醒窗口；其他周期扫描提醒使用很短或相近节点时，也应调小 `ACM_REMIND_CHECK_INTERVAL_MINUTES`。
 
+### 主动额度节流：聚合晨报 + 被动搭便车
+
+官方 QQ 协议每群每天只有 1~4 条主动消息额度，因此提醒升级为「定时聚合 + 被动尾随」双轨：
+
+- **聚合晨报**：每天 `ACM_DAILY_DIGEST_TIME`（默认 `08:30`）为每个授权群生成一条事务总览，汇总今日课程、48 小时内截止的征集、24 小时内开赛且预检就绪的比赛，只占 1 条主动额度。三类都为空的群直接跳过，不发空消息；正文为纯文本，不含 Markdown 语法。
+- **只承诺能推的比赛**：晨报里的比赛必须通过 `/比赛状态` 同款预检（群白名单、接入能力位、主动总开关、群熔断、比赛-群绑定、未来待发节点），查得到但到点不会推的比赛不会写进晨报。
+- **被动搭便车**：群员触发只读查询（`/课程列表`、`/FAQ列表`、`/帮助`、`/比赛状态`、`/群状态`、`/提醒状态` 等）时，被动回复尾部追加一条最紧急待办——12 小时内截止的报名（附 `/报名 <id>` 快捷命令）或 2 小时内开赛的比赛。单群 10 分钟冷却，零消耗主动额度；写操作与出错/无权限的回复不搭车。
+- **单群失败不阻塞**：晨报逐个群推送，某群遇到主动消息配额耗尽（`11253`/`11263`）按群熔断跳过并记告警，其余群继续；单群生成或发送异常也只影响该群。
+
 发布、修正、超管确认、定时提醒、直接回复共用统一通知入口。应用错误包括 `[validation]`、`[permission]`、`[internal]`、`[fetch]`、`[llm]`；投递错误包括 `[not_connected]`、`[disabled]`、`[target_not_allowed]`、`[authentication]`、`[forbidden]`、`[active_forbidden]`、`[rate_limited]`、`[timeout_unknown]` 等。未知平台错误保留为 `[unknown]`，不会猜测成“额度用完”。网络超时存在平台已收但本地未确认的可能，重试不能保证严格 exactly-once。
 
 ### 双协议保持可切换
@@ -197,6 +206,9 @@ python scripts/export_collection.py --group-id '群openid' --collection-id 1 --o
 | `ACM_WEEKLY_CONTEST_START` / `_END` | 否 | `19:00` / `21:00` | 周赛起止时间 |
 | `ACM_WEEKLY_CONTEST_TEMPLATE` | 否 | `ACM 周赛（本周）` | 周赛记录名称模板 |
 | `ACM_WEEKLY_CONTEST_GROUPS` | 否 | 空 | 周赛仅对这些群可见并提醒（逗号分隔）；留空不对任何群开放，官方群填 OpenID |
+| `ACM_DAILY_DIGEST_ENABLED` | 否 | `1` | 每日聚合晨报开关（每群每天最多 1 条主动消息） |
+| `ACM_DAILY_DIGEST_TIME` | 否 | `08:30` | 晨报推送时刻（`HH:MM`，北京时间）；格式非法回落 `08:30` |
+| `ACM_DAILY_DIGEST_PIGGYBACK_ENABLED` | 否 | `1` | 只读查询的被动回复尾部是否附带一条最紧急待办（零主动额度） |
 | `ACM_LLM_BASE_URL` | 否 | `https://api.deepseek.com/v1` | 大模型接口地址 |
 | `ACM_LLM_MODEL` | 否 | `deepseek-chat` | 模型名 |
 | `ACM_LLM_MAX_INPUT_CHARS` | 否 | `6000` | 单次模型请求输入上限 |

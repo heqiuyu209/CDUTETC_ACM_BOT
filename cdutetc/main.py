@@ -39,6 +39,7 @@ from cdutetc import commands
 from cdutetc import config
 from cdutetc import content_filter
 from cdutetc import crawler
+from cdutetc import daily_digest
 from cdutetc import database as db
 from cdutetc import llm
 from cdutetc import roles
@@ -366,6 +367,17 @@ class ACMBot:
             minutes=config.FETCH_MIN_INTERVAL_MINUTES,
             id="source-crawl",
         )
+        if config.DAILY_DIGEST_ENABLED:
+            # 每日固定时刻推送一次聚合晨报；coalesce 保证服务重启/休眠后只补一次。
+            sched.add_job(
+                self._daily_digest_job,
+                "cron",
+                hour=config.DAILY_DIGEST_HOUR,
+                minute=config.DAILY_DIGEST_MINUTE,
+                id="daily-digest",
+                max_instances=1,
+                coalesce=True,
+            )
         if config.WEEKLY_CONTEST_ENABLED:
             _, start, _ = _weekly_contest_window(now)
             # 提醒窗口打开前一个扫描周期预生成，避免开赛时才生成及同刻调度竞争。
@@ -646,6 +658,15 @@ class ACMBot:
             # OneBot 无此约束，保持原有逐条回复行为。
             if self.supports_passive_reply:
                 merged_texts = _merge_group_reply_texts(same_group_texts)
+                # 被动搭便车：只读查询的被动回复尾部追加一条最紧急待办，
+                # 零消耗主动额度；单群冷却与内容提取都在命令层统一处理。
+                if merged_texts and config.DAILY_DIGEST_PIGGYBACK_ENABLED:
+                    # 出错/无权限的回复不搭车：先把问题讲清楚，别混入广告式提示。
+                    failed = any(reply.get("error_code") for reply in (replies or []))
+                    if not failed and cmd in commands.PIGGYBACK_COMMANDS:
+                        merged_texts[-1] = commands.append_piggyback_notice(
+                            group_id, merged_texts[-1]
+                        )
             else:
                 merged_texts = same_group_texts
             merged_cursor = 0
@@ -1100,6 +1121,48 @@ class ACMBot:
             await check_general_reminders(self._send_group_result)
         except Exception:  # noqa: BLE001
             logger.exception("通用提醒扫描失败，等待下一轮重试")
+
+    async def _daily_digest_job(self, now: datetime | None = None) -> int:
+        """每日聚合晨报：每群最多 1 条主动消息，汇总当日课程/征集/赛事。
+
+        设计要点：
+        - 只对授权群（运行时白名单）逐个生成，某群内容为空则整群跳过，
+          不发空消息浪费额度；
+        - 单群失败不影响其他群：配额耗尽（11253/11263）已在
+          ``_send_group_result`` 内持久熔断，这里只记告警并继续下一个群；
+        - now 供离线验证注入，无时区按北京时间处理。
+        """
+        from cdutetc.errors import DeliveryCode
+
+        if not config.DAILY_DIGEST_ENABLED:
+            return 0
+        if not config.GROUP_ACTIVE_MESSAGES_ENABLED:
+            logger.info("主动群消息未启用，暂停晨报投递")
+            return 0
+        sent = 0
+        for group_id in sorted(config.ALLOWED_GROUPS):
+            try:
+                text = daily_digest.build_daily_digest(group_id, now=now)
+                if not text:
+                    continue
+                result = await self._send_group_result(group_id, text)
+            except Exception:  # noqa: BLE001 - 单群异常不得中断其余群
+                logger.exception("[晨报] 群 %s 生成或发送异常，继续下一个群", group_id)
+                continue
+            if result.ok:
+                sent += 1
+                continue
+            if result.code == DeliveryCode.QUOTA_EXHAUSTED:
+                logger.warning(
+                    "[晨报] 群 %s 主动消息配额已耗尽，本群今日跳过（已熔断，不再重试）",
+                    group_id,
+                )
+            else:
+                logger.warning("[晨报] 群 %s 未发送 [%s]",
+                               group_id, getattr(result.code, "value", result.code))
+        if sent:
+            logger.info("[晨报] 本次成功推送 %d 个群的事务总览", sent)
+        return sent
 
     async def _weekly_contest_job(self, now: datetime | None = None):
         """提前生成下一场未来周赛（默认不通知全员）。
