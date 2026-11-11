@@ -405,6 +405,16 @@ class ACMBot:
         try:
             uid = message.user_id
             content = message.content or ""
+            # 私聊作用域闸门：只有超管能进管理链路，老师与普通成员一律在这里返回，
+            # 避免老师借私聊拿到跨群配置/比赛，也避免后续审批与命令被误触发。
+            if not is_super_admin(uid):
+                if content.strip().startswith("/"):
+                    await self._send_private_result(
+                        uid, "⛔ 私聊管理仅对超级管理员开放，请在已授权群内使用命令")
+                else:
+                    await self._send_private_result(
+                        uid, "你好～群内问题请在群里 @我，私聊管理仅向超管开放。")
+                return
             if config.DEBUG_LOG_IDENTITY:
                 logger.info("[私聊][调试] user_id=%s content=%s", uid, content[:50])
             # 超管私聊回复「同意/通过/拒绝 <编号>」处理待确认的发布申请
@@ -437,7 +447,7 @@ class ACMBot:
                             "或设置 ACM_ADMIN_GROUP / ACM_ALLOWED_GROUPS）",
                         )
                         return
-                replies = await commands.handle_command(content, admin_gid, uid)
+                replies = await commands.handle_command(content, admin_gid, uid, private=True)
                 for reply in replies or []:
                     if reply.get("text"):
                         await self._send_private_result(uid, reply["text"])

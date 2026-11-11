@@ -75,6 +75,7 @@ _HELP_SECTIONS = (
     )),
     ("提醒与来源", (
         (2, "/提醒状态 [页码]", "查看未来7天的提醒时间和投递状态"),
+        (2, "/比赛状态", "诊断本群比赛到点是否真会推送（就绪/阻断分列）"),
         (3, "/通知测试 [群|私聊] [目标标识]", "主动测试；官方群可在末尾加 Markdown 或 文本"),
         (2, "/抓取状态", "查看比赛来源更新情况"),
         (2, "/抓取一次", "立即检查一次比赛来源"),
@@ -103,6 +104,7 @@ _HELP_SECTIONS = (
         (3, "/命名人 <标识> <名称>", "给人起名字"),
         (3, "/命名列表", "查看已命名的群和人"),
         (3, "/通知群 <比赛id> <群号,群号>", "设置该比赛通知哪些群"),
+        (3, "/比赛状态 全部", "私聊查看全部已授权群的提醒就绪情况"),
     )),
 )
 
@@ -967,6 +969,34 @@ def cmd_reminder_status(group_id: str, sender: str, args: str) -> list[dict]:
     return [{"group_id": group_id, "text": reminder_view.render(group_id, page=page)}]
 
 
+SCOPE_DENIED_GROUP = "⚠️ 该命令仅限本群老师或超级管理员执行"
+SCOPE_DENIED_PRIVATE = "⛔ 私聊管理仅对超级管理员开放，请在已授权群内使用命令"
+# 作用域诊断类命令：入口处按「身份 × 渠道」统一挡一层，命令内部再按作用域决定展示范围。
+# 其余既有管理命令沿用各自的权限实现，避免改动已知行为。
+_STATUS_COMMANDS = frozenset({"比赛状态", "群状态"})
+
+
+def admin_scope(sender: str, group_id: str, *, private: bool = False) -> str | None:
+    """统一作用域入口：群聊按本群，私聊按全局（仅超管）。"""
+    from cdutetc import roles
+    return roles.resolve_admin_scope(sender, None if private else group_id)
+
+
+def cmd_contest_status(group_id: str, sender: str, args: str, *, private: bool = False) -> list[dict]:
+    """比赛主动提醒诊断：私聊超管看全部已授权群，群聊只看本群。"""
+    from cdutetc import reminder_preflight
+    scope = admin_scope(sender, group_id, private=private)
+    if scope is None:
+        return [{"group_id": group_id,
+                 "text": SCOPE_DENIED_PRIVATE if private else SCOPE_DENIED_GROUP}]
+    if args.strip() not in ("", "全部"):
+        return [{"group_id": group_id,
+                 "text": "用法：/比赛状态（群内看本群；私聊超管可用 /比赛状态 全部）"}]
+    from cdutetc import roles
+    groups = sorted(config.ALLOWED_GROUPS) if scope == roles.SCOPE_GLOBAL else [group_id]
+    return [{"group_id": group_id, "text": reminder_preflight.render_diagnosis(groups)}]
+
+
 async def cmd_trigger_fetch(group_id: str, sender: str, args: str) -> list[dict]:
     """手动触发一次公共来源抓取（老师）。结果汇总后返回，不写入发送日志冒充发送。
 
@@ -1004,13 +1034,15 @@ async def cmd_trigger_fetch(group_id: str, sender: str, args: str) -> list[dict]
 # ---------------------------------------------------------------------
 
 async def handle_command(text: str, group_id: str, sender: str,
-                         client=None) -> list[dict] | None:
+                         client=None, *, private: bool = False) -> list[dict] | None:
     """处理一条命令消息。
 
     - 非命令消息返回 None（由上层走 FAQ 匹配 / 模型问答 / 未答问题收集）。
     - 命令消息返回消息列表，每条含 group_id 与 text（text 为空表示无需发送）。
     - 命令名大小写不敏感：精确匹配失败时按 lower 兜底（兼容 /FAQ、/faq 等）。
     - 命令处理函数若为协程（如异步抓取）则在本循环内 await，避免嵌套 asyncio.run。
+    - `private=True` 表示来自私聊：管理命令按全局作用域校验（仅超管），
+      群聊按本群作用域校验；作用域为 None 时统一拦截，不进入任何管理逻辑。
     """
     if not text.startswith("/"):
         return None
@@ -1019,6 +1051,11 @@ async def handle_command(text: str, group_id: str, sender: str,
         return [{"group_id": group_id, "text": "请写上命令名，例如 /帮助。"}]
     if cmd in ("help", "帮助"):
         return [{"group_id": group_id, "text": build_help(sender, args)}]
+    scoped_cmd = cmd if cmd in _STATUS_COMMANDS else next(
+        (key for key in _STATUS_COMMANDS if key.lower() == cmd.lower()), cmd)
+    if scoped_cmd in _STATUS_COMMANDS and admin_scope(sender, group_id, private=private) is None:
+        return [{"group_id": group_id,
+                 "text": SCOPE_DENIED_PRIVATE if private else SCOPE_DENIED_GROUP}]
     from cdutetc import group_admin
     handlers = {
         "群配置": lambda gid, uid, value: group_admin.handle_command("群配置", value, uid, gid),
@@ -1058,6 +1095,8 @@ async def handle_command(text: str, group_id: str, sender: str,
         "回答": cmd_answer_question,
         "抓取状态": cmd_fetch_status,
         "提醒状态": cmd_reminder_status,
+        "比赛状态": lambda gid, uid, value: cmd_contest_status(gid, uid, value, private=private),
+        "群状态": lambda gid, uid, value: cmd_contest_status(gid, uid, value, private=private),
         "抓取一次": cmd_trigger_fetch,
     }
     handler = handlers.get(cmd)

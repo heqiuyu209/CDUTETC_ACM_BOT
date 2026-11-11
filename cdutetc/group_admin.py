@@ -127,8 +127,15 @@ def handle_command(command: str, args: str, sender: str, current_group: str = ""
     if command not in COMMANDS:
         return None
     reply = lambda text, **extra: [{"group_id": current_group, "text": text, **extra}]
-    if not is_super_admin(sender):
-        return reply("仅超管可按群查询和配置；老师请在负责的群里查看 /提醒状态。")
+    # 作用域闸门：私聊只有超管（global），群聊是超管或本群老师（group）；
+    # 群内查询永远只能落到 current_group，跨群与配置类操作仍锁在超管。
+    from cdutetc import roles
+    scope = roles.resolve_admin_scope(sender, current_group or None)
+    if scope is None:
+        return reply("⚠️ 该命令仅限本群老师或超级管理员执行" if current_group
+                     else "⛔ 私聊管理仅对超级管理员开放，请在已授权群内使用命令")
+    if command in ("群配置", "周赛设置", "群老师") and not is_super_admin(sender):
+        return reply("群配置与变更仅超管执行；本群提醒可用 /群提醒、/比赛状态 查看。")
     try:
         parts = shlex.split(args)
         if not parts:
