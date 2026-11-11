@@ -298,6 +298,17 @@ QA_KB_MATCH_MIN_SCORE = float(os.getenv("ACM_QA_KB_MATCH_MIN_SCORE", "0.34"))
 # 仅本地无法确定 FAQ 时让模型选择候选编号；默认关闭，保持零模型成本。
 QA_FAQ_LLM_ENABLED = os.getenv("ACM_QA_FAQ_LLM_ENABLED", "0") == "1"
 
+# --- 8) 动态群上下文注入（问答链路重构） ---
+# 开启后每次 @机器人 提问都会把「未来 7 天课程 + 开放征集 + 本群 FAQ」拼成
+# 事实块注入 system prompt，模型只按事实作答，操作引导仅限白名单命令。
+# 置 0 可关闭，关闭后退回「只按存档比赛数据作答」的旧行为。
+QA_CONTEXT_ENABLED = os.getenv("ACM_QA_CONTEXT_ENABLED", "1") != "0"
+# 普通成员 FAQ / 已录入资料都没命中时，是否先用上下文模型作答，
+# 模型仍判定「未收录」才转人工工单。默认关闭以保持普通成员零 token 成本。
+QA_MEMBER_CONTEXT_ANSWER = os.getenv("ACM_QA_MEMBER_CONTEXT_ANSWER", "0") == "1"
+# 上下文长度上限（字符），超出按行截断，避免撑爆输入预算。
+QA_CONTEXT_MAX_CHARS = int(os.getenv("ACM_QA_CONTEXT_MAX_CHARS", "3000"))
+
 # ================= 链接抓取（SSRF 与资源限制） =================
 # 域名白名单（逗号分隔，小写）。配置后仅白名单域名可抓取（重定向目标同样校验）
 FETCH_ALLOWED_DOMAINS = {

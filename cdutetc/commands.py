@@ -1318,15 +1318,44 @@ async def handle_non_command_message(text: str, group_id: str, sender: str,
         answer = await _answer_from_knowledge_base(text, group_id)
         if answer is not None:
             return [{"group_id": group_id, "text": answer}]
+        # 可选：先用动态上下文模型作答（事实覆盖不到才转工单），默认关闭保持零 token
+        if config.QA_MEMBER_CONTEXT_ANSWER and config.LLM_API_KEY:
+            contextual = await _answer_from_context(text, group_id)
+            if contextual is not None:
+                return [{"group_id": group_id, "text": contextual}]
         qid = db.add_unanswered_question(group_id, text, sender)
         return [{"group_id": group_id,
                  "text": f"{config.QA_MEMBER_NO_MATCH_REPLY}（问题编号 #{qid}）"}]
 
-    try:
-        answer = await llm.answer_question(text, db.list_question_contests(group_id))
-    except Exception:  # noqa: BLE001
-        answer = "模型暂时不可用，请稍后再试~"
+    answer = await _answer_question_with_context(text, group_id)
     if answer.startswith("模型暂时不可用"):
         qid = db.add_unanswered_question(group_id, text, sender)
-        return [{"group_id": group_id, "text": f"收到，已记录为问题 #{qid}，老师看到后会回答"}]
+        return [{"group_id": group_id,
+                 "text": f"模型暂时用不了，已先记为问题 #{qid}，老师看到后会回复。"}]
+    if llm.UNKNOWN_MARKER in answer:
+        qid = db.add_unanswered_question(group_id, text, sender)
+        return [{"group_id": group_id,
+                 "text": f"这条我暂时没查到，已记录为问题 #{qid}；"
+                         "补一份 FAQ（/FAQ添加）或课程/征集后我就能直接答。"}]
     return [{"group_id": group_id, "text": answer}]
+
+
+async def _answer_question_with_context(text: str, group_id: str) -> str:
+    """带上当前群教务事实的模型问答；模型异常按「模型暂时不可用」返回。"""
+    from cdutetc import qa_context
+
+    group_context = qa_context.build_group_qa_context(group_id) if config.QA_CONTEXT_ENABLED else ""
+    try:
+        return await llm.answer_question(
+            text, db.list_question_contests(group_id), group_context=group_context,
+        )
+    except Exception:  # noqa: BLE001 - 模型异常统一降级，不打断群聊
+        return "模型暂时不可用，请稍后再试~"
+
+
+async def _answer_from_context(text: str, group_id: str) -> str | None:
+    """上下文模型作答；模型不可用或判定未收录时返回 None，交由调用方转工单。"""
+    answer = await _answer_question_with_context(text, group_id)
+    if not answer or answer.startswith("模型暂时不可用") or llm.UNKNOWN_MARKER in answer:
+        return None
+    return answer

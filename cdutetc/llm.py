@@ -204,6 +204,28 @@ def _limit_contests(contests: list[dict], max_items: int = 5, max_chars: int = 1
     return out
 
 
+# 动态上下文完全覆盖不到问题时的内部标记：调用方据此平滑转人工工单。
+UNKNOWN_MARKER = "[未收录]"
+
+
+def _context_block(group_context: str) -> str:
+    """把动态教务事实拼成 system prompt 尾段；空上下文返回空串（零额外 token）。"""
+    context = (group_context or "").strip()
+    if not context:
+        return ""
+    from cdutetc.qa_context import COMMAND_GUIDE  # 局部导入避免循环依赖
+
+    commands = "；".join(COMMAND_GUIDE)
+    return (
+        f"\n{context}\n"
+        "【事实使用规则】以上事实由本群教务库实时生成，课程、征集、FAQ 一律以事实为准：\n"
+        "- 时间、地点、截止时间、名额、征集 ID 原样引用，不改写、不补全；\n"
+        "- 事实里没有的内容就说还没查到，不要猜，也不要重复整份事实清单；\n"
+        f"- 需要用户执行操作时，只能用这些命令引导：{commands}，不要编造其他命令；\n"
+        f"- 若以上事实完全回答不了这个问题，只输出 {UNKNOWN_MARKER}，不要输出别的字。"
+    )
+
+
 async def _chat_once(system: str, user: str, json_mode: bool = False, *,
                      max_tokens: int | None = None, temperature: float = 0) -> str:
     """调用一次模型（并发受限），返回 assistant 文本。失败抛异常。
@@ -354,8 +376,13 @@ async def answer_social_chat(text: str) -> str:
     )
 
 
-async def answer_question(question: str, contests: list[dict]) -> str:
+async def answer_question(question: str, contests: list[dict], *,
+                          group_context: str = "") -> str:
     """按可见存档回答提问。contests 须为调用方筛选、限量的结果。
+
+    传入 ``group_context`` 时（见 :mod:`cdutetc.qa_context`），动态教务事实
+    会追加到 system prompt，模型只按事实作答；事实完全覆盖不到时输出
+    :data:`UNKNOWN_MARKER`，由调用方平滑转人工工单，而不是硬凑答案。
 
     回答前先做五层防护中的本地判定（不调模型），system prompt 软约束保留：
       - 话题范围硬限制：与 ACM 明显无关的问题直接拒绝，不产生模型调用；
@@ -376,6 +403,7 @@ async def answer_question(question: str, contests: list[dict]) -> str:
         return config.QA_SENSITIVE_REPLY
 
     limited = _limit_contests(contests)
+    fact_block = _context_block(group_context)
     system = (
         "你是 CDUTETC ACM 队务助手，只答比赛、课程和集训事务。像队友聊天，先说结论，"
         "用一到三句短中文，不套客服开场或功能清单。只用存档事实，时间、地点原样引用；"
@@ -383,6 +411,7 @@ async def answer_question(question: str, contests: list[dict]) -> str:
         "系统支持查询、报名、老师发布并由超管确认，以及按配置自动提醒；不要声称做不到，"
         "也不承诺已经执行操作或消息必达。不确定的事项请老师确认。\n"
         f"【存档数据】\n{json.dumps(limited, ensure_ascii=False, separators=(',', ':'))}"
+        f"{fact_block}"
     )
     try:
         answer = (await _chat_once(system, question, max_tokens=240, temperature=0.4))[:1500]
