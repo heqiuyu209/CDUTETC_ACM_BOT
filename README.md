@@ -29,6 +29,7 @@
 - **群内安排（training_sessions / group_faq / unanswered_questions / collections）**：全部带 `group_id`，严格按群隔离。
 - **征集登记（collection_responses）**：同一征集+成员幂等登记，取消保留历史；容量、截止、字段校验与写入同事务。
 - **提醒投递（reminder_deliveries）**：去重键含群、对象、类型、目标时间及节点，自动迁移旧键；成功回执单独持久化，失败有界重试，关闭/改期取消，过期不发。
+- **旧群赛事提醒兼容**：已有群归属的旧赛事按原提醒窗口继续投递；旧成功记录参与去重。迁移后的比赛确认时，原群同一时间的旧成功记录继续生效。
 - **来源抓取（competition_sources）**：记录 ETag/Last-Modified/正文哈希/最近抓取时间/状态/错误，支撑低频抓取与变化检测。
 
 发布比赛时，正式比赛、来源 URL 和已抓取正文的哈希在同一事务保存。开启 `ACM_AUTO_FETCH_ENABLED=1` 后，新发布链接按 `ACM_FETCH_MIN_INTERVAL_MINUTES` 进入后台监控；正文未变化不再调用模型，有变化则保存待审更新。`/抓取状态` 可查看来源登记与最近检查结果。

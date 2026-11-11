@@ -683,7 +683,10 @@ def has_reminded(group_id: str, contest_id: int, remind_type: str, target_time: 
             "SELECT 1 FROM reminders WHERE group_id=? AND contest_id=? AND remind_type=? AND target_time=?",
             (group_id, contest_id, remind_type, target_time),
         ).fetchone()
-        return row is not None
+        if row is not None:
+            return True
+        key = delivery_dedup_key(group_id, "legacy_contest", contest_id, remind_type, target_time)
+        return conn.execute("SELECT 1 FROM reminder_success_receipts WHERE dedup_key=?", (key,)).fetchone() is not None
 
 
 # LEGACY(P1): contests/reminders 旧表读写，仅供历史数据迁移与清理；新代码请用 competitions 新链。
@@ -2647,6 +2650,21 @@ def _delivery_parse_time(text: str) -> datetime | None:
     return None
 
 
+def _legacy_reminder_succeeded_on(conn: sqlite3.Connection, group_id: str, contest_id: int,
+                                  remind_type: str, target_time: str) -> bool:
+    for row in conn.execute(
+        "SELECT target_time FROM reminders WHERE group_id=? AND contest_id=? AND remind_type=?",
+        (group_id, contest_id, remind_type),
+    ):
+        if _canonical_time(row[0]) == target_time:
+            return True
+    key = delivery_dedup_key(group_id, "legacy_contest", contest_id, remind_type, target_time)
+    return conn.execute(
+        "SELECT 1 FROM reminder_success_receipts WHERE dedup_key=? UNION ALL "
+        "SELECT 1 FROM reminder_deliveries WHERE dedup_key=? AND status='sent' LIMIT 1", (key, key),
+    ).fetchone() is not None
+
+
 def _delivery_invalid_status(conn: sqlite3.Connection, delivery: dict,
                              now: datetime, allowed_groups: set[str] | None = None) -> str | None:
     """发送前按当前对象状态/目标复核；旧计划失效即终结。"""
@@ -2674,6 +2692,15 @@ def _delivery_invalid_status(conn: sqlite3.Connection, delivery: dict,
             return "cancelled"
         if delivery["group_id"] not in _competition_target_groups_on(conn, delivery["obj_id"]):
             return "cancelled"
+        old_type = {"reg_deadline": "reg_deadline", "contest_start": "contest_time"}[delivery["remind_type"]]
+        migrations = conn.execute(
+            "SELECT object_id FROM audit_log WHERE action='migrate' AND object_type='contest' AND after_json=?",
+            (f"->competition {delivery['obj_id']}",),
+        ).fetchall()
+        for (old_id,) in migrations:
+            if old_id.isdecimal() and _legacy_reminder_succeeded_on(
+                    conn, delivery["group_id"], int(old_id), old_type, delivery["target_time"]):
+                return "cancelled"
     elif delivery["obj_type"] == "training_session":
         if delivery["remind_type"] != "start_time" or not delivery["group_id"]:
             return "cancelled"
@@ -2683,6 +2710,21 @@ def _delivery_invalid_status(conn: sqlite3.Connection, delivery: dict,
         target = _delivery_parse_time(delivery["target_time"])
         if (row is None or row[1] != delivery["group_id"] or target is None
                 or not training_occurrence_valid(_row_to_training(row), target)):
+            return "cancelled"
+    elif delivery["obj_type"] == "legacy_contest":
+        field = {"reg_deadline": "reg_deadline", "contest_time": "contest_time"}.get(delivery["remind_type"])
+        if field is None or not delivery["group_id"]:
+            return "cancelled"
+        row = conn.execute(f"SELECT group_id, {field} FROM contests WHERE id=?", (delivery["obj_id"],)).fetchone()
+        if (row is None or row[0] != delivery["group_id"]
+                or _canonical_time(row[1]) != delivery["target_time"]):
+            return "cancelled"
+        superseded = conn.execute(
+            "SELECT 1 FROM audit_log a JOIN competitions c ON a.after_json = '->competition ' || c.id"
+            " WHERE a.action='migrate' AND a.object_type='contest' AND a.object_id=?"
+            " AND c.status='confirmed' LIMIT 1", (str(delivery["obj_id"]),),
+        ).fetchone()
+        if superseded:
             return "cancelled"
     else:
         return "cancelled"
@@ -2750,6 +2792,20 @@ def claim_delivery(group_id: str, obj_type: str, obj_id: int, remind_type: str,
         return None
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        if obj_type == "competition" and remind_type in ("reg_deadline", "contest_start"):
+            old_type = "contest_time" if remind_type == "contest_start" else "reg_deadline"
+            inflight = conn.execute(
+                "SELECT d.lease_token, d.lease_until FROM reminder_deliveries d"
+                " JOIN audit_log a ON a.object_id=CAST(d.obj_id AS TEXT)"
+                " WHERE a.action='migrate' AND a.object_type='contest' AND a.after_json=?"
+                " AND d.obj_type='legacy_contest' AND d.group_id=? AND d.remind_type=?"
+                " AND d.target_time=? AND d.status='sending'",
+                (f"->competition {obj_id}", group_id, old_type, target_time),
+            ).fetchall()
+            for lease_token, lease_until in inflight:
+                until = _delivery_parse_time(lease_until)
+                if lease_token and until and until > now:
+                    return None
         if key != legacy_key:
             legacy = conn.execute(
                 "SELECT status FROM reminder_deliveries WHERE dedup_key = ?", (legacy_key,),
@@ -2772,6 +2828,18 @@ def claim_delivery(group_id: str, obj_type: str, obj_id: int, remind_type: str,
         )
         row = conn.execute(f"SELECT {_DELIVERY_COLS} FROM reminder_deliveries WHERE dedup_key = ?", (key,)).fetchone()
         delivery = _row_to_delivery(row)
+        if obj_type == "legacy_contest":
+            history = conn.execute(
+                "SELECT target_time, sent_at FROM reminders WHERE group_id=? AND contest_id=? AND remind_type=?",
+                (group_id, obj_id, remind_type),
+            ).fetchall()
+            for history_target, sent_at in history:
+                if _canonical_time(history_target) == target_time:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO reminder_success_receipts (dedup_key, lease_token, sent_at) VALUES (?, ?, ?)",
+                        (key, "legacy-history", sent_at),
+                    )
+                    return None
         if remind_type == "contest_start":
             scheduled = _delivery_parse_time(delivery.get("scheduled_at") or "")
             if scheduled is None or now < scheduled or delivery["status"] == "cancelled":

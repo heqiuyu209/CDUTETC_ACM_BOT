@@ -345,8 +345,7 @@ class ACMBot:
         now = now or datetime.now(tz)
         now = now.replace(tzinfo=tz) if now.tzinfo is None else now.astimezone(tz)
         sched = AsyncIOScheduler(timezone=config.TZ_NAME)
-        # legacy 比赛提醒（contests/reminders 旧表）已下线；此处只跑通用提醒
-        # （征集截止 / 公共比赛 / 课程开课），扫描节奏沿用原配置项。
+        # 通用与旧群赛事提醒共用扫描周期。
         sched.add_job(
             self._general_remind_job,
             "interval",
@@ -1130,7 +1129,7 @@ class ACMBot:
             logger.exception("开赛提醒计划扫描失败 [%s]", AppErrorCode.INTERNAL)
 
     async def _general_remind_job(self):
-        """周期检查通用提醒：征集登记截止 + 公共比赛 + 训练开始。"""
+        """周期检查征集、比赛和训练提醒。"""
         if not config.GROUP_ACTIVE_MESSAGES_ENABLED:
             logger.info("主动群消息未启用，暂停提醒投递")
             return
