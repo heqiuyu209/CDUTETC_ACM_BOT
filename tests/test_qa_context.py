@@ -32,6 +32,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "QA_FAQ_LLM_ENABLED", False)
     monkeypatch.setattr(config, "QA_SOCIAL_CHAT_ENABLED", True)
     monkeypatch.setattr(config, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(qa_context, "_now", lambda value=None: value or NOW)
     db.init_db()
     return monkeypatch
 

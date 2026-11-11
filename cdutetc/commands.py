@@ -128,6 +128,12 @@ _HELP_SECTIONS = (
         (2, "/抓取状态", "查看比赛来源更新情况"),
         (2, "/抓取一次", "立即检查一次比赛来源"),
     )),
+    ("私聊调试（超管）", (
+        (3, "/选群 [序号|群名|群号]", "私聊绑定目标群，之后私聊指令都作用于该群"),
+        (3, "/当前群", "查看私聊当前绑定的目标群"),
+        (3, "/重置群", "解除绑定，恢复全局管理模式"),
+        (3, "/晨报预览", "只在私聊回显该群晨报，不发送到群"),
+    )),
     ("身份信息", (
         (2, "/群列表", "查看已授权的群和老师"),
         (2, "/老师列表", "查看已授权的群和老师"),
@@ -1045,6 +1051,165 @@ def cmd_contest_status(group_id: str, sender: str, args: str, *, private: bool =
     return [{"group_id": group_id, "text": reminder_preflight.render_diagnosis(groups)}]
 
 
+# ---------------------------------------------------------------------
+# 超管私聊「目标工作群（Active Group）」会话指令
+# ---------------------------------------------------------------------
+# 这些指令只在私聊里生效，用于给超管私聊绑定一个目标群，之后私聊的
+# /课程* /FAQ* /比赛状态 /晨报预览 等指令都按该群的单群视角执行，
+# 回执全部走私聊，真实群完全无感知。
+PRIVATE_SESSION_COMMANDS = frozenset({"选群", "切群", "当前群", "重置群"})
+
+
+def _allowed_group_ids() -> list[str]:
+    return sorted(config.ALLOWED_GROUPS)
+
+
+def _group_label(group_id: str) -> str:
+    from cdutetc import reminder_preflight
+    return reminder_preflight.group_label(group_id)
+
+
+def resolve_group_arg(arg: str) -> tuple[str | None, str]:
+    """把 /选群 的参数解析成群 ID。
+
+    支持三种写法：序号（列表里的 1/2/3…）、群备注名/命名、群号或 group_openid。
+    返回 (group_id, "") 或 (None, 错误提示)。
+    """
+    value = (arg or "").strip()
+    if not value:
+        return None, "请带上目标群：/选群 <序号|群备注名|群号>"
+    groups = _allowed_group_ids()
+    if not groups:
+        return None, "当前没有已授权群，请先用 /加群 <群号> 添加。"
+    # 1) 直接命中群号/openid
+    if value in config.ALLOWED_GROUPS:
+        return value, ""
+    # 2) 序号
+    if value.isdigit():
+        index = int(value)
+        if 1 <= index <= len(groups):
+            return groups[index - 1], ""
+        return None, f"序号 {index} 超出范围（当前共 {len(groups)} 个已授权群）。"
+    # 3) 群备注名 / 命名（先精确，再包含匹配，唯一命中才采纳）
+    exact = [gid for gid in groups if _group_label(gid) == value]
+    if len(exact) == 1:
+        return exact[0], ""
+    fuzzy = [gid for gid in groups if value in _group_label(gid)]
+    if len(fuzzy) == 1:
+        return fuzzy[0], ""
+    if len(fuzzy) > 1:
+        names = "、".join(f"{_group_label(gid)}({gid})" for gid in fuzzy)
+        return None, f"「{value}」匹配到多个群：{names}，请改用序号或群号。"
+    return None, f"没有找到群「{value}」，发送 /选群 查看全部已授权群。"
+
+
+def render_group_picker(*, current: str | None = None) -> str:
+    """列出全部已授权群（序号、群名/群号、是否为当前选定群）。"""
+    groups = _allowed_group_ids()
+    if not groups:
+        return "当前没有已授权群，请先用 /加群 <群号> 添加。"
+    lines = [f"📋 已授权群（{len(groups)} 个），发送 /选群 <序号> 绑定操作群："]
+    for index, gid in enumerate(groups, 1):
+        mark = "　✅ 当前" if gid == current else ""
+        lines.append(f"{index}. {_group_label(gid)}（{gid}）{mark}")
+    if current:
+        lines.append("发送 /重置群 可清除绑定，恢复全局管理模式。")
+    else:
+        lines.append("当前未绑定操作群，私聊管理指令按全局视角执行。")
+    return "\n".join(lines)
+
+
+def cmd_active_group(uid: str, args: str) -> list[dict]:
+    """/选群、/切群：不带参数列群，带参数绑定目标群。"""
+    from cdutetc import admin_session
+    current = admin_session.get_active_group(uid)
+    value = (args or "").strip()
+    if not value:
+        return [{"group_id": current or "", "text": render_group_picker(current=current)}]
+    gid, error = resolve_group_arg(value)
+    if gid is None:
+        return [{"group_id": current or "", "text": f"⚠️ {error}"}]
+    admin_session.set_active_group(uid, gid)
+    text = (
+        f"✅ 已将操作群切换为：【{_group_label(gid)}】(ID: {gid})\n"
+        "当前私聊执行 /课程列表、/课程添加、/FAQ添加、/比赛状态 等指令将作用于该群。\n"
+        "发送 /重置群 可清除绑定。"
+    )
+    return [{"group_id": gid, "text": text}]
+
+
+def cmd_active_group_show(uid: str) -> list[dict]:
+    """/当前群：查看私聊当前绑定的目标群。"""
+    from cdutetc import admin_session
+    gid = admin_session.get_active_group(uid)
+    if not gid:
+        return [{"group_id": "", "text": (
+            "📍 当前未绑定操作群，私聊管理指令按全局管理模式执行。\n"
+            "发送 /选群 查看已授权群并绑定目标群。"
+        )}]
+    if gid not in config.ALLOWED_GROUPS:
+        # 白名单被运行时收回：绑定已失效，直接清掉避免误操作
+        admin_session.clear_active_group(uid)
+        return [{"group_id": "", "text": (
+            f"⚠️ 原先绑定的群 {gid} 已不在授权列表，绑定已自动清除。\n"
+            "发送 /选群 重新选择目标群。"
+        )}]
+    return [{"group_id": gid, "text": (
+        f"📍 当前操作群：【{_group_label(gid)}】(ID: {gid})\n"
+        "私聊里的 /课程*、/FAQ*、/比赛状态、/晨报预览 均作用于该群。"
+    )}]
+
+
+def cmd_active_group_reset(uid: str) -> list[dict]:
+    """/重置群：清除绑定，私聊恢复全局管理模式。"""
+    from cdutetc import admin_session
+    previous = admin_session.get_active_group(uid)
+    admin_session.clear_active_group(uid)
+    if not previous:
+        return [{"group_id": "", "text": "当前未绑定操作群，无需重置。"}]
+    return [{"group_id": "", "text": (
+        f"♻️ 已解除与「{_group_label(previous)}」({previous}) 的绑定。\n"
+        "私聊管理指令已恢复全局管理模式。"
+    )}]
+
+
+def handle_session_command(cmd: str, args: str, uid: str) -> list[dict]:
+    """私聊会话指令统一入口：/选群 /切群 /当前群 /重置群。"""
+    if cmd in ("选群", "切群"):
+        return cmd_active_group(uid, args)
+    if cmd == "当前群":
+        return cmd_active_group_show(uid)
+    if cmd == "重置群":
+        return cmd_active_group_reset(uid)
+    return [{"group_id": "", "text": "没有这个命令，发送 /帮助 查看用法。"}]
+
+
+DIGEST_PREVIEW_EMPTY = (
+    "[预览] 该群今日无课程、无临近截止征集且无就绪比赛，晨报将跳过发送（不消耗配额）。"
+)
+DIGEST_PREVIEW_PREFIX = "【晨报私聊模拟预览】"
+
+
+def cmd_digest_preview(group_id: str, sender: str, args: str, *, private: bool = False) -> list[dict]:
+    """/晨报预览：只在当前通道回显晨报渲染结果，不触发任何群发送。
+
+    私聊绑定目标群时，检验该群今日晨报会是什么样；群内则由老师/超管自查本群。
+    """
+    from cdutetc import daily_digest
+    if private:
+        if not is_super_admin(sender):
+            return [{"group_id": group_id, "text": SCOPE_DENIED_PRIVATE}]
+    elif admin_scope(sender, group_id, private=False) is None:
+        return [{"group_id": group_id, "text": SCOPE_DENIED_GROUP}]
+    # 只读渲染，绝不调用 send_group：预览结果由调用方原路（私聊）回显
+    text = daily_digest.build_daily_digest(group_id)
+    header = f"{DIGEST_PREVIEW_PREFIX}目标群：{_group_label(group_id)}（{group_id}）\n"
+    if not text:
+        return [{"group_id": group_id, "text": header + DIGEST_PREVIEW_EMPTY}]
+    return [{"group_id": group_id,
+             "text": header + "以下内容仅本次预览，未发送到群：\n" + text}]
+
+
 async def cmd_trigger_fetch(group_id: str, sender: str, args: str) -> list[dict]:
     """手动触发一次公共来源抓取（老师）。结果汇总后返回，不写入发送日志冒充发送。
 
@@ -1082,7 +1247,8 @@ async def cmd_trigger_fetch(group_id: str, sender: str, args: str) -> list[dict]
 # ---------------------------------------------------------------------
 
 async def handle_command(text: str, group_id: str, sender: str,
-                         client=None, *, private: bool = False) -> list[dict] | None:
+                         client=None, *, private: bool = False,
+                         active_group: str | None = None) -> list[dict] | None:
     """处理一条命令消息。
 
     - 非命令消息返回 None（由上层走 FAQ 匹配 / 模型问答 / 未答问题收集）。
@@ -1091,9 +1257,16 @@ async def handle_command(text: str, group_id: str, sender: str,
     - 命令处理函数若为协程（如异步抓取）则在本循环内 await，避免嵌套 asyncio.run。
     - `private=True` 表示来自私聊：管理命令按全局作用域校验（仅超管），
       群聊按本群作用域校验；作用域为 None 时统一拦截，不进入任何管理逻辑。
+    - `active_group` 仅对超管私聊生效：超管先 /选群 绑定了目标群后，
+      私聊指令改按该群的单群视角执行（写库、查询、诊断都落到该群），
+      回执仍由调用方走私聊，绝不发往真实群。
     """
     if not text.startswith("/"):
         return None
+    # 私聊绑定目标群时降维成「单群视角」：作用域按该群校验，展示范围也只到该群
+    if private and active_group and is_super_admin(sender) and active_group in config.ALLOWED_GROUPS:
+        group_id = active_group
+        private = False
     cmd, args = parse_command(text)
     if cmd is None:
         return [{"group_id": group_id, "text": "请写上命令名，例如 /帮助。"}]
@@ -1145,6 +1318,7 @@ async def handle_command(text: str, group_id: str, sender: str,
         "提醒状态": cmd_reminder_status,
         "比赛状态": lambda gid, uid, value: cmd_contest_status(gid, uid, value, private=private),
         "群状态": lambda gid, uid, value: cmd_contest_status(gid, uid, value, private=private),
+        "晨报预览": lambda gid, uid, value: cmd_digest_preview(gid, uid, value, private=private),
         "抓取一次": cmd_trigger_fetch,
     }
     handler = handlers.get(cmd)

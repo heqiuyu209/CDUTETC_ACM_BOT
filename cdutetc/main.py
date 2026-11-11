@@ -35,6 +35,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from cdutetc.clients.base import BaseBotClient, capabilities_of
 from cdutetc.clients.onebot import OneBotClient, OneBotMessage
 
+from cdutetc import admin_session
 from cdutetc import commands
 from cdutetc import config
 from cdutetc import content_filter
@@ -437,8 +438,19 @@ class ACMBot:
             if content.strip().startswith("/") and is_super_admin(uid):
                 cmd, args = parse_command(content)
                 from cdutetc import group_admin
+                # 目标群会话指令最先处理：它们决定后续业务指令作用到哪个群
+                if cmd in commands.PRIVATE_SESSION_COMMANDS:
+                    for reply in commands.handle_session_command(cmd, args, str(uid)) or []:
+                        if reply.get("text"):
+                            await self._send_private_result(uid, reply["text"])
+                    return
                 if cmd in group_admin.COMMANDS:
-                    replies = group_admin.handle_command(cmd, args, uid)
+                    # 已绑定目标群时，群配置类指令默认落到该群（不带参数的 /群配置 即查该群）；
+                    # 显式 /群配置 全部 属于跨群查询，仍按全局视角处理。
+                    bound = admin_session.get_active_group(str(uid)) or ""
+                    if "全部" in (args or ""):
+                        bound = ""
+                    replies = group_admin.handle_command(cmd, args, uid, bound)
                     if any(reply.get("refresh_weekly") for reply in replies or []):
                         await self._weekly_contest_job()
                     for reply in replies or []:
@@ -447,7 +459,10 @@ class ACMBot:
                 if cmd == "通知测试":
                     await self._send_private_result(uid, await self._notification_test(uid, args))
                     return
-                admin_gid = admin_group_id()
+                # 私聊绑定目标群后，业务指令按该群的单群视角执行（写库/查询/诊断都落到该群），
+                # 回执一律走私聊 _send_private_result，绝不向真实群发送任何消息。
+                active_group = admin_session.get_active_group(str(uid))
+                admin_gid = active_group or admin_group_id()
                 if not admin_gid:
                     # 引导场景：一个群都没配时，仍要允许超管用 /加群 把第一个群加进来，
                     # 否则会陷入“没群 → 不能用命令 → 永远加不了群”的死锁。
@@ -459,7 +474,8 @@ class ACMBot:
                             "或设置 ACM_ADMIN_GROUP / ACM_ALLOWED_GROUPS）",
                         )
                         return
-                replies = await commands.handle_command(content, admin_gid, uid, private=True)
+                replies = await commands.handle_command(
+                    content, admin_gid, uid, private=True, active_group=active_group)
                 for reply in replies or []:
                     if reply.get("text"):
                         await self._send_private_result(uid, reply["text"])
