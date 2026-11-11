@@ -157,6 +157,8 @@ _HELP_SECTIONS = (
         (3, "/命名群 <标识> <名称>", "给群起名字，提示里显示名字而不是 openid"),
         (3, "/命名人 <标识> <名称>", "给人起名字"),
         (3, "/命名列表", "查看已命名的群和人"),
+        (3, "/认领此群 <QQ群号> <群备注名>", "在群里把本群 openid 与真实群号对上号"),
+        (3, "/认领老师 <QQ号> <姓名>", "在群里认领老师身份，名字用于提示展示"),
         (3, "/通知群 <比赛id> <群号,群号>", "设置该比赛通知哪些群"),
         (3, "/比赛状态 全部", "私聊查看全部已授权群的提醒就绪情况"),
     )),
@@ -752,11 +754,12 @@ def cmd_pub_pending_list(group_id: str, sender: str, args: str) -> list[dict]:
     if not items:
         return [{"group_id": group_id, "text": "当前没有待确认的发布申请"}]
     lines = ["待确认的发布申请："]
+    from cdutetc.alias_helper import format_user_name
     for item in items:
         lines.append(
             f"#{item['id']} {item['name'] or '未命名'}"
             f"｜{item['official_time'] or '时间待定'}"
-            f"｜提交人 {item['submitted_by'] or '未知'}"
+            f"｜提交人 {format_user_name(item['submitted_by'] or '')}"
         )
         if item.get("duplicate_note"):
             lines.append(f"   ⚠ {item['duplicate_note']}")
@@ -850,6 +853,70 @@ def cmd_teacher_list(group_id: str, sender: str, args: str) -> list[dict]:
     if not can_manage_group(sender):
         return [{"group_id": group_id, "text": "仅老师/超管可查看"}]
     return [{"group_id": group_id, "text": roles.describe()}]
+
+
+def cmd_claim_group(group_id: str, sender: str, args: str) -> list[dict]:
+    """群内认领本群：/认领此群 <QQ群号> <群备注名>（仅超管）。
+
+    官方协议下群号拿不回来，只能由超管在本群里把 group_openid 与真实群号
+    对上号；认领后同步写入动态白名单，本群立刻具备完整功能。
+    """
+    from cdutetc.alias_helper import format_group_name
+    if not is_super_admin(sender):
+        return [{"group_id": group_id, "text": "仅超管可认领本群"}]
+    if not group_id:
+        return [{"group_id": group_id, "text": "请在目标群里 @我 发送该指令"}]
+    parts = (args or "").strip().split(None, 1)
+    if len(parts) < 2:
+        return [{"group_id": group_id,
+                 "text": "用法：/认领此群 <QQ群号> <群备注名>\n例：/认领此群 123456789 集训队群"}]
+    numeric, name = parts[0].strip(), parts[1].strip()
+    if not numeric.isdigit():
+        return [{"group_id": group_id, "text": "QQ 群号应为纯数字"}]
+    if not is_valid_account_id(group_id):
+        return [{"group_id": group_id, "text": "当前群标识格式不对，无法认领"}]
+    try:
+        db.set_entity_alias("group", group_id, name, numeric, operator=sender)
+    except ValueError as e:
+        return [{"group_id": group_id, "text": str(e)}]
+    added, detail = roles.add_group(group_id, operator=sender, note=name)
+    tail = "本群已纳入自动放行名单。" if added else f"{detail}"
+    return [{"group_id": group_id, "text": (
+        f"✅ 已认领本群：{format_group_name(group_id)}\n{tail}"
+    )}]
+
+
+def cmd_claim_teacher(group_id: str, sender: str, args: str) -> list[dict]:
+    """群内认领老师身份：/认领老师 <QQ号> <姓名>。
+
+    绑定的是「发送者本人的 member_openid」，因此不需要（也无法）输入 openid；
+    同时写入动态老师名单，认领后立即获得本群管理权限。
+    """
+    from cdutetc.alias_helper import format_user_name
+    if not group_id:
+        return [{"group_id": group_id, "text": "请在群里 @我 发送该指令"}]
+    if not (is_super_admin(sender) or sender in config.TEACHER_WHITELIST):
+        return [{"group_id": group_id,
+                 "text": "仅超管或已授权老师可认领身份；新老师请让超管先 /加老师。"}]
+    parts = (args or "").strip().split(None, 1)
+    if len(parts) < 2:
+        return [{"group_id": group_id,
+                 "text": "用法：/认领老师 <QQ号> <姓名>\n例：/认领老师 10001 李老师"}]
+    numeric, name = parts[0].strip(), parts[1].strip()
+    if not numeric.isdigit():
+        return [{"group_id": group_id, "text": "QQ 号应为纯数字"}]
+    if not sender:
+        return [{"group_id": group_id, "text": "取不到你的账号标识，认领失败"}]
+    try:
+        db.set_entity_alias("user", sender, name, numeric, operator=sender)
+    except ValueError as e:
+        return [{"group_id": group_id, "text": str(e)}]
+    added, detail = roles.add_teacher(sender, operator=sender, note=name)
+    tail = "已加入老师名单。" if added else f"{detail}"
+    return [{"group_id": group_id, "text": (
+        f"✅ 已认领老师身份：{format_user_name(sender)}\n{tail}\n"
+        "如该群尚未登记负责老师，请超管用 /群老师 登记后再按名单收窄权限。"
+    )}]
 
 
 def cmd_label_group(group_id: str, sender: str, args: str) -> list[dict]:
@@ -1105,13 +1172,14 @@ def resolve_group_arg(arg: str) -> tuple[str | None, str]:
 
 def render_group_picker(*, current: str | None = None) -> str:
     """列出全部已授权群（序号、群名/群号、是否为当前选定群）。"""
+    from cdutetc.alias_helper import format_group_name
     groups = _allowed_group_ids()
     if not groups:
         return "当前没有已授权群，请先用 /加群 <群号> 添加。"
     lines = [f"📋 已授权群（{len(groups)} 个），发送 /选群 <序号> 绑定操作群："]
     for index, gid in enumerate(groups, 1):
         mark = "　✅ 当前" if gid == current else ""
-        lines.append(f"{index}. {_group_label(gid)}（{gid}）{mark}")
+        lines.append(f"{index}. {format_group_name(gid)}{mark}")
     if current:
         lines.append("发送 /重置群 可清除绑定，恢复全局管理模式。")
     else:
@@ -1307,6 +1375,8 @@ async def handle_command(text: str, group_id: str, sender: str,
         "命名群": cmd_label_group,
         "命名人": cmd_label_user,
         "命名列表": cmd_label_list,
+        "认领此群": cmd_claim_group,
+        "认领老师": cmd_claim_teacher,
         "加老师": cmd_teacher_add,
         "删老师": cmd_teacher_remove,
         "老师列表": cmd_teacher_list,

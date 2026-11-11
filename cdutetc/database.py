@@ -164,6 +164,20 @@ CREATE TABLE IF NOT EXISTS account_labels (
 )
 """
 
+# 实体别名：官方协议只给哈希 openid，群号/QQ号拿不回来，只能由管理员认领后落到这里。
+# 与 account_labels 的区别：这里额外记真实群号/QQ号（numeric_id），
+# account_labels 只记名字，供历史命令与既有渲染继续使用。
+_ENTITY_ALIASES_DDL = """
+CREATE TABLE IF NOT EXISTS entity_aliases (
+    entity_type   TEXT NOT NULL,
+    openid        TEXT NOT NULL,
+    numeric_id    TEXT NOT NULL DEFAULT '',
+    display_name  TEXT NOT NULL DEFAULT '',
+    updated_at    TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (entity_type, openid)
+)
+"""
+
 _COMPETITION_SOURCES_DDL = """
 CREATE TABLE IF NOT EXISTS competition_sources (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -400,7 +414,7 @@ _ALL_DDL = (
     _RUNTIME_WHITELIST_DDL,
     _RUNTIME_TEACHER_DDL,
     _COMPETITION_NOTIFY_GROUPS_DDL,
-    _ACCOUNT_LABELS_DDL,
+    _ACCOUNT_LABELS_DDL, _ENTITY_ALIASES_DDL,
     _COMPETITION_SOURCES_DDL, _COMPETITION_VERSIONS_DDL,
     _PENDING_UPDATES_DDL,
     _ORG_EVENTS_DDL,
@@ -3469,3 +3483,119 @@ def describe_account(kind: str, account_id: str) -> str:
     else:
         short = account_id
     return f"{label}（{short}）" if label else short
+
+
+# =====================================================================
+# 实体别名（entity_aliases）：openid ↔ 真实群号/QQ号 + 备注名
+# 官方协议下群号、QQ号都拿不回来，只能由管理员在群内「认领」后落库；
+# 展示统一走 cdutetc.alias_helper.format_group_name / format_user_name。
+# =====================================================================
+
+_ALIAS_ENTITY_TYPES = ("group", "user")
+
+
+def _normalize_entity_type(entity_type: str) -> str:
+    value = _as_str(entity_type).lower()
+    if value not in _ALIAS_ENTITY_TYPES:
+        raise ValueError("别名类型只能是 group 或 user")
+    return value
+
+
+def set_entity_alias(entity_type: str, openid: str, display_name: str,
+                     numeric_id: str = "", operator: str = "") -> bool:
+    """绑定 openid 与真实群号/QQ号、备注名。
+
+    同时镜像一份名字到 account_labels，让既有「命名群/命名人」相关渲染
+    与按名字匹配的旧逻辑无需改动即可共用同一个名字。
+    """
+    entity_type = _normalize_entity_type(entity_type)
+    openid = _as_str(openid)
+    display_name = _as_str(display_name)
+    numeric_id = _as_str(numeric_id)
+    if not openid:
+        raise ValueError("标识不能为空")
+    if not display_name:
+        raise ValueError("名称不能为空")
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO entity_aliases (entity_type, openid, numeric_id, display_name, updated_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(entity_type, openid) DO UPDATE SET"
+            " numeric_id = excluded.numeric_id,"
+            " display_name = excluded.display_name,"
+            " updated_at = excluded.updated_at",
+            (entity_type, openid, numeric_id, display_name, now_str()),
+        )
+        conn.execute(
+            "INSERT INTO account_labels (kind, account_id, label, updated_at)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(kind, account_id) DO UPDATE SET"
+            " label = excluded.label, updated_at = excluded.updated_at",
+            (entity_type, openid, display_name, now_str()),
+        )
+        add_audit(operator, openid if entity_type == "group" else "", "set_alias",
+                  entity_type, openid, "", f"{display_name}|{numeric_id}", conn=conn)
+    return True
+
+
+def get_entity_alias(entity_type: str, openid: str) -> dict | None:
+    """取别名记录；没有绑定返回 None（调用方负责降级成短哈希展示）。"""
+    entity_type = _normalize_entity_type(entity_type)
+    openid = _as_str(openid)
+    if not openid:
+        return None
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT entity_type, openid, numeric_id, display_name, updated_at"
+            " FROM entity_aliases WHERE entity_type = ? AND openid = ?",
+            (entity_type, openid),
+        ).fetchone()
+    if not row:
+        return None
+    return {"entity_type": row[0], "openid": row[1], "numeric_id": row[2],
+            "display_name": row[3], "updated_at": row[4]}
+
+
+def list_entity_aliases(entity_type: str | None = None) -> list[dict]:
+    with _connect() as conn:
+        if entity_type:
+            kind = _normalize_entity_type(entity_type)
+            rows = conn.execute(
+                "SELECT entity_type, openid, numeric_id, display_name, updated_at"
+                " FROM entity_aliases WHERE entity_type = ? ORDER BY updated_at DESC",
+                (kind,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT entity_type, openid, numeric_id, display_name, updated_at"
+                " FROM entity_aliases ORDER BY entity_type, updated_at DESC"
+            ).fetchall()
+    return [
+        {"entity_type": r[0], "openid": r[1], "numeric_id": r[2],
+         "display_name": r[3], "updated_at": r[4]}
+        for r in rows
+    ]
+
+
+def list_group_aliases() -> dict[str, dict]:
+    """{group_openid: {"display_name":…, "numeric_id":…, "updated_at":…}}"""
+    return {
+        item["openid"]: {"display_name": item["display_name"],
+                         "numeric_id": item["numeric_id"],
+                         "updated_at": item["updated_at"]}
+        for item in list_entity_aliases("group")
+    }
+
+
+def remove_entity_alias(entity_type: str, openid: str, operator: str = "") -> bool:
+    entity_type = _normalize_entity_type(entity_type)
+    openid = _as_str(openid)
+    with _connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM entity_aliases WHERE entity_type = ? AND openid = ?",
+            (entity_type, openid),
+        )
+        if cur.rowcount:
+            add_audit(operator, openid if entity_type == "group" else "",
+                      "remove_alias", entity_type, openid, "", "", conn=conn)
+        return bool(cur.rowcount)

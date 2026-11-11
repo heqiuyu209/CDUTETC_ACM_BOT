@@ -25,7 +25,7 @@ BUSINESS_TABLES = (
     "competitions", "contests", "audit_log",
 )
 CONFIG_TABLES = (
-    "runtime_allowed_groups", "runtime_teachers", "account_labels",
+    "runtime_allowed_groups", "runtime_teachers", "account_labels", "entity_aliases",
     "group_notification_settings", "group_notification_blocks",
     "group_weekly_settings", "group_teacher_assignments",
 )

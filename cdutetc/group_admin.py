@@ -25,6 +25,12 @@ def _name(gid: str) -> str:
                                                       if g["group_id"] == gid and g["note"]), gid)
 
 
+def _display(gid: str) -> str:
+    """展示用群名：已认领显示「备注名 (群号)」，否则退回短哈希，绝不裸露长 openid。"""
+    from cdutetc.alias_helper import format_group_name
+    return format_group_name(gid)
+
+
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", "", text).replace("的群", "群").removesuffix("群")
 
@@ -33,10 +39,26 @@ def _choices() -> str:
     groups = sorted(config.ALLOWED_GROUPS)
     if not groups:
         return "还没有授权群。先在目标群 @我 /帮助，再由超管按提示加群。"
-    return "请选择要查询的群：\n" + "\n".join(f"· {_name(gid)}｜/群配置 {gid}" for gid in groups)
+    lines = []
+    for index, gid in enumerate(groups, 1):
+        lines.append(f"{index}. {_display(gid)}｜/群配置 {gid}")
+    return "请选择要查询的群（也可直接发 /群配置 <序号>）：\n" + "\n".join(lines)
+
+
+def _resolve_index(selector: str) -> str | None:
+    """支持用候选列表里的序号选择群（/群配置 1）。"""
+    text = (selector or "").strip()
+    if not text.isdigit():
+        return None
+    groups = sorted(config.ALLOWED_GROUPS)
+    index = int(text)
+    return groups[index - 1] if 1 <= index <= len(groups) else None
 
 
 def resolve_group(selector: str, *, question: bool = False) -> str:
+    by_index = _resolve_index(selector)
+    if by_index:
+        return by_index
     matches = []
     normalized = _normalize(selector)
     for gid, aliases in _aliases().items():
@@ -56,7 +78,9 @@ def resolve_group(selector: str, *, question: bool = False) -> str:
 
 
 def _teacher_names(gid: str) -> str:
-    return "、".join(db.get_account_label("user", uid) or uid for uid in db.get_group_teachers(gid)) or "未登记"
+    from cdutetc.alias_helper import format_user_name
+    uids = db.get_group_teachers(gid)
+    return "、".join(format_user_name(uid) for uid in uids) or "未登记"
 
 
 def contests(gid: str, *, this_week: bool = False, now: datetime | None = None) -> list[dict]:

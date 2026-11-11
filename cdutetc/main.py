@@ -38,6 +38,7 @@ from cdutetc.clients.onebot import OneBotClient, OneBotMessage
 from cdutetc import admin_session
 from cdutetc import commands
 from cdutetc import config
+from cdutetc.alias_helper import format_group_name, format_user_name
 from cdutetc import content_filter
 from cdutetc import crawler
 from cdutetc import daily_digest
@@ -228,8 +229,8 @@ def _build_publish_review(pending: dict) -> str:
         lines.append(f"{label}：{value or '未提供'}")
     if (info.get("official_time") or "").strip():
         lines.append(f"提醒计划：同意后安排开始前 {_format_remind_offsets()}的未来节点，已错过的不补发")
-    lines.append(f"来源群：{db.describe_account('group', pending.get('group_id') or '')}")
-    lines.append(f"提交人：{db.describe_account('user', pending.get('submitted_by') or '')}")
+    lines.append(f"来源群：{format_group_name(pending.get('group_id') or '')}")
+    lines.append(f"提交人：{format_user_name(pending.get('submitted_by') or '')}")
     if pending.get("duplicate_note"):
         lines.append(f"⚠ 查重提示：{pending['duplicate_note']}")
     else:
