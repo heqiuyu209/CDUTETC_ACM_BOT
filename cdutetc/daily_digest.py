@@ -165,11 +165,11 @@ def soon_collections(group_id: str, now: datetime | None = None,
 
 
 def soon_competitions(group_id: str, now: datetime | None = None,
-                      hours: float = CONTEST_SOON_HOURS) -> list[dict]:
-    """临近赛事：未来 ``hours`` 小时内开赛、且预检确认「到点必推」的比赛。
+                      hours: float = CONTEST_SOON_HOURS, *,
+                      require_delivery_ready: bool = True) -> list[dict]:
+    """列出未来指定时间内本群可见的赛事。
 
-    预检不通过（未绑定、已熔断、无待发节点……）的比赛不进入晨报，
-    避免承诺一件到点根本不会推送的事。
+    晨报要求主动投递预检通过；被动提示不依赖主动投递状态。
     """
     current = _now(now)
     gid = (group_id or "").strip()
@@ -191,11 +191,17 @@ def soon_competitions(group_id: str, now: datetime | None = None,
         if delta <= timedelta(0) or delta > timedelta(hours=hours):
             continue
         try:
-            ready, _ = reminder_preflight.check_contest_delivery_readiness(contest["id"], gid, current)
-        except Exception:  # noqa: BLE001 - 预检异常按不可推处理
-            logger.warning("比赛发信预检异常，晨报跳过 [contest=%s]", contest.get("id"), exc_info=True)
-            continue
-        if not ready:
+            if require_delivery_ready:
+                ready, _ = reminder_preflight.check_contest_delivery_readiness(contest["id"], gid, current)
+                if not ready:
+                    continue
+            elif db.is_weekly_competition(contest["id"]):
+                if gid not in db.get_weekly_groups():
+                    continue
+                if config.WEEKLY_CONTEST_GROUPS and gid not in config.WEEKLY_CONTEST_GROUPS:
+                    continue
+        except Exception:  # noqa: BLE001 - 无法确认可见性或投递状态时跳过
+            logger.warning("比赛状态检查异常，跳过 [contest=%s]", contest.get("id"), exc_info=True)
             continue
         out.append({
             "id": contest.get("id"),
@@ -304,7 +310,7 @@ def build_piggyback_notice(group_id: str, now: datetime | None = None) -> str | 
     candidates: list[tuple[datetime, str, dict]] = []
     for item in soon_collections(gid, current, PIGGYBACK_COLLECTION_HOURS):
         candidates.append((item["deadline_dt"], "collection", item))
-    for item in soon_competitions(gid, current, PIGGYBACK_CONTEST_HOURS):
+    for item in soon_competitions(gid, current, PIGGYBACK_CONTEST_HOURS, require_delivery_ready=False):
         candidates.append((item["start_dt"], "contest", item))
     if not candidates:
         return None
