@@ -457,10 +457,18 @@ class ACMBot:
                     bound = admin_session.get_active_group(str(uid)) or ""
                     if "全部" in (args or ""):
                         bound = ""
+                    # 私聊 /群配置 <序号> 解析成功后顺手锁定工作区（C5），后续业务指令
+                    # 无需再 /选群。仅处理候选列表序号，避免与「按群查询」只读语义混淆；
+                    # 且在本条指令执行之后绑定，保证本条查询仍按原作用域解析。
                     replies = group_admin.handle_command(cmd, args, uid, bound)
+                    if cmd == "群配置":
+                        tokens = (args or "").split()
+                        if len(tokens) == 1 and tokens[0].isdigit():
+                            commands.bind_active_group(str(uid), tokens[0])
                     if any(reply.get("refresh_weekly") for reply in replies or []):
                         await self._weekly_contest_job()
-                    for reply in replies or []:
+                    # 私聊管理回执同样带工作区标牌，与业务指令出口保持一致
+                    for reply in commands.with_private_header(replies, str(uid)) or []:
                         await self._send_private_result(uid, reply["text"])
                     return
                 if cmd == "通知测试":
@@ -1242,11 +1250,23 @@ class ACMBot:
         logger.info("已自动生成周赛记录: %s（id=%s），未通知全员", template, cid)
 
     async def _crawl_job(self):
-        """周期抓取公共来源（默认关闭）：变化检测 → 待审更新，不自动广播。"""
+        """周期抓取公共来源（默认关闭）：变化检测 → 待审更新，不自动广播。
+
+        来源抓取之后，若开启了赛程自动抓取，再顺带抓 CF / 牛客赛程；
+        两段各自兜底，任一段异常都不影响另一段，也不会让调度器崩掉。
+        """
         try:
             await crawler.run_fetch(send_group=self._send_group_result)
         except Exception:  # noqa: BLE001 - 网络/解析/DB 异常统一兜底，不逸出调度器
             logger.exception("[抓取] 本轮调度执行异常，跳过本轮等待下次触发")
+        if not config.AUTO_CONTEST_CRAWL_ENABLED:
+            return
+        try:
+            results = await crawler.run_contest_fetch()
+            created = sum(1 for item in results if item.get("kind") == "created")
+            logger.info("[赛程抓取] 本轮处理 %s 条，新建 %s 条", len(results), created)
+        except Exception:  # noqa: BLE001 - 赛程抓取失败同样不逸出调度器
+            logger.exception("[赛程抓取] 本轮执行异常，跳过本轮等待下次触发")
 
 
 def _build_client():

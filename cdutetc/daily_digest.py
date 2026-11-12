@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 from cdutetc import config
 from cdutetc import database as db
 from cdutetc.reminder import _parse_time
+from cdutetc.utils import normalize_time_expression
 
 TZ = ZoneInfo(config.TZ_NAME)
 logger = logging.getLogger(__name__)
@@ -233,10 +234,15 @@ def render_digest(sessions: list[dict], collections: list[dict], competitions: l
     lines = [DIGEST_TITLE]
 
     if sessions:
-        lines.append("📅 今日课程：")
+        lines.append("📚 今日课程/训练：")
         for item in sessions:
-            span = f"{item['start_text']}-{item['end_text']}" if item.get("end_text") else item["start_text"]
-            line = f"- {span} {item['title']}"
+            span = (item["start_text"] if not item.get("end_text")
+                    else f"{item['start_text']}-{item['end_text']}")
+            span = normalize_time_expression(span) or span
+            # 带上具体公历日期：跨天追问「今天 / 明天有课吗」时模型不会算错日子。
+            start_dt = item.get("start_dt")
+            date_text = start_dt.strftime("%Y-%m-%d") if start_dt else ""
+            line = f"- {date_text} {span} {item['title']}".replace("-  ", "- ")
             if item.get("location"):
                 line += f" ({item['location']})"
             if item.get("ongoing"):

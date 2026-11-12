@@ -34,6 +34,7 @@ from cdutetc.database import (
 from cdutetc.database import list_collections_all as _list_collections_all
 from cdutetc.database import get_competition_target_groups
 from cdutetc.database import get_group_notification_block
+from cdutetc.database import group_course_remind_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +57,11 @@ def _parse_time(text: str) -> datetime | None:
     return None
 
 
-def _due_offset_hours(delta: timedelta) -> float | None:
+def _due_offset_hours(delta: timedelta, offsets: tuple[float, ...] | None = None) -> float | None:
     """返回该剩余时间命中的「最紧」提醒节点（小时）；未命中返回 None。
 
-    节点取自 config.REMIND_OFFSET_HOURS（降序存放）。判定方式是取所有
+    节点默认取自 config.REMIND_OFFSET_HOURS（降序存放），可用 ``offsets``
+    传入自定义节点集（课程提醒会在此之上追加分钟级节点）。判定方式是取所有
     「节点小时数 ≥ 剩余时间」的节点中最小的那个，也就是已进入的最紧窗口：
     剩 23 小时命中 24 小时节点，剩 0.5 小时命中 1 小时节点，剩 10 分钟
     （若配置了 0.167=10 分钟）命中 10 分钟节点。
@@ -70,11 +72,18 @@ def _due_offset_hours(delta: timedelta) -> float | None:
     """
     if delta <= timedelta(0):
         return None
+    nodes = config.REMIND_OFFSET_HOURS if offsets is None else tuple(offsets)
     candidates = [
-        offset for offset in config.REMIND_OFFSET_HOURS
+        offset for offset in nodes
         if delta <= timedelta(hours=offset)
     ]
     return min(candidates) if candidates else None
+
+
+def training_offset_hours() -> tuple[float, ...]:
+    """课程提醒节点：既有小时级节点 + 配置的分钟级额外节点（降序去重）。"""
+    extra = tuple(minutes / 60 for minutes in config.TRAINING_REMIND_EXTRA_OFFSETS_MINUTES)
+    return tuple(sorted(set(config.REMIND_OFFSET_HOURS) | set(extra), reverse=True))
 
 
 def _countdown(target: datetime, now: datetime) -> str:
@@ -270,14 +279,22 @@ def _delivery_key(item: dict) -> str:
 
 
 def build_training_reminders(sessions: list[dict], now: datetime) -> list[dict]:
-    """按课程的具体开课日期生成群提醒；每周实例独立去重。"""
+    """按课程的具体开课日期生成群提醒；每周实例独立去重。
+
+    节点为 ``REMIND_OFFSET_HOURS`` 与 ``TRAINING_REMIND_EXTRA_OFFSETS_MINUTES``
+    的并集（含 30/15 分钟级），并尊重群级「课程提醒」开关。
+    """
     out = []
+    offsets = training_offset_hours()
+    horizon = max(offsets)
     for session in sessions:
         group_id = session.get("group_id")
         if group_id not in config.ALLOWED_GROUPS:
             continue
-        for target in training_occurrence_times(session, now, max(config.REMIND_OFFSET_HOURS)):
-            offset = _due_offset_hours(target - now)
+        if not group_course_remind_enabled(group_id):
+            continue
+        for target in training_occurrence_times(session, now, horizon):
+            offset = _due_offset_hours(target - now, offsets)
             if offset is None:
                 continue
             target_str = target.strftime("%Y-%m-%d %H:%M:%S" if target.second else "%Y-%m-%d %H:%M")

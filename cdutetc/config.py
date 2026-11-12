@@ -367,6 +367,48 @@ def _remind_offset_hours() -> tuple[float, ...]:
 
 REMIND_OFFSET_HOURS = _remind_offset_hours()
 
+
+def _training_extra_offsets() -> tuple[int, ...]:
+    """课程提醒的额外分钟级节点（在 REMIND_OFFSET_HOURS 之外追加）。
+
+    例：``30,15`` 表示课程开始前 30 分钟、15 分钟各提醒一次；
+    非法值（空、负数、非数字）整体回退默认 ``(30, 15)``。
+    """
+    raw = os.getenv("ACM_TRAINING_REMIND_EXTRA_OFFSETS_MINUTES", "30,15")
+    try:
+        values = {int(value.strip()) for value in raw.split(",") if value.strip()}
+    except (TypeError, ValueError):
+        return (30, 15)
+    if not values or any(value <= 0 for value in values):
+        return (30, 15)
+    return tuple(sorted(values, reverse=True))
+
+
+TRAINING_REMIND_EXTRA_OFFSETS_MINUTES = _training_extra_offsets()
+
+# ================= 赛程自动抓取（CF / 牛客） =================
+# 默认关闭：开启后定时任务会在既有来源抓取之后，再抓 CF 官方 API 与牛客赛程页。
+AUTO_CONTEST_CRAWL_ENABLED = os.getenv("ACM_AUTO_CONTEST_CRAWL_ENABLED", "0") != "0"
+
+
+def _auto_contest_window_days() -> int:
+    """抓取窗口天数；非法或小于 1 一律回退 14 天。"""
+    try:
+        value = int(os.getenv("ACM_AUTO_CONTEST_WINDOW_DAYS", "14"))
+    except (TypeError, ValueError):
+        return 14
+    return value if value >= 1 else 14
+
+
+AUTO_CONTEST_WINDOW_DAYS = _auto_contest_window_days()
+# 1=抓到的比赛直接 confirmed 并通知群；0=进草稿待审核。
+AUTO_CONTEST_AUTO_CONFIRM = os.getenv("ACM_AUTO_CONTEST_AUTO_CONFIRM", "0") != "0"
+# 自动发布时的通知群；留空则覆盖所有允许群。
+AUTO_CONTEST_NOTIFY_GROUPS = frozenset(
+    item.strip() for item in os.getenv("ACM_AUTO_CONTEST_NOTIFY_GROUPS", "").split(",")
+    if item.strip()
+)
+
 # ================= 发布确认（超管私聊） =================
 # 老师发布比赛后，整理结果先私聊推送给超管，超管回「同意/拒绝」才入库并通知群。
 PUBLISH_CONFIRM_ENABLED = os.getenv("ACM_PUBLISH_CONFIRM_ENABLED", "1") != "0"

@@ -370,6 +370,16 @@ CREATE TABLE IF NOT EXISTS group_notification_settings (
 )
 """
 
+_GROUP_SETTINGS_DDL = """
+CREATE TABLE IF NOT EXISTS group_settings (
+    group_id    TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    value       TEXT DEFAULT '',
+    updated_at  TEXT DEFAULT '',
+    PRIMARY KEY (group_id, key)
+)
+"""
+
 _AUDIT_LOG_DDL = """
 CREATE TABLE IF NOT EXISTS audit_log (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -421,7 +431,8 @@ _ALL_DDL = (
     _TRAINING_SESSIONS_DDL, _GROUP_FAQ_DDL, _UNANSWERED_DDL,
     _COLLECTIONS_DDL, _COLLECTION_RESPONSES_DDL,
     _REMINDER_DELIVERIES_DDL, _REMINDER_SUCCESS_RECEIPTS_DDL,
-    _GROUP_NOTIFICATION_BLOCKS_DDL, _GROUP_NOTIFICATION_SETTINGS_DDL, _AUDIT_LOG_DDL,
+    _GROUP_NOTIFICATION_BLOCKS_DDL, _GROUP_NOTIFICATION_SETTINGS_DDL,
+    _GROUP_SETTINGS_DDL, _AUDIT_LOG_DDL,
 )
 
 
@@ -1927,6 +1938,80 @@ def cancel_training_session(group_id: str, tid: int, operator: str = "") -> bool
         return cur.rowcount > 0
 
 
+_TRAINING_UPDATE_FIELDS = (
+    "title", "weekday", "start_time", "end_time", "location", "needs_laptop",
+    "software", "device_req", "training_group", "effective_start", "effective_end",
+    "status", "source",
+)
+_TRAINING_TIME_FIELDS = ("effective_start", "effective_end")
+_TRAINING_STATUSES = ("confirmed", "draft", "cancelled")
+
+
+def get_group_course(group_id: str, course_id: int) -> dict | None:
+    """按群 + 课程 id 读取单条课程；群不匹配视为不存在（不跨群泄露）。"""
+    try:
+        cid = int(course_id)
+    except (TypeError, ValueError):
+        return None
+    with _connect() as conn:
+        row = conn.execute(
+            f"SELECT {_TRAINING_COLS} FROM training_sessions WHERE id = ? AND group_id = ?",
+            (cid, _as_str(group_id)),
+        ).fetchone()
+    return _row_to_training(row) if row else None
+
+
+def update_group_course(group_id: str, course_id: int, operator: str = "", **kwargs) -> bool:
+    """修改课程的可编辑字段（白名单字段 + 审计留痕）。
+
+    - 未知字段直接 ValueError，避免拼写错误静默丢改动；
+    - 只更新显式传入且非 None 的字段，其余保持原值；
+    - 审计 before 记空，after 记本次变更字段名列表，与既有 update 语义一致。
+    """
+    group_id = _as_str(group_id)
+    try:
+        cid = int(course_id)
+    except (TypeError, ValueError):
+        return False
+    unknown = sorted(set(kwargs) - set(_TRAINING_UPDATE_FIELDS))
+    if unknown:
+        raise ValueError(f"不支持修改的字段：{'、'.join(unknown)}")
+    changes: dict[str, object] = {}
+    for field, value in kwargs.items():
+        if value is None:
+            continue
+        if field == "title":
+            title = _as_str(value).strip()
+            if not title:
+                raise ValueError("课程标题不能为空")
+            changes[field] = title
+        elif field == "status":
+            status = _as_str(value)
+            if status not in _TRAINING_STATUSES:
+                raise ValueError("状态必须是 confirmed/draft/cancelled")
+            changes[field] = status
+        elif field == "needs_laptop":
+            changes[field] = 1 if value else 0
+        elif field in _TRAINING_TIME_FIELDS:
+            changes[field] = _clean_time(value)
+        else:
+            changes[field] = _as_str(value)
+    if not changes:
+        return False
+    assignments = ", ".join(f"{field} = ?" for field in changes)
+    values = [*changes.values(), now_str(), cid, group_id]
+    with _connect() as conn:
+        cur = conn.execute(
+            f"UPDATE training_sessions SET {assignments}, updated_at = ?"
+            " WHERE id = ? AND group_id = ?",
+            values,
+        )
+        if cur.rowcount:
+            add_audit(operator, group_id, "update", "training_session", str(cid), "",
+                      json.dumps(sorted(changes), ensure_ascii=False), conn=conn)
+        return cur.rowcount > 0
+
+
 # =====================================================================
 # 群内 FAQ
 # =====================================================================
@@ -2997,6 +3082,65 @@ def confirm_group_notification_channel(protocol: str, group_id: str, message_for
             (protocol, group_id, message_format, now_str()),
         )
         conn.execute("DELETE FROM group_notification_blocks WHERE protocol=? AND group_id=?", (protocol, group_id))
+
+
+# =====================================================================
+# 群级通用设置（key-value，便于后续扩展开关）
+# =====================================================================
+
+COURSE_REMIND_SETTING = "course_remind"
+_COURSE_REMIND_ON = "on"
+_COURSE_REMIND_OFF = "off"
+
+
+def set_group_setting(group_id: str, key: str, value: str, operator: str = "") -> None:
+    """写入群级设置项（同一事务内记审计，便于回溯谁改了什么）。"""
+    group_id = _as_str(group_id)
+    key = _as_str(key)
+    if not group_id or not key:
+        raise ValueError("群设置需要群标识与设置项")
+    value = _as_str(value)
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO group_settings (group_id, key, value, updated_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(group_id, key) DO UPDATE SET"
+            " value=excluded.value, updated_at=excluded.updated_at",
+            (group_id, key, value, now_str()),
+        )
+        add_audit(operator, group_id, "set", "group_setting", key, "", value, conn=conn)
+
+
+def get_group_setting(group_id: str, key: str, default: str = "") -> str:
+    """读取群级设置项；未写入过返回 default。"""
+    group_id = _as_str(group_id)
+    key = _as_str(key)
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM group_settings WHERE group_id = ? AND key = ?",
+            (group_id, key),
+        ).fetchone()
+    return row[0] if row and row[0] is not None else default
+
+
+def set_group_course_remind(group_id: str, enabled: bool, operator: str = "") -> None:
+    """课程提醒群级开关（默认开启，关闭后该群不再产生课程提醒）。"""
+    if type(enabled) is not bool:
+        raise ValueError("请明确开启或关闭课程提醒")
+    set_group_setting(group_id, COURSE_REMIND_SETTING,
+                      _COURSE_REMIND_ON if enabled else _COURSE_REMIND_OFF, operator)
+
+
+def group_course_remind_enabled(group_id: str) -> bool:
+    """课程提醒是否开启；未设置过按默认 on 处理。
+
+    库未初始化（缺 group_settings 表，如部分只建业务表的测试/旧库）时也按
+    默认 on 处理：读不到开关不能让整条提醒链路中断。
+    """
+    try:
+        value = get_group_setting(group_id, COURSE_REMIND_SETTING, _COURSE_REMIND_ON)
+    except sqlite3.OperationalError:
+        return True
+    return value.strip().lower() != _COURSE_REMIND_OFF
 
 
 def delivery_status_counts(group_id: str) -> dict[str, int]:
