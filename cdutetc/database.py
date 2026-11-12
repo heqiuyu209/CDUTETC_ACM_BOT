@@ -33,6 +33,7 @@ from cdutetc.config import DB_PATH
 
 from cdutetc import config
 from cdutetc import content_filter
+from cdutetc.errors import DeliveryCode
 
 TZ = ZoneInfo("Asia/Shanghai")
 logger = logging.getLogger(__name__)
@@ -3104,13 +3105,21 @@ def list_deliveries(group_id: str, *, statuses: tuple[str, ...] | None = None,
 
 
 def get_group_notification_block(protocol: str, group_id: str) -> dict | None:
-    """平台权限暂停按协议和群持久保存，不影响被动回复或其他群。"""
+    """按协议和群读取暂停状态；配额耗尽只阻断发生当天。"""
     with _connect() as conn:
         row = conn.execute(
             "SELECT error_code, platform_code, blocked_at FROM group_notification_blocks WHERE protocol=? AND group_id=?",
             (protocol, group_id),
         ).fetchone()
-    return dict(zip(("error_code", "platform_code", "blocked_at"), row)) if row else None
+    if not row:
+        return None
+    block = dict(zip(("error_code", "platform_code", "blocked_at"), row))
+    if block["error_code"] == DeliveryCode.QUOTA_EXHAUSTED.value:
+        blocked_at = _delivery_parse_time(block["blocked_at"])
+        now = _delivery_parse_time(now_str())
+        if blocked_at and now and blocked_at.date() < now.date():
+            return None
+    return block
 
 
 def block_group_notifications(protocol: str, group_id: str, error_code: str, platform_code: int | None) -> None:
@@ -3118,7 +3127,7 @@ def block_group_notifications(protocol: str, group_id: str, error_code: str, pla
         conn.execute(
             "INSERT INTO group_notification_blocks (protocol, group_id, error_code, platform_code, blocked_at)"
             " VALUES (?, ?, ?, ?, ?) ON CONFLICT(protocol, group_id) DO UPDATE SET"
-            " error_code=excluded.error_code, platform_code=excluded.platform_code",
+            " error_code=excluded.error_code, platform_code=excluded.platform_code, blocked_at=excluded.blocked_at",
             (protocol, group_id, error_code, platform_code, now_str()),
         )
 
