@@ -310,8 +310,12 @@ def build_piggyback_notice(group_id: str, now: datetime | None = None) -> str | 
     candidates: list[tuple[datetime, str, dict]] = []
     for item in soon_collections(gid, current, PIGGYBACK_COLLECTION_HOURS):
         candidates.append((item["deadline_dt"], "collection", item))
-    for item in soon_competitions(gid, current, PIGGYBACK_CONTEST_HOURS, require_delivery_ready=False):
-        candidates.append((item["start_dt"], "contest", item))
+    # 被动提示不依赖主动投递预检，但仍须尊重本群「比赛提醒」开关：
+    # 群关闭比赛提醒后，搭车文案里也不该再出现赛事。
+    if db.group_switch_enabled(gid, "contest_remind_enabled"):
+        for item in soon_competitions(gid, current, PIGGYBACK_CONTEST_HOURS,
+                                      require_delivery_ready=False):
+            candidates.append((item["start_dt"], "contest", item))
     if not candidates:
         return None
     target, kind, item = min(candidates, key=lambda candidate: candidate[0])

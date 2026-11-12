@@ -191,6 +191,17 @@ def test_piggyback_weekly_respects_current_subscription(env, monkeypatch):
     assert daily_digest.build_piggyback_notice("g2", NOW) is None
 
 
+def test_piggyback_contest_respects_group_switch(env):
+    _contest(official_time="2026-11-11 19:30")  # 1.5h 后开赛
+    db.set_group_switch("g1", "contest_remind_enabled", False, "teacher")
+    assert daily_digest.build_piggyback_notice("g1", NOW) is None
+
+    _collection(deadline="2026-11-12 05:00", capacity=2)  # 11h 后截止
+    notice = daily_digest.build_piggyback_notice("g1", NOW)
+    assert "天梯赛选拔" in notice
+    assert "Codeforces Round 990" not in notice
+
+
 def test_piggyback_prefers_most_urgent(env):
     _collection(title="天梯赛选拔", deadline="2026-11-12 05:00", capacity=2)   # 11h 后
     _collection(title="周末讲座报名", deadline="2026-11-14 12:00")             # 超出 12h
