@@ -9,10 +9,13 @@
 import asyncio
 import json
 import sqlite3
+from unittest.mock import AsyncMock
 
 import pytest
 
-from cdutetc import alias_helper, commands, config, database, group_admin
+from cdutetc import alias_helper, commands, config, database, group_admin, main, notifications
+from cdutetc.clients.qqbot import QQBotClient, QQBotMessage
+from cdutetc.clients.onebot import OneBotMessage
 
 
 @pytest.fixture()
@@ -132,6 +135,69 @@ def test_claim_group_rejects_non_admin_and_bad_args(memory_db):
     assert database.get_entity_alias("group", GROUP) is None
 
 
+@pytest.mark.parametrize("content,member,addressed,expected", [
+    ("/认领此群 123456789 集训队群", "admin", True, True),
+    ("/认领此群 123456789 集训队群", "member", True, False),
+    ("/认领此群 123456789 集训队群", "admin", False, False),
+    ("/帮助", "admin", True, False),
+])
+async def test_unauthorized_group_claim_route(memory_db, monkeypatch, content, member, addressed, expected):
+    monkeypatch.setattr(config, "BOT_PROTOCOL", "qqbot")
+    monkeypatch.setattr(config, "GROUP_REQUIRE_AT", True)
+    send = AsyncMock(return_value=True)
+    monkeypatch.setattr(notifications, "send_group", send)
+    bot = main.ACMBot(QQBotClient("offline", "offline"))
+    message = QQBotMessage(None, message_type="group", group_id=GROUP, user_id=member,
+                           content=content, msg_id="msg", always_addressed=addressed)
+    await bot.on_group_at_message_create(message)
+    assert (GROUP in config.ALLOWED_GROUPS) is expected
+    assert bool(database.get_entity_alias("group", GROUP)) is expected
+    if expected:
+        assert send.await_count == 1
+        assert "已认领本群" in send.await_args.args[2]
+
+
+async def test_unauthorized_group_claim_invalid_input_gets_passive_error(memory_db, monkeypatch):
+    monkeypatch.setattr(config, "BOT_PROTOCOL", "qqbot")
+    monkeypatch.setattr(config, "GROUP_REQUIRE_AT", True)
+    send = AsyncMock(return_value=True)
+    monkeypatch.setattr(notifications, "send_group", send)
+    bot = main.ACMBot(QQBotClient("offline", "offline"))
+    message = QQBotMessage(None, message_type="group", group_id=GROUP, user_id="admin",
+                           content="/认领此群", msg_id="msg", always_addressed=True)
+    await bot.on_group_at_message_create(message)
+    assert GROUP not in config.ALLOWED_GROUPS
+    assert send.await_count == 1
+    assert "用法" in send.await_args.args[2]
+    assert send.await_args.kwargs["reply_to"] == "msg"
+
+
+async def test_claim_without_qq_message_id_never_sends_active_message(memory_db, monkeypatch):
+    monkeypatch.setattr(config, "BOT_PROTOCOL", "qqbot")
+    monkeypatch.setattr(config, "GROUP_REQUIRE_AT", True)
+    send = AsyncMock(return_value=True)
+    monkeypatch.setattr(notifications, "send_group", send)
+    bot = main.ACMBot(QQBotClient("offline", "offline"))
+    message = QQBotMessage(None, message_type="group", group_id=GROUP, user_id="admin",
+                           content="/认领此群", always_addressed=True)
+    await bot.on_group_at_message_create(message)
+    send.assert_not_awaited()
+
+
+@pytest.mark.parametrize("target,expected", [("30001", True), ("30002", False)])
+async def test_unauthorized_onebot_claim_checks_mention(memory_db, monkeypatch, target, expected):
+    monkeypatch.setattr(config, "BOT_PROTOCOL", "onebot")
+    monkeypatch.setattr(config, "BOT_QQ", "30001")
+    monkeypatch.setattr(config, "GROUP_REQUIRE_AT", True)
+    monkeypatch.setattr(notifications, "send_group", AsyncMock(return_value=True))
+    bot = main.ACMBot()
+    message = OneBotMessage({"post_type": "message", "message_type": "group",
+                             "raw_message": f"[CQ:at,qq={target}] /认领此群 123456789 集训队群",
+                             "group_id": GROUP, "user_id": "admin", "message_id": 123})
+    await bot.on_group_at_message_create(message)
+    assert (GROUP in config.ALLOWED_GROUPS) is expected
+
+
 def test_claim_teacher_binds_sender(memory_db):
     result = asyncio.run(commands.handle_command("/认领老师 10001 张老师", GROUP, "admin"))
     text = result[0]["text"]
@@ -169,6 +235,25 @@ def test_group_admin_choices_and_index_selector(memory_db, monkeypatch):
     assert group_admin.resolve_group("2") == ordered[1]
     with pytest.raises(ValueError):
         group_admin.resolve_group("99")
+
+
+def test_group_selectors_resolve_numeric_alias_and_reject_ambiguity(memory_db, monkeypatch):
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {GROUP, OTHER})
+    database.set_entity_alias("group", GROUP, "集训队群", "123456789")
+    assert commands.resolve_group_arg("123456789") == (GROUP, "")
+    assert group_admin.resolve_group("123456789") == GROUP
+    database.set_entity_alias("group", OTHER, "其他群", "123456789")
+    assert commands.resolve_group_arg("123456789")[0] is None
+    with pytest.raises(ValueError):
+        group_admin.resolve_group("123456789")
+
+
+def test_group_selectors_ignore_aliases_of_unauthorized_groups(memory_db, monkeypatch):
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {GROUP})
+    database.set_entity_alias("group", OTHER, "未授权群", "123456789")
+    assert commands.resolve_group_arg("123456789")[0] is None
+    with pytest.raises(ValueError):
+        group_admin.resolve_group("123456789")
 
 
 def test_teacher_names_never_leak_openid(memory_db, monkeypatch):

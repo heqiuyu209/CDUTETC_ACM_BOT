@@ -16,7 +16,9 @@ TZ = ZoneInfo(config.TZ_NAME)
 
 def _aliases() -> dict[str, set[str]]:
     notes = {item["group_id"]: item["note"] for item in db.list_runtime_groups()}
-    return {gid: {value for value in (gid, db.get_account_label("group", gid), notes.get(gid, "")) if value}
+    numeric = db.list_group_aliases()
+    return {gid: {value for value in (gid, db.get_account_label("group", gid), notes.get(gid, ""),
+                                     numeric.get(gid, {}).get("numeric_id", "")) if value}
             for gid in sorted(config.ALLOWED_GROUPS)}
 
 
@@ -56,12 +58,21 @@ def _resolve_index(selector: str) -> str | None:
 
 
 def resolve_group(selector: str, *, question: bool = False) -> str:
+    if selector in config.ALLOWED_GROUPS:
+        return selector
+    aliases_by_group = _aliases()
+    if selector.isdigit():
+        exact = [gid for gid, aliases in aliases_by_group.items() if selector in aliases]
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            raise ValueError("群号有歧义，请使用群标识。\n" + _choices())
     by_index = _resolve_index(selector)
     if by_index:
         return by_index
     matches = []
     normalized = _normalize(selector)
-    for gid, aliases in _aliases().items():
+    for gid, aliases in aliases_by_group.items():
         if question:
             found = any((re.search(r"(?<![A-Za-z0-9_-])" + re.escape(alias) + r"(?![A-Za-z0-9_-])", selector)
                          if alias == gid else len(_normalize(alias)) >= 2 and _normalize(alias) in normalized)

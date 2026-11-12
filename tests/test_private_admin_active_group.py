@@ -182,6 +182,7 @@ async def test_group_admin_defaults_to_bound_group(env):
 
 def test_resolve_group_arg_supports_index_name_and_id(monkeypatch):
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"a", "b"})
+    monkeypatch.setattr(db, "list_group_aliases", lambda: {})
     monkeypatch.setattr(commands, "_group_label", lambda gid: {"a": "集训队", "b": "新生群"}[gid])
     assert commands.resolve_group_arg("1") == ("a", "")
     assert commands.resolve_group_arg("b") == ("b", "")

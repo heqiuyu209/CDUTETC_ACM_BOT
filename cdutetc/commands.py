@@ -1503,13 +1503,20 @@ def resolve_group_arg(arg: str) -> tuple[str | None, str]:
     # 1) 直接命中群号/openid
     if value in config.ALLOWED_GROUPS:
         return value, ""
-    # 2) 序号
+    # 2) 已认领的真实群号，可能被重复绑定，必须唯一匹配。
     if value.isdigit():
+        aliases = db.list_group_aliases()
+        numeric_matches = [gid for gid in groups if value == aliases.get(gid, {}).get("numeric_id")]
+        if len(numeric_matches) == 1:
+            return numeric_matches[0], ""
+        if len(numeric_matches) > 1:
+            return None, f"群号 {value} 对应多个已授权群，请改用序号或群标识。"
+        # 3) 序号
         index = int(value)
         if 1 <= index <= len(groups):
             return groups[index - 1], ""
         return None, f"序号 {index} 超出范围（当前共 {len(groups)} 个已授权群）。"
-    # 3) 群备注名 / 命名（先精确，再包含匹配，唯一命中才采纳）
+    # 4) 群备注名 / 命名（先精确，再包含匹配，唯一命中才采纳）
     exact = [gid for gid in groups if _group_label(gid) == value]
     if len(exact) == 1:
         return exact[0], ""
