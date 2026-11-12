@@ -18,6 +18,8 @@ import uuid
 # 子表、队列先清；不重置 sqlite_sequence，防止旧审批编号指向新记录。
 BUSINESS_TABLES = (
     "reminder_success_receipts", "reminder_deliveries", "reminders",
+    # 统一提醒中心的自定义提醒：属业务数据，正式启用前随重置一并清空。
+    "custom_reminders",
     "collection_responses", "collections", "unanswered_questions", "group_faq",
     "training_sessions", "org_events", "competition_pending_updates",
     "competition_versions", "competition_sources", "competition_notify_groups",
@@ -28,6 +30,8 @@ CONFIG_TABLES = (
     "runtime_allowed_groups", "runtime_teachers", "account_labels", "entity_aliases",
     "group_notification_settings", "group_notification_blocks",
     "group_weekly_settings", "group_teacher_assignments",
+    # 群级键值开关（课程提醒开/关等）：属配置，重置业务数据时一并保留。
+    "group_settings",
 )
 
 

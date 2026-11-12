@@ -199,7 +199,8 @@ async def test_group_config_by_index_auto_binds_and_marks_header(env):
     assert admin_session.get_active_group("admin") == target
     first = text.splitlines()[0]
     assert first.startswith("📌【当前工作区：")
-    assert target in first
+    # 标牌优先展示群备注名；未认领真实群号时不拼 openid，避免暴露短哈希。
+    assert db.get_account_label("group", target) in first
     env.api.post_group_message.assert_not_awaited()
 
 

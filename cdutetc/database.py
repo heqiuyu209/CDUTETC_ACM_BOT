@@ -23,6 +23,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+import time
 import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -246,6 +247,7 @@ CREATE TABLE IF NOT EXISTS training_sessions (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id         TEXT NOT NULL,
     title            TEXT NOT NULL DEFAULT '',
+    requirement      TEXT NOT NULL DEFAULT '',
     weekday          TEXT NOT NULL DEFAULT '',
     start_time       TEXT NOT NULL DEFAULT '',
     end_time         TEXT NOT NULL DEFAULT '',
@@ -380,6 +382,22 @@ CREATE TABLE IF NOT EXISTS group_settings (
 )
 """
 
+_CUSTOM_REMINDERS_DDL = """
+CREATE TABLE IF NOT EXISTS custom_reminders (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id     TEXT NOT NULL,
+    content      TEXT NOT NULL DEFAULT '',
+    target_time  TEXT NOT NULL DEFAULT '',
+    repeat_rule  TEXT NOT NULL DEFAULT 'none',
+    weekday      TEXT NOT NULL DEFAULT '',
+    time_of_day  TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'pending',
+    created_by   TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL DEFAULT '',
+    updated_at   TEXT NOT NULL DEFAULT ''
+)
+"""
+
 _AUDIT_LOG_DDL = """
 CREATE TABLE IF NOT EXISTS audit_log (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -432,8 +450,23 @@ _ALL_DDL = (
     _COLLECTIONS_DDL, _COLLECTION_RESPONSES_DDL,
     _REMINDER_DELIVERIES_DDL, _REMINDER_SUCCESS_RECEIPTS_DDL,
     _GROUP_NOTIFICATION_BLOCKS_DDL, _GROUP_NOTIFICATION_SETTINGS_DDL,
-    _GROUP_SETTINGS_DDL, _AUDIT_LOG_DDL,
+    _GROUP_SETTINGS_DDL, _CUSTOM_REMINDERS_DDL, _AUDIT_LOG_DDL,
 )
+
+
+def _ensure_wal(conn: sqlite3.Connection) -> None:
+    """把库切到 WAL。切模式要拿独占锁，另一个进程正在初始化时 SQLite 会直接返回
+    ``database is locked``（这条 PRAGMA 不走 busy_timeout），所以这里自己做有限重试。"""
+    deadline = time.monotonic() + 10.0
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if ("locked" not in message and "busy" not in message) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
 
 
 def _connect() -> sqlite3.Connection:
@@ -447,9 +480,9 @@ def _connect() -> sqlite3.Connection:
     三条 PRAGMA 都在事务开启前执行且幂等，已处于 WAL 的库只回读不重写。
     """
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    _ensure_wal(conn)
     return conn
 
 
@@ -567,6 +600,30 @@ def _migrate_source_activity(conn: sqlite3.Connection) -> None:
     conn.execute("RELEASE source_activity_migration")
 
 
+def _migrate_training_requirement(conn: sqlite3.Connection) -> None:
+    """为旧库的 training_sessions 补 requirement 列（幂等）。
+
+    SQLite 不支持 ADD COLUMN IF NOT EXISTS，因此先用 PRAGMA 查列；
+    查询与 ALTER 处在同一写事务内，避免两个进程同时启动时重复补列报错。
+    """
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(training_sessions)")}
+    if "requirement" not in columns:
+        conn.execute("ALTER TABLE training_sessions ADD COLUMN requirement TEXT NOT NULL DEFAULT ''")
+
+
+def _migrate_group_switches(conn: sqlite3.Connection) -> None:
+    """分群细粒度开关的幂等保障。
+
+    group_settings 是键值表，四个开关以行形式存储，缺行即按默认开启处理，
+    因此这里只校验表结构可用（PRAGMA 检查），不做列变更，重复执行无副作用。
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(group_settings)")}
+    if not {"group_id", "key", "value"} <= columns:
+        logger.warning("group_settings 表结构不完整，分群开关使用默认值")
+
+
 def init_db() -> None:
     """初始化数据库：建表 + 旧库迁移 + 索引。程序启动时调用一次。"""
     conn = _connect()
@@ -578,7 +635,7 @@ def init_db() -> None:
         with conn:
             # WAL 是写进库头的持久属性，必须在事务外执行（事务内会被静默拒绝）。
             # 新库首次初始化、旧库沿用既有模式两种情况都重跑一次以保证落盘生效。
-            conn.execute("PRAGMA journal_mode=WAL")
+            _ensure_wal(conn)
             # 查列与 ALTER 必须位于同一写事务，避免两个启动进程同时补列。
             # 调用方已有事务时保留它；普通新连接先取得数据库写锁再读 schema。
             if not conn.in_transaction:
@@ -588,6 +645,8 @@ def init_db() -> None:
             _migrate_v1(conn)
             _migrate_business_times(conn)
             _migrate_reminder_deliveries(conn)
+            _migrate_training_requirement(conn)
+            _migrate_group_switches(conn)
             for ddl in _INDEX_DDL:
                 conn.execute(ddl)
             _migrate_source_activity(conn)
@@ -1795,7 +1854,7 @@ def update_org_event(eid: int, info: dict, operator: str = "") -> bool:
 _TRAINING_COLS = (
     "id, group_id, title, weekday, start_time, end_time, location, needs_laptop,"
     " software, device_req, training_group, effective_start, effective_end,"
-    " status, source, maintainer, updated_at"
+    " status, source, maintainer, updated_at, requirement"
 )
 
 
@@ -1864,6 +1923,7 @@ def _row_to_training(r: sqlite3.Row) -> dict:
         "needs_laptop": r[7], "software": r[8], "device_req": r[9],
         "training_group": r[10], "effective_start": r[11], "effective_end": r[12],
         "status": r[13], "source": r[14], "maintainer": r[15], "updated_at": r[16],
+        "requirement": r[17],
     }
 
 
@@ -1889,6 +1949,7 @@ def create_training_session(group_id: str, info: dict, operator: str = "") -> in
         _as_str(info.get("source") or ""),
         _as_str(operator or ""),
         now_str(),
+        _as_str(info.get("requirement") or ""),
     )
     if values[12] not in ("confirmed", "draft", "cancelled"):
         raise ValueError("状态必须是 confirmed/draft/cancelled")
@@ -1896,8 +1957,9 @@ def create_training_session(group_id: str, info: dict, operator: str = "") -> in
         cur = conn.execute(
             "INSERT INTO training_sessions (group_id, title, weekday, start_time,"
             " end_time, location, needs_laptop, software, device_req, training_group,"
-            " effective_start, effective_end, status, source, maintainer, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " effective_start, effective_end, status, source, maintainer, updated_at,"
+            " requirement)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             values,
         )
         return cur.lastrowid
@@ -1941,7 +2003,7 @@ def cancel_training_session(group_id: str, tid: int, operator: str = "") -> bool
 _TRAINING_UPDATE_FIELDS = (
     "title", "weekday", "start_time", "end_time", "location", "needs_laptop",
     "software", "device_req", "training_group", "effective_start", "effective_end",
-    "status", "source",
+    "status", "source", "requirement",
 )
 _TRAINING_TIME_FIELDS = ("effective_start", "effective_end")
 _TRAINING_STATUSES = ("confirmed", "draft", "cancelled")
@@ -3141,6 +3203,237 @@ def group_course_remind_enabled(group_id: str) -> bool:
     except sqlite3.OperationalError:
         return True
     return value.strip().lower() != _COURSE_REMIND_OFF
+
+
+# ---------------------------------------------------------------------
+# 分群细粒度后台开关（group_settings 键值存储，缺省全开）
+# ---------------------------------------------------------------------
+
+GROUP_SWITCH_KEYS = ("qa_enabled", "contest_remind_enabled",
+                     "course_remind_enabled", "daily_digest_enabled")
+GROUP_SWITCH_LABELS = {
+    "qa_enabled": "问答",
+    "contest_remind_enabled": "比赛提醒",
+    "course_remind_enabled": "课程提醒",
+    "daily_digest_enabled": "晨报",
+}
+_TRUE_VALUES = ("1", "true", "on", "yes", "开", "开启", "是")
+_FALSE_VALUES = ("0", "false", "off", "no", "关", "关闭", "否")
+
+
+def parse_switch_value(text: str) -> bool | None:
+    """把 ``开/关/1/0/true/false`` 解析成布尔；无法识别返回 None。"""
+    value = (text or "").strip().lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    return None
+
+
+def get_group_switches(group_id: str) -> dict[str, bool]:
+    """读取某群四项后台开关；缺省行一律按开启处理（不返回 None）。"""
+    switches = {key: True for key in GROUP_SWITCH_KEYS}
+    group_id = _as_str(group_id)
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT key, value FROM group_settings WHERE group_id = ?", (group_id,)
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return switches
+    for key, value in rows:
+        if key in switches:
+            parsed = parse_switch_value(value)
+            if parsed is not None:
+                switches[key] = parsed
+    # 旧版「课程提醒」开关（course_remind=on/off）与新开关保持一致
+    try:
+        legacy = get_group_setting(group_id, COURSE_REMIND_SETTING, "")
+    except sqlite3.OperationalError:
+        legacy = ""
+    if legacy and "course_remind_enabled" not in {row[0] for row in rows}:
+        switches["course_remind_enabled"] = legacy.strip().lower() != _COURSE_REMIND_OFF
+    return switches
+
+
+def set_group_switch(group_id: str, key: str, enabled: bool, operator: str = "") -> None:
+    """写入单个后台开关；未知键直接报错，避免拼写错误静默失效。"""
+    if key not in GROUP_SWITCH_KEYS:
+        raise ValueError(f"未知开关：{key}")
+    if type(enabled) is not bool:
+        raise ValueError("请明确开启或关闭")
+    set_group_setting(group_id, key, "on" if enabled else "off", operator)
+    if key == "course_remind_enabled":
+        # 同步旧键，保证 /群配置 课程提醒 与 /群开关 课程提醒 口径一致
+        set_group_setting(group_id, COURSE_REMIND_SETTING,
+                          _COURSE_REMIND_ON if enabled else _COURSE_REMIND_OFF, operator)
+
+
+def group_switch_enabled(group_id: str, key: str) -> bool:
+    """单开关读取；库未初始化等异常一律按开启处理，不中断主链路。"""
+    if key not in GROUP_SWITCH_KEYS:
+        raise ValueError(f"未知开关：{key}")
+    try:
+        return get_group_switches(group_id)[key]
+    except sqlite3.OperationalError:
+        return True
+
+
+# ---------------------------------------------------------------------
+# 统一提醒中心：自定义提醒
+# ---------------------------------------------------------------------
+
+_CUSTOM_REMINDER_COLS = (
+    "id, group_id, content, target_time, repeat_rule, weekday, time_of_day,"
+    " status, created_by, created_at, updated_at"
+)
+_CUSTOM_REMINDER_STATUSES = ("pending", "done", "cancelled")
+
+
+def _row_to_custom_reminder(row: sqlite3.Row) -> dict:
+    return {
+        "id": row[0], "group_id": row[1], "content": row[2], "target_time": row[3],
+        "repeat_rule": row[4], "weekday": row[5], "time_of_day": row[6],
+        "status": row[7], "created_by": row[8], "created_at": row[9],
+        "updated_at": row[10],
+    }
+
+
+def create_custom_reminder(group_id: str, content: str, target_time: str, *,
+                           repeat_rule: str = "none", weekday: str = "",
+                           time_of_day: str = "", operator: str = "") -> int:
+    """新建自定义提醒，返回新 id。"""
+    group_id = _as_str(group_id)
+    content = _as_str(content).strip()
+    if not content:
+        raise ValueError("提醒内容不能为空")
+    target = _canonical_time(target_time)
+    if not target:
+        raise ValueError("提醒时间不能为空")
+    rule = "weekly" if repeat_rule == "weekly" else "none"
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO custom_reminders (group_id, content, target_time, repeat_rule,"
+            " weekday, time_of_day, status, created_by, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,'pending',?,?,?)",
+            (group_id, content, target, rule, _as_str(weekday), _as_str(time_of_day),
+             _as_str(operator), now_str(), now_str()),
+        )
+        new_id = cur.lastrowid
+        add_audit(operator, group_id, "create", "custom_reminder", str(new_id),
+                  "", content, conn=conn)
+    return new_id
+
+
+def list_custom_reminders(group_id: str, *, statuses: tuple[str, ...] = ("pending",)) -> list[dict]:
+    """按触发时间升序返回某群自定义提醒。"""
+    where = "group_id = ?"
+    args: list = [_as_str(group_id)]
+    if statuses:
+        where += " AND status IN (" + ",".join("?" for _ in statuses) + ")"
+        args.extend(statuses)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_CUSTOM_REMINDER_COLS} FROM custom_reminders WHERE {where}"
+            " ORDER BY target_time, id", args,
+        ).fetchall()
+    return [_row_to_custom_reminder(r) for r in rows]
+
+
+def get_custom_reminder(reminder_id: int) -> dict | None:
+    try:
+        rid = int(reminder_id)
+    except (TypeError, ValueError):
+        return None
+    with _connect() as conn:
+        row = conn.execute(
+            f"SELECT {_CUSTOM_REMINDER_COLS} FROM custom_reminders WHERE id = ?", (rid,)
+        ).fetchone()
+    return _row_to_custom_reminder(row) if row else None
+
+
+def update_custom_reminder(reminder_id: int, *, content: str | None = None,
+                           target_time: str | None = None, status: str | None = None,
+                           operator: str = "") -> bool:
+    """修改自定义提醒的时间/内容/状态；返回是否有行被更新。"""
+    try:
+        rid = int(reminder_id)
+    except (TypeError, ValueError):
+        return False
+    changes: dict[str, object] = {}
+    if content is not None:
+        text = _as_str(content).strip()
+        if not text:
+            raise ValueError("提醒内容不能为空")
+        changes["content"] = text
+    if target_time is not None:
+        target = _canonical_time(target_time)
+        if not target:
+            raise ValueError("提醒时间不能为空")
+        changes["target_time"] = target
+    if status is not None:
+        if status not in _CUSTOM_REMINDER_STATUSES:
+            raise ValueError("状态必须是 pending/done/cancelled")
+        changes["status"] = status
+    if not changes:
+        return False
+    assignments = ", ".join(f"{field} = ?" for field in changes)
+    with _connect() as conn:
+        cur = conn.execute(
+            f"UPDATE custom_reminders SET {assignments}, updated_at = ? WHERE id = ?",
+            [*changes.values(), now_str(), rid],
+        )
+        if cur.rowcount:
+            add_audit(operator, "", "update", "custom_reminder", str(rid), "",
+                      ",".join(changes), conn=conn)
+        return cur.rowcount > 0
+
+
+def set_custom_reminder_repeat(reminder_id: int, *, repeat_rule: str = "none",
+                               weekday: str = "", time_of_day: str = "",
+                               operator: str = "") -> bool:
+    """单独更新循环规则（/提醒修改 改周期时用），与内容/时间更新解耦。"""
+    try:
+        rid = int(reminder_id)
+    except (TypeError, ValueError):
+        return False
+    rule = "weekly" if repeat_rule == "weekly" else "none"
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE custom_reminders SET repeat_rule = ?, weekday = ?, time_of_day = ?,"
+            " updated_at = ? WHERE id = ?",
+            (rule, _as_str(weekday), _as_str(time_of_day), now_str(), rid),
+        )
+        if cur.rowcount:
+            add_audit(operator, "", "update", "custom_reminder", str(rid), "",
+                      "repeat_rule=" + rule, conn=conn)
+        return cur.rowcount > 0
+
+
+def delete_custom_reminder(reminder_id: int, operator: str = "") -> bool:
+    """删除自定义提醒（物理删除，仅本表行，不触碰任何用户文件）。"""
+    try:
+        rid = int(reminder_id)
+    except (TypeError, ValueError):
+        return False
+    with _connect() as conn:
+        cur = conn.execute("DELETE FROM custom_reminders WHERE id = ?", (rid,))
+        if cur.rowcount:
+            add_audit(operator, "", "delete", "custom_reminder", str(rid), "", "", conn=conn)
+        return cur.rowcount > 0
+
+
+def list_due_custom_reminders(now, limit: int = 200) -> list[dict]:
+    """返回所有到期待发自定义提醒（target_time <= now）。"""
+    stamp = _canonical_time(now.strftime("%Y-%m-%d %H:%M:%S") if hasattr(now, "strftime") else str(now))
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_CUSTOM_REMINDER_COLS} FROM custom_reminders"
+            " WHERE status = 'pending' AND target_time <= ? ORDER BY target_time, id LIMIT ?",
+            (stamp, limit),
+        ).fetchall()
+    return [_row_to_custom_reminder(r) for r in rows]
 
 
 def delivery_status_counts(group_id: str) -> dict[str, int]:

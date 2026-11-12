@@ -52,7 +52,11 @@ from cdutetc.database import create_published_competition_once, init_db
 from cdutetc.fetcher import FetchError, fetch_text
 from cdutetc.llm import extract_contest, normalize_time
 from cdutetc.publish_text import is_timed_contest_announcement, parse_simple_publication
-from cdutetc.reminder import check_general_reminders, check_contest_start_reminders
+from cdutetc.reminder import (
+    check_contest_start_reminders,
+    check_custom_reminders,
+    check_general_reminders,
+)
 from cdutetc.utils import (
     admin_group_id,
     can_manage_group,
@@ -663,6 +667,10 @@ class ACMBot:
                         logger.info("识别为发布比赛意图，转发布流程")
                         await self._handle_publish(message, text, group_id, member_id)
                         return
+                # 群开关闸门：问答关闭后不再自动回答自由文本，命令仍照常执行
+                if not db.group_switch_enabled(group_id, "qa_enabled"):
+                    logger.info("本群问答开关已关闭，跳过自动回答")
+                    return
                 replies = await commands.handle_non_command_message(
                     text, group_id, member_id, staff=can_manage_group(member_id)
                 )
@@ -1150,6 +1158,7 @@ class ACMBot:
             return
         try:
             await check_general_reminders(self._send_group_result)
+            await check_custom_reminders(self._send_group_result)
         except Exception:  # noqa: BLE001
             logger.exception("通用提醒扫描失败，等待下一轮重试")
 
@@ -1174,6 +1183,8 @@ class ACMBot:
         try:
             for group_id in sorted(config.ALLOWED_GROUPS):
                 try:
+                    if not db.group_switch_enabled(group_id, "daily_digest_enabled"):
+                        continue
                     text = daily_digest.build_daily_digest(group_id, now=now)
                     if not text:
                         continue

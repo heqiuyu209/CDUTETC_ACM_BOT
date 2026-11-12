@@ -74,14 +74,17 @@ def test_add_course_without_title_shows_usage(env):
     assert db.list_training_sessions(GID) == []
 
 
-def test_list_courses_shows_normalized_span_and_location_fallback(env):
-    """列表展示归一化时间；未填地点回退为「地点待定」。"""
-    commands.cmd_training_add(GID, TEACHER, "训练 周四 19-21点 B201")
+def test_list_courses_shows_normalized_span_and_requirement(env):
+    """列表展示归一化时间与「要求」；未填要求时不渲染该段。"""
+    commands.cmd_training_add(GID, TEACHER, "训练 周四 19-21点 B201 要求=带电脑")
     commands.cmd_training_add(GID, TEACHER, "自习 周三 20点")
     text = _text(commands.cmd_training_list(GID, OUTSIDER, ""))
     assert "19:00-21:00" in text
-    assert "周三 20:00-" in text
-    assert "地点待定" in text
+    assert "周三 20:00" in text
+    assert "要求：带电脑" in text
+    # 没写要求的那门课不出现空「要求：」段
+    rows = [line for line in text.splitlines() if line.startswith("1. ")]
+    assert rows and "要求" not in rows[0]
 
 
 def test_list_courses_empty_notice(env):
@@ -92,7 +95,7 @@ def test_modify_by_index_updates_time(env):
     """用列表序号定位课程并改时间，落库字段与回执同步更新。"""
     commands.cmd_training_add(GID, TEACHER, "训练 周四 19-21点 B201")
     text = _text(commands.cmd_training_modify(GID, TEACHER, "1 时间=周三 20:00-22:00"))
-    assert "已更新课程" in text and "20:00-22:00" in text
+    assert "已更新课程「训练」" in text and "20:00-22:00" in text
     course = db.get_group_course(GID, 1)
     assert (course["weekday"], course["start_time"], course["end_time"]) == ("周三", "20:00", "22:00")
 

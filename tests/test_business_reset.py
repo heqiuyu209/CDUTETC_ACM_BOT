@@ -13,6 +13,12 @@ from cdutetc import database
 from scripts import reset_business_data as reset
 
 
+def test_custom_reminders_is_a_business_table():
+    """统一提醒中心的自定义提醒属业务数据：随重置清理，绝不按配置保留。"""
+    assert "custom_reminders" in reset.BUSINESS_TABLES
+    assert "custom_reminders" not in reset.CONFIG_TABLES
+
+
 def snapshot(path):
     with closing(sqlite3.connect(path)) as conn:
         return list(conn.iterdump())
@@ -63,6 +69,7 @@ def test_apply_clears_every_business_table_backs_up_and_preserves_configuration(
     assert snapshot(result.backup) == before
     preview = reset.reset_business_data(populated_db)
     assert set(preview.cleared.values()) == {0}
+    assert preview.cleared["custom_reminders"] == 0
     assert preview.preserved == result.preserved
     with closing(sqlite3.connect(populated_db)) as conn, closing(sqlite3.connect(result.backup)) as backup:
         for table in (*reset.CONFIG_TABLES, "sqlite_sequence"):
