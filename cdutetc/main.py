@@ -353,6 +353,8 @@ class ACMBot:
             minutes=config.REMIND_CHECK_INTERVAL_MINUTES,
             id="general-remind-check",
             next_run_time=now,
+            max_instances=1,
+            coalesce=True,
         )
         sched.add_job(
             self._contest_remind_job,
@@ -368,6 +370,8 @@ class ACMBot:
             "interval",
             minutes=config.FETCH_MIN_INTERVAL_MINUTES,
             id="source-crawl",
+            max_instances=1,
+            coalesce=True,
         )
         if config.DAILY_DIGEST_ENABLED:
             # 每日固定时刻推送一次聚合晨报；coalesce 保证服务重启/休眠后只补一次。
@@ -395,6 +399,8 @@ class ACMBot:
                 hour=generation_at.hour,
                 minute=generation_at.minute,
                 id="weekly-contest",
+                max_instances=1,
+                coalesce=True,
             )
             await self._weekly_contest_job(now=now)
         sched.start()
@@ -1157,26 +1163,29 @@ class ACMBot:
             logger.info("主动群消息未启用，暂停晨报投递")
             return 0
         sent = 0
-        for group_id in sorted(config.ALLOWED_GROUPS):
-            try:
-                text = daily_digest.build_daily_digest(group_id, now=now)
-                if not text:
+        try:
+            for group_id in sorted(config.ALLOWED_GROUPS):
+                try:
+                    text = daily_digest.build_daily_digest(group_id, now=now)
+                    if not text:
+                        continue
+                    result = await self._send_group_result(group_id, text)
+                except Exception:  # noqa: BLE001 - 单群异常不得中断其余群
+                    logger.exception("[晨报] 群 %s 生成或发送异常，继续下一个群", group_id)
                     continue
-                result = await self._send_group_result(group_id, text)
-            except Exception:  # noqa: BLE001 - 单群异常不得中断其余群
-                logger.exception("[晨报] 群 %s 生成或发送异常，继续下一个群", group_id)
-                continue
-            if result.ok:
-                sent += 1
-                continue
-            if result.code == DeliveryCode.QUOTA_EXHAUSTED:
-                logger.warning(
-                    "[晨报] 群 %s 主动消息配额已耗尽，本群今日跳过（已熔断，不再重试）",
-                    group_id,
-                )
-            else:
-                logger.warning("[晨报] 群 %s 未发送 [%s]",
-                               group_id, getattr(result.code, "value", result.code))
+                if result.ok:
+                    sent += 1
+                    continue
+                if result.code == DeliveryCode.QUOTA_EXHAUSTED:
+                    logger.warning(
+                        "[晨报] 群 %s 主动消息配额已耗尽，本群今日跳过（已熔断，不再重试）",
+                        group_id,
+                    )
+                else:
+                    logger.warning("[晨报] 群 %s 未发送 [%s]",
+                                   group_id, getattr(result.code, "value", result.code))
+        except Exception:  # noqa: BLE001 - 循环外的兜底，异常不得逸出调度器
+            logger.exception("[晨报] 本次调度执行异常，跳过本轮等待下次触发")
         if sent:
             logger.info("[晨报] 本次成功推送 %d 个群的事务总览", sent)
         return sent
@@ -1189,6 +1198,13 @@ class ACMBot:
         """
         if not config.WEEKLY_CONTEST_ENABLED:
             return
+        try:
+            await self._create_weekly_contest(now=now)
+        except Exception:  # noqa: BLE001 - DB 锁/时区等意外异常统一兜底，不向上抛出
+            logger.exception("[周赛] 本轮调度执行异常，跳过本轮等待下次触发")
+
+    async def _create_weekly_contest(self, now: datetime | None = None) -> None:
+        """按周幂等生成下一场周赛（由 ``_weekly_contest_job`` 统一兜底调用）。"""
         template = config.WEEKLY_CONTEST_TEMPLATE
         try:
             now = now or datetime.now(ZoneInfo(config.TZ_NAME))
@@ -1227,7 +1243,10 @@ class ACMBot:
 
     async def _crawl_job(self):
         """周期抓取公共来源（默认关闭）：变化检测 → 待审更新，不自动广播。"""
-        await crawler.run_fetch(send_group=self._send_group_result)
+        try:
+            await crawler.run_fetch(send_group=self._send_group_result)
+        except Exception:  # noqa: BLE001 - 网络/解析/DB 异常统一兜底，不逸出调度器
+            logger.exception("[抓取] 本轮调度执行异常，跳过本轮等待下次触发")
 
 
 def _build_client():

@@ -426,7 +426,24 @@ _ALL_DDL = (
 
 
 def _connect() -> sqlite3.Connection:
-    return sqlite3.connect(DB_PATH)
+    """建立连接：显式 10s 忙等 + WAL，避免并发写/长事务直接抛 database is locked。
+
+    - ``timeout=10.0``：连接级忙等阈值（等价于 sqlite3_busy_timeout）；
+    - ``journal_mode=WAL``：读写并发，写事务不再阻塞读者；
+    - ``synchronous=NORMAL``：WAL 下的推荐档位，断电仅可能丢最后一个事务；
+    - ``busy_timeout=10000``：显式声明，防止外部用 PRAGMA 覆盖后回退到默认值。
+
+    三条 PRAGMA 都在事务开启前执行且幂等，已处于 WAL 的库只回读不重写。
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=10000")
+    return conn
+
+
+# 供 init_db 判断 _connect 是否被替换（测试里常注入同一条共享内存连接）。
+_CONNECT_IMPL = _connect
 
 
 def _as_str(value) -> str:
@@ -541,19 +558,31 @@ def _migrate_source_activity(conn: sqlite3.Connection) -> None:
 
 def init_db() -> None:
     """初始化数据库：建表 + 旧库迁移 + 索引。程序启动时调用一次。"""
-    with _connect() as conn:
-        # 查列与 ALTER 必须位于同一写事务，避免两个启动进程同时补列。
-        # 调用方已有事务时保留它；普通新连接先取得数据库写锁再读 schema。
-        if not conn.in_transaction:
-            conn.execute("BEGIN IMMEDIATE")
-        for ddl in _ALL_DDL:
-            conn.execute(ddl)
-        _migrate_v1(conn)
-        _migrate_business_times(conn)
-        _migrate_reminder_deliveries(conn)
-        for ddl in _INDEX_DDL:
-            conn.execute(ddl)
-        _migrate_source_activity(conn)
+    conn = _connect()
+    # 真实 _connect() 每次新建独占连接，初始化后必须关闭：
+    # 残留连接会一直持有 -shm 句柄，导致后续切换 journal_mode 或清理时报
+    # database is locked。测试注入的共享连接由测试自己管理，这里不代关。
+    owns_conn = _connect is _CONNECT_IMPL
+    try:
+        with conn:
+            # WAL 是写进库头的持久属性，必须在事务外执行（事务内会被静默拒绝）。
+            # 新库首次初始化、旧库沿用既有模式两种情况都重跑一次以保证落盘生效。
+            conn.execute("PRAGMA journal_mode=WAL")
+            # 查列与 ALTER 必须位于同一写事务，避免两个启动进程同时补列。
+            # 调用方已有事务时保留它；普通新连接先取得数据库写锁再读 schema。
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+            for ddl in _ALL_DDL:
+                conn.execute(ddl)
+            _migrate_v1(conn)
+            _migrate_business_times(conn)
+            _migrate_reminder_deliveries(conn)
+            for ddl in _INDEX_DDL:
+                conn.execute(ddl)
+            _migrate_source_activity(conn)
+    finally:
+        if owns_conn:
+            conn.close()
 
 
 # =====================================================================
