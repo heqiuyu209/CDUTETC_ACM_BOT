@@ -367,11 +367,11 @@ def test_reminder_status_filters_group_before_limiting_and_shows_terminal_counts
     text = commands.cmd_reminder_status("g1", "teacher", "")[0]["text"]
     assert "重试耗尽 1" in text
     assert "已取消 0" in text and "已过期 0" in text
-    assert "本群当前无待发送提醒" in text
+    assert "7天后暂无已排期提醒" in text
     pending_id, _ = collection()
     database.ensure_delivery("g1", "collection", pending_id, "deadline", TARGET)
     text = commands.cmd_reminder_status("g1", "teacher", "")[0]["text"]
-    assert f"collection#{pending_id}" in text and "待发送 1" in text
+    assert f"(#{pending_id})" in text and "待发送 1" in text
     assert "重试耗尽 1" in text
 
 

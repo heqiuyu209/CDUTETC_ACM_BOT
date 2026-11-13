@@ -25,6 +25,7 @@ import logging
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import urlsplit
@@ -3099,18 +3100,59 @@ def list_pending_deliveries(limit: int = 200) -> list[dict]:
 
 
 def list_deliveries(group_id: str, *, statuses: tuple[str, ...] | None = None,
-                    limit: int = 200) -> list[dict]:
+                    limit: int = 200, order: str = "id") -> list[dict]:
+    """列出某群投递记录。
+
+    order="id"：按主键倒序（发送/巡检链路沿用，保持既有行为）；
+    order="schedule"：按预计触发时间正序（同时间按 id 正序），供展示层从近到远排列。
+    """
     where = "group_id = ?"
     args: list = [group_id]
     if statuses:
         where += " AND status IN (" + ",".join("?" for _ in statuses) + ")"
         args.extend(statuses)
+    # scheduled_at 为空的记录排在最后，避免空串抢占队首。
+    order_by = ("scheduled_at = '', scheduled_at, id" if order == "schedule" else "id DESC")
     with _connect() as conn:
         rows = conn.execute(
-            f"SELECT {_DELIVERY_COLS} FROM reminder_delivery_states WHERE {where} ORDER BY id DESC LIMIT ?",
+            f"SELECT {_DELIVERY_COLS} FROM reminder_delivery_states WHERE {where} ORDER BY {order_by} LIMIT ?",
             [*args, limit],
         ).fetchall()
     return [_row_to_delivery(row) for row in rows]
+
+
+_TARGET_NAME_COLUMNS = {
+    "competition": ("competitions", "name"),
+    "collection": ("collections", "title"),
+    "training_session": ("training_sessions", "title"),
+}
+
+
+def get_target_names(pairs: Iterable[tuple[str, int]]) -> dict[tuple[str, int], str]:
+    """批量解析提醒目标名称，键为 (obj_type, obj_id)；已删除或不支持的类型不返回。"""
+    grouped: dict[str, set[int]] = {}
+    for obj_type, obj_id in pairs:
+        if obj_type not in _TARGET_NAME_COLUMNS:
+            continue
+        try:
+            grouped.setdefault(obj_type, set()).add(int(obj_id))
+        except (TypeError, ValueError):
+            continue
+    names: dict[tuple[str, int], str] = {}
+    if not grouped:
+        return names
+    with _connect() as conn:
+        for obj_type, ids in grouped.items():
+            table, column = _TARGET_NAME_COLUMNS[obj_type]
+            marks = ",".join("?" for _ in ids)
+            rows = conn.execute(
+                f"SELECT id, {column} FROM {table} WHERE id IN ({marks})", sorted(ids),
+            ).fetchall()
+            for row in rows:
+                text = (row[1] or "").strip()
+                if text:
+                    names[(obj_type, int(row[0]))] = text
+    return names
 
 
 def get_group_notification_block(protocol: str, group_id: str) -> dict | None:
