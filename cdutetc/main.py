@@ -26,6 +26,7 @@ import logging
 import re
 import sqlite3
 import time
+import types
 from dataclasses import replace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -478,6 +479,37 @@ class ACMBot:
                     # 私聊管理回执同样带工作区标牌，与业务指令出口保持一致
                     for reply in commands.with_private_header(replies, str(uid)) or []:
                         await self._send_private_result(uid, reply["text"])
+                    return
+                if cmd == "发布":
+                    # 超管私聊录入比赛：作用域=当前工作区群，抓取/提取/查重/入库全部复用
+                    # 群内 _handle_publish 链路，只是回执改走私聊，不在目标群刷屏。
+                    pub_group = admin_session.get_active_group(str(uid))
+                    if not pub_group:
+                        await self._send_private_result(
+                            uid,
+                            "还没有锁定工作区群，无法确定发布到哪个群。\n"
+                            "请先发送 /群配置 <序号> 选中目标群（/群配置 全部 可查看候选），"
+                            "再发送 /发布。",
+                        )
+                        return
+                    # 保留多行正文与链接：从原文里剥掉前缀命令词，不做任何摘要
+                    pub_text = content.strip()[3:].strip()
+                    if not pub_text:
+                        await self._send_private_result(
+                            uid,
+                            "用法：/发布 比赛名称 比赛时间（可附官网链接，支持多行）\n"
+                            f"本次将录入到工作区群 {pub_group}，所有回执只在当前私聊返回。",
+                        )
+                        return
+                    # 轻量消息对象：_handle_publish 只用到 group_id / id，
+                    # 另带 _private_uid 标记让 _safe_reply 改走私聊回执。
+                    priv_msg = types.SimpleNamespace(
+                        group_id=pub_group,
+                        user_id=uid,
+                        id=str(getattr(message, "id", "") or ""),
+                        _private_uid=uid,
+                    )
+                    await self._handle_publish(priv_msg, pub_text, pub_group, str(uid))
                     return
                 if cmd == "通知测试":
                     await self._send_private_result(uid, await self._notification_test(uid, args))
@@ -1078,6 +1110,12 @@ class ACMBot:
 
     async def _safe_reply(self, message: OneBotMessage, content: str) -> bool:
         """只回复当前入站群消息，官方适配不得复用历史ID或转主动重发。"""
+        # 超管私聊录入比赛时，入参是 SimpleNamespace 轻量消息：没有真实群上下文，
+        # 一律走私聊回执，避免落进 send_group 的群白名单校验。
+        private_uid = getattr(message, "_private_uid", None)
+        if private_uid:
+            result = await self._send_private_result(str(private_uid), content)
+            return bool(result)
         group_id = message.group_id
         if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
             return False
