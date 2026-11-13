@@ -283,8 +283,15 @@ async def run_fetch(now: datetime | None = None,
 
 CF_CONTEST_API = "https://codeforces.com/api/contest.list"
 NOWCODER_CONTEST_PAGE = "https://ac.nowcoder.com/acm/contest/vip-index"
+# 牛客官方日历 JSON 接口：按月返回赛程，服务器直连通畅；
+# 网页 vip-index 是前端渲染页，服务端抓到的常常是空壳，故改为接口优先、页面兜底。
+NOWCODER_CALENDAR_API = "https://ac.nowcoder.com/acm/calendar/contest?token=&month={month}"
+NOWCODER_REFERER = NOWCODER_CONTEST_PAGE
 _CF_URL_TEMPLATE = "https://codeforces.com/contest/{id}"
 _NOWCODER_URL_TEMPLATE = "https://ac.nowcoder.com/acm/contest/{id}"
+# 日历接口里 contestId（如 1143041）与真实路径 ID（如 143041）不一致，
+# 因此 URL 必须从 link 字段取；模板只用于 link 缺失时的兼容回退。
+_NOWCODER_LINK_ID = re.compile(r"/acm/contest/(\d+)")
 _NOWCODER_ANCHOR = re.compile(
     r'<a[^>]*href="[^"]*/acm/contest/(\d+)"[^>]*>(.*?)</a>', re.S | re.I)
 _NOWCODER_ID = re.compile(r"/acm/contest/(\d+)")
@@ -318,6 +325,46 @@ def _window_guard(start: datetime, now: datetime, window_days: int) -> bool:
     """仅保留「尚未开始且落在窗口内」的比赛。"""
     delta = (start - now).total_seconds()
     return 0 <= delta <= max(int(window_days), 0) * 86400
+
+
+def _nowcoder_window_guard(start: datetime, end: datetime | None,
+                           now: datetime, window_days: int) -> bool:
+    """牛客赛程窗口：未结束且在窗口内的比赛都要，当天已开赛的不能漏。
+
+    - 有结束时间：只要 ``end > now`` 就算未结束（哪怕已经开始）；
+    - 无结束时间：允许开始时间回看 3 小时，覆盖「刚开赛但接口没给 end」的情况；
+    - 上限仍受 ``window_days`` 约束，避免把远期赛程全部拉进。
+    """
+    limit = now + timedelta(days=max(int(window_days), 0))
+    if start > limit:
+        return False
+    if end is not None:
+        return end > now
+    return start >= now - timedelta(hours=3)
+
+
+def _nowcoder_calendar_urls(now: datetime, window_days: int) -> list[str]:
+    """按月构造日历接口地址：窗口跨月时同时取本月与后续月份。"""
+    first = now.replace(day=1)
+    last = now + timedelta(days=max(int(window_days), 0))
+    months: list[str] = []
+    cursor = first
+    while cursor <= last and len(months) < 3:
+        months.append(cursor.strftime("%Y-%m"))
+        cursor = (cursor + timedelta(days=32)).replace(day=1)
+    return [NOWCODER_CALENDAR_API.format(month=month) for month in months]
+
+
+def _nowcoder_clean_link(value) -> str | None:
+    """从 link / url 字段取干净的比赛地址，剥离 ``?from=acm_calendar`` 等追踪参数。"""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = _NOWCODER_LINK_ID.search(text)
+    if match is None:
+        return None
+    return _NOWCODER_URL_TEMPLATE.format(id=int(match.group(1)))
+
 
 
 def parse_codeforces(payload: dict, now: datetime, window_days: int = 14) -> list[dict]:
@@ -402,19 +449,27 @@ def _nowcoder_from_json(text: str, now: datetime, window_days: int) -> list[dict
         payload = json.loads(text)
     except (TypeError, ValueError):
         return []
+    return _nowcoder_items_to_contests(_nowcoder_items(payload), now, window_days)
+
+
+def _nowcoder_items_to_contests(items, now: datetime, window_days: int) -> list[dict]:
+    """把日历接口的比赛数组转成统一赛程条目（URL 优先取 link，窗口放行当日赛事）。"""
     out: list[dict] = []
-    for raw in _nowcoder_items(payload):
+    for raw in items:
         if not isinstance(raw, Mapping):
             continue
+        link_url = _nowcoder_clean_link(
+            raw.get("link") or raw.get("url") or raw.get("contestUrl"))
         contest_id = raw.get("contestId") or raw.get("id")
         name = _clean_name(raw.get("name") or raw.get("title")
                            or raw.get("contestName") or raw.get("contestTitle")
                            or raw.get("contest_name") or "")
         start = _nowcoder_time(
             raw.get("startTime") or raw.get("start_time") or raw.get("start"))
-        if not contest_id or not name or start is None:
+        if not name or start is None:
             continue
-        if not _window_guard(start, now, window_days):
+        if link_url is None and not contest_id:
+            # 两者都没有时无法定位比赛，宁可不收也不编造链接。
             continue
         duration = raw.get("duration") or raw.get("durationSeconds") or 0
         try:
@@ -425,17 +480,26 @@ def _nowcoder_from_json(text: str, now: datetime, window_days: int) -> list[dict
         if end_value is not None and end_value > start:
             # 只给了结束时刻时用差值补时长，避免 end 与 duration_minutes 自相矛盾。
             minutes = int((end_value - start).total_seconds() // 60)
+        if not _nowcoder_window_guard(start, end_value, now, window_days):
+            continue
         end = end_value or (start + timedelta(minutes=max(minutes, 0)))
+        url = link_url
+        if url is None:
+            try:
+                url = _NOWCODER_URL_TEMPLATE.format(id=int(contest_id))
+            except (TypeError, ValueError):
+                continue
         out.append({
             "platform": "牛客",
             "name": name,
             "start": _fmt_minute(start),
             "end": _fmt_minute(end),
             "duration_minutes": max(minutes, 0),
-            "url": _NOWCODER_URL_TEMPLATE.format(id=int(contest_id)),
+            "url": url,
         })
     out.sort(key=lambda item: item["start"])
     return out
+
 
 
 def _nowcoder_blocks(text: str) -> list[tuple[int, int]]:
@@ -482,7 +546,7 @@ def _nowcoder_from_html(text: str, now: datetime, window_days: int) -> list[dict
         if stamp is None:
             continue
         start = _nowcoder_time(f"{stamp.group(1)} {stamp.group(2)}")
-        if start is None or not _window_guard(start, now, window_days):
+        if start is None or not _nowcoder_window_guard(start, None, now, window_days):
             continue
         # 锚后片段若给出同日时段（如「19:00-21:00」），用它补出结束时间与时长；
         # 结束时刻不晚于开始时刻视为跨天（如 23:00-01:00），仍属同一条比赛。
@@ -535,13 +599,43 @@ def dedupe_contest_items(items) -> list[dict]:
     return out
 
 
+async def _fetch_nowcoder_contests(current: datetime, window: int, nc_fetcher) -> list[dict]:
+    """牛客赛程：日历 JSON 接口优先（跨月合并去重），异常再降级赛程页 HTML。"""
+    items: list[dict] = []
+    json_ok = False
+    for url in _nowcoder_calendar_urls(current, window):
+        try:
+            text = await nc_fetcher(url)
+        except Exception as error:  # noqa: BLE001 - 单月失败要能继续试其它月份
+            logger.warning("牛客日历接口请求失败（%s）：%s", url, error)
+            continue
+        if not isinstance(text, str):
+            text = json.dumps(text, ensure_ascii=False)
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            logger.warning("牛客日历接口返回非 JSON（%s），准备降级赛程页", url)
+            continue
+        json_ok = True
+        items.extend(_nowcoder_items_to_contests(
+            _nowcoder_items(payload), current, window))
+    if json_ok:
+        # 跨月请求常出现同一场比赛（月末/月初边界），按 (平台, 名称, 开始时间) 去重。
+        return dedupe_contest_items(items)
+    logger.warning("牛客日历接口不可用，降级抓取赛程页：%s", NOWCODER_CONTEST_PAGE)
+    page = await nc_fetcher(NOWCODER_CONTEST_PAGE)
+    if not isinstance(page, str):
+        page = json.dumps(page, ensure_ascii=False)
+    return dedupe_contest_items(parse_nowcoder(page, current, window))
+
+
 async def fetch_contests(now: datetime | None = None, *,
                          codeforces_fetch=None, nowcoder_fetch=None) -> dict:
     """抓取两站赛程；单源失败只记错误项，不影响另一源。"""
     current = _as_tz(now)
     window = config.AUTO_CONTEST_WINDOW_DAYS
     cf_fetcher = codeforces_fetch or _http_get_text
-    nc_fetcher = nowcoder_fetch or _http_get_text
+    nc_fetcher = nowcoder_fetch or _nowcoder_http_get_text
     result = {"codeforces": [], "nowcoder": [], "errors": []}
 
     try:
@@ -554,10 +648,7 @@ async def fetch_contests(now: datetime | None = None, *,
         result["errors"].append({"platform": "Codeforces", "error": str(error)})
 
     try:
-        text = await nc_fetcher(NOWCODER_CONTEST_PAGE)
-        if not isinstance(text, str):
-            text = json.dumps(text, ensure_ascii=False)
-        result["nowcoder"] = parse_nowcoder(text, current, window)
+        result["nowcoder"] = await _fetch_nowcoder_contests(current, window, nc_fetcher)
     except Exception as error:  # noqa: BLE001 - 单源失败必须隔离
         logger.warning("牛客赛程抓取失败：%s", error)
         result["errors"].append({"platform": "牛客", "error": str(error)})
@@ -567,6 +658,12 @@ async def fetch_contests(now: datetime | None = None, *,
 async def _http_get_text(url: str) -> str:
     """复用既有抓取通道（同一套 SSRF 防护、超时与 UA）。"""
     return await fetcher.fetch_text(url)
+
+
+async def _nowcoder_http_get_text(url: str) -> str:
+    """牛客请求带上来源页 Referer：日历接口对裸请求偶发返回空/阻断。"""
+    return await fetcher.fetch_text_with_extra_headers(
+        url, {"Referer": NOWCODER_REFERER})
 
 
 def _existing_contest_keys() -> set[tuple[str, str]]:

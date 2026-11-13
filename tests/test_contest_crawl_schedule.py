@@ -130,3 +130,57 @@ async def test_source_crawl_job_follows_configured_clock(memory_db, monkeypatch)
         if bot.sched is not None:
             bot.sched.shutdown(wait=False)
             await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------- 赛程同步 job
+
+async def test_contest_crawl_job_registered_only_when_enabled(memory_db, monkeypatch):
+    """赛程自动抓取默认关闭时不注册 job，开启后才注册。"""
+    monkeypatch.setattr(config, "AUTO_CONTEST_CRAWL_ENABLED", False, raising=False)
+    bot = new_bot()
+    base = datetime(2026, 11, 12, 9, 0, tzinfo=TZ)
+    try:
+        await bot._on_ready(now=base)
+        assert bot.sched.get_job("contest-crawl") is None
+    finally:
+        if bot.sched is not None:
+            bot.sched.shutdown(wait=False)
+            await asyncio.sleep(0)
+
+
+async def test_contest_crawl_job_runs_at_startup_then_daily(memory_db, monkeypatch):
+    """开启后启动即同步一次（不必等到明天 08:05），之后每天固定时刻一次。"""
+    monkeypatch.setattr(config, "AUTO_CONTEST_CRAWL_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "CONTEST_CRAWL_HOUR", 8)
+    monkeypatch.setattr(config, "CONTEST_CRAWL_MINUTE", 5)
+
+    bot = new_bot()
+    base = datetime(2026, 11, 12, 9, 0, tzinfo=TZ)  # 已过今天 08:05
+    try:
+        await bot._on_ready(now=base)
+        job = bot.sched.get_job("contest-crawl")
+        assert job is not None
+        assert job.max_instances == 1 and job.coalesce is True
+        # 启动时先跑一次：next_run_time 就是当前时刻，而不是明天的 08:05
+        assert job.next_run_time == base
+        assert job.trigger.get_next_fire_time(None, base) == datetime(2026, 11, 13, 8, 5, tzinfo=TZ)
+        fields = {field.name: str(field) for field in job.trigger.fields}
+        assert fields["hour"] == "8" and fields["minute"] == "5"
+    finally:
+        if bot.sched is not None:
+            bot.sched.shutdown(wait=False)
+            await asyncio.sleep(0)
+
+
+async def test_contest_crawl_job_swallows_fetch_failure(memory_db, monkeypatch):
+    """赛程抓取抛异常也不逸出调度器。"""
+    from cdutetc import crawler
+
+    monkeypatch.setattr(config, "AUTO_CONTEST_CRAWL_ENABLED", True, raising=False)
+
+    async def _boom(*args, **kwargs):
+        raise TimeoutError("nowcoder timeout")
+
+    monkeypatch.setattr(crawler, "run_contest_fetch", _boom)
+    bot = new_bot()
+    await bot._contest_crawl_job()

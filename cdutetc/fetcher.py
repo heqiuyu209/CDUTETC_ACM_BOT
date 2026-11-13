@@ -46,6 +46,9 @@ _HIDDEN_TAGS = frozenset(("script", "style", "noscript", "iframe"))
 
 _sem = asyncio.Semaphore(config.FETCH_CONCURRENCY)
 _request_deadline = ContextVar("fetch_request_deadline", default=None)
+# 附加请求头（如 Referer）：按 asyncio 上下文传递，重定向逐跳沿用。
+_extra_headers = ContextVar("fetch_extra_headers", default=())
+_HEADER_NAME_OK = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 
 
 class FetchError(Exception):
@@ -359,12 +362,14 @@ async def _request_once_impl(url: str, deadline: float) -> tuple[int, dict[str, 
             if index == len(ips) - 1:
                 raise FetchError(f"所有已验证地址连接失败（{host}:{port}）") from error
     try:
+        extra = "".join(f"{name}: {value}\r\n" for name, value in _extra_headers.get())
         req = (
             f"GET {target} HTTP/1.1\r\n"
             f"Host: {authority}\r\n"
             f"User-Agent: {_UA}\r\n"
             "Accept: text/html,text/plain,application/json,application/xml;q=0.9,*/*;q=0.1\r\n"
             "Accept-Encoding: gzip\r\n"
+            f"{extra}"
             "Connection: close\r\n\r\n"
         )
         writer.write(req.encode("ascii"))
@@ -583,6 +588,36 @@ async def fetch_text(url: str) -> str:
     """
     text, _ = await fetch_text_with_headers(url)
     return text
+
+
+def _sanitize_extra_headers(headers) -> tuple[tuple[str, str], ...]:
+    """过滤附加请求头：只放行常规名值，挡住 CRLF 注入等非法内容。"""
+    pairs: list[tuple[str, str]] = []
+    for name, value in dict(headers or {}).items():
+        key, val = str(name or "").strip(), str(value or "").strip()
+        if not key or not _HEADER_NAME_OK.fullmatch(key):
+            raise FetchError(f"非法请求头名：{key!r}")
+        if any(ch in val for ch in "\r\n") or not val:
+            raise FetchError(f"非法请求头值：{key}")
+        try:
+            val.encode("ascii")
+        except UnicodeEncodeError:
+            raise FetchError(f"请求头值必须为 ASCII：{key}") from None
+        pairs.append((key, val))
+    return tuple(pairs)
+
+
+async def fetch_text_with_extra_headers(url: str, headers=None) -> str:
+    """带附加请求头抓取正文（如牛客需要的 Referer），重定向逐跳保留。
+
+    附加头只在本次抓取的 asyncio 上下文内生效，不影响其它抓取。
+    """
+    pairs = _sanitize_extra_headers(headers)
+    token = _extra_headers.set(pairs)
+    try:
+        return await fetch_text(url)
+    finally:
+        _extra_headers.reset(token)
 
 
 async def fetch_text_with_headers(url: str) -> tuple[str, dict[str, str]]:

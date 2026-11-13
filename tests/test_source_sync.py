@@ -1,7 +1,8 @@
 """官网来源切换、正文基线和待审部分更新的真实 SQLite / 群命令回归。"""
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
+import asyncio
 import hashlib
 import json
 import sqlite3
@@ -475,3 +476,201 @@ def test_failed_old_source_migration_can_retry_without_partial_schema(tmp_path, 
         assert len(database.list_sources(1, active_only=False)) == 2
     finally:
         conn.close()
+
+
+# ================= 牛客赛程：日历 JSON 接口（真实响应结构） =================
+# 真实样本：contestId 与路径 ID 不一致（1143041 → /acm/contest/143041），
+# link 带 ?from=acm_calendar 追踪参数，时间字段为毫秒时间戳。
+
+NC_TZ = ZoneInfo("Asia/Shanghai")
+NC_NOW = datetime(2026, 11, 15, 10, 30, tzinfo=NC_TZ)
+NC_CALENDAR = "https://ac.nowcoder.com/acm/calendar/contest?token=&month="
+
+
+def _nc_ms(value: datetime) -> int:
+    """牛客日历接口的 startTime / endTime 是毫秒时间戳。"""
+    return int(value.timestamp() * 1000)
+
+
+def _nc_contest(contest_id, name, link, start, end=None) -> dict:
+    item = {"contestId": contest_id, "contestName": name, "startTime": _nc_ms(start)}
+    if link is not None:
+        item["link"] = link
+    if end is not None:
+        item["endTime"] = _nc_ms(end)
+    return item
+
+
+@pytest.fixture()
+def nc_no_network(monkeypatch):
+    """赛程抓取的真实网络通道一律炸掉，逼迫用例显式注入假 fetcher。"""
+    async def _boom(*args, **kwargs):
+        raise AssertionError("测试禁止真实联网，请注入假 fetcher")
+
+    monkeypatch.setattr(crawler, "_http_get_text", _boom)
+    monkeypatch.setattr(crawler, "_nowcoder_http_get_text", _boom)
+    return _boom
+
+
+def test_nowcoder_calendar_uses_link_field_over_contest_id():
+    """URL 取接口原生 link（并剥掉追踪参数），绝不能拿 contestId 拼路径。"""
+    payload = {"contests": [_nc_contest(
+        1143041, "牛客周赛 Round 78",
+        "https://ac.nowcoder.com/acm/contest/143041?from=acm_calendar",
+        datetime(2026, 11, 16, 19, 0, tzinfo=NC_TZ),
+        datetime(2026, 11, 16, 21, 0, tzinfo=NC_TZ))]}
+    item = crawler.parse_nowcoder(json.dumps(payload, ensure_ascii=False), NC_NOW)[0]
+    assert item["url"] == "https://ac.nowcoder.com/acm/contest/143041"
+    assert "1143041" not in item["url"]
+    assert item["start"] == "2026-11-16 19:00"
+    assert item["duration_minutes"] == 120
+
+
+def test_nowcoder_calendar_falls_back_to_contest_id_when_link_missing():
+    """仅在 link 缺失时才用 contestId 兼容回退。"""
+    payload = {"contests": [_nc_contest(
+        7001, "老接口比赛", None,
+        datetime(2026, 11, 16, 19, 0, tzinfo=NC_TZ),
+        datetime(2026, 11, 16, 21, 0, tzinfo=NC_TZ))]}
+    item = crawler.parse_nowcoder(json.dumps(payload, ensure_ascii=False), NC_NOW)[0]
+    assert item["url"] == "https://ac.nowcoder.com/acm/contest/7001"
+
+
+def test_nowcoder_calendar_keeps_started_but_running_contest():
+    """当天已开赛未结束的必须保留，上午已结束的丢弃。"""
+    running = _nc_contest(
+        1, "当日正在进行的赛", "https://ac.nowcoder.com/acm/contest/1?from=acm_calendar",
+        datetime(2026, 11, 15, 10, 0, tzinfo=NC_TZ),
+        datetime(2026, 11, 15, 12, 0, tzinfo=NC_TZ))
+    finished = _nc_contest(
+        2, "上午已结束的赛", "https://ac.nowcoder.com/acm/contest/2",
+        datetime(2026, 11, 15, 8, 0, tzinfo=NC_TZ),
+        datetime(2026, 11, 15, 9, 30, tzinfo=NC_TZ))
+    names = [item["name"] for item in crawler.parse_nowcoder(
+        json.dumps({"data": [running, finished]}, ensure_ascii=False), NC_NOW)]
+    assert names == ["当日正在进行的赛"]
+
+
+def test_nowcoder_calendar_without_end_allows_recent_start():
+    """没有 endTime 时允许回看 3 小时，远期赛程仍受窗口上限约束。"""
+    recent = _nc_contest(3, "刚开赛没给结束时间",
+                         "https://ac.nowcoder.com/acm/contest/3",
+                         NC_NOW - timedelta(hours=2))
+    stale = _nc_contest(4, "四小时前开的赛",
+                        "https://ac.nowcoder.com/acm/contest/4",
+                        NC_NOW - timedelta(hours=4))
+    far = _nc_contest(5, "超窗口的远期赛",
+                      "https://ac.nowcoder.com/acm/contest/5",
+                      NC_NOW + timedelta(days=30))
+    names = [item["name"] for item in crawler.parse_nowcoder(
+        json.dumps({"contests": [recent, stale, far]}, ensure_ascii=False), NC_NOW)]
+    assert names == ["刚开赛没给结束时间"]
+
+
+def test_nowcoder_calendar_urls_span_month_boundary():
+    """窗口跨月时同时取本月与下月，未跨月只取一个，避免漏抓下月初比赛。"""
+    cross = crawler._nowcoder_calendar_urls(
+        datetime(2026, 11, 25, 9, 0, tzinfo=NC_TZ), 14)
+    assert cross == [f"{NC_CALENDAR}2026-11", f"{NC_CALENDAR}2026-12"]
+    single = crawler._nowcoder_calendar_urls(
+        datetime(2026, 11, 5, 9, 0, tzinfo=NC_TZ), 14)
+    assert single == [f"{NC_CALENDAR}2026-11"]
+
+
+def test_fetch_contests_merges_calendar_months_and_dedupes(nc_no_network):
+    """跨月双请求结果合并后按名称+开始时间去重，边界那场不会重复。"""
+    nov_last = _nc_contest(11, "十一月末赛", "https://ac.nowcoder.com/acm/contest/11?from=acm_calendar",
+                           datetime(2026, 11, 29, 19, 0, tzinfo=NC_TZ),
+                           datetime(2026, 11, 29, 21, 0, tzinfo=NC_TZ))
+    dec_first = _nc_contest(12, "十二月初赛", "https://ac.nowcoder.com/acm/contest/12?from=acm_calendar",
+                            datetime(2026, 12, 1, 19, 0, tzinfo=NC_TZ),
+                            datetime(2026, 12, 1, 21, 0, tzinfo=NC_TZ))
+    dec_later = _nc_contest(13, "十二月中赛", "https://ac.nowcoder.com/acm/contest/13?from=acm_calendar",
+                            datetime(2026, 12, 2, 19, 0, tzinfo=NC_TZ),
+                            datetime(2026, 12, 2, 21, 0, tzinfo=NC_TZ))
+    urls: list[str] = []
+
+    async def nc_fetch(url):
+        urls.append(url)
+        if "month=2026-12" in url:
+            return json.dumps({"contests": [dec_first, dec_later]}, ensure_ascii=False)
+        return json.dumps({"contests": [nov_last, dec_first]}, ensure_ascii=False)
+
+    async def cf_fetch(_url):
+        return json.dumps({"status": "OK", "result": []})
+
+    # 11-20 + 14 天跨到 12 月，触发双月请求
+    result = asyncio.run(crawler.fetch_contests(
+        datetime(2026, 11, 20, 10, 0, tzinfo=NC_TZ),
+        codeforces_fetch=cf_fetch, nowcoder_fetch=nc_fetch))
+    assert urls == [f"{NC_CALENDAR}2026-11", f"{NC_CALENDAR}2026-12"]
+    assert [item["name"] for item in result["nowcoder"]] == ["十一月末赛", "十二月初赛", "十二月中赛"]
+    assert len({item["url"] for item in result["nowcoder"]}) == 3
+    assert result["errors"] == []
+
+
+def test_fetch_contests_falls_back_to_calendar_page_html(nc_no_network, caplog):
+    """日历接口返回非 JSON 时降级抓赛程页，并留下 warning。"""
+    calls: list[str] = []
+
+    async def nc_fetch(url):
+        calls.append(url)
+        return ('<li><a href="/acm/contest/143041">牛客周赛 Round 78</a>'
+                '<em>2026-11-16 19:00-21:00</em></li>')
+
+    async def cf_fetch(_url):
+        return json.dumps({"status": "OK", "result": []})
+
+    with caplog.at_level("WARNING", logger=crawler.logger.name):
+        result = asyncio.run(crawler.fetch_contests(
+            NC_NOW, codeforces_fetch=cf_fetch, nowcoder_fetch=nc_fetch))
+    assert [item["name"] for item in result["nowcoder"]] == ["牛客周赛 Round 78"]
+    assert result["nowcoder"][0]["url"] == "https://ac.nowcoder.com/acm/contest/143041"
+    assert calls[0] == f"{NC_CALENDAR}2026-11"
+    assert calls[-1] == crawler.NOWCODER_CONTEST_PAGE
+    assert any("降级" in record.getMessage() for record in caplog.records)
+
+
+def test_nowcoder_calendar_page_fallback_keeps_recent_started_contest(nc_no_network):
+    """降级到 HTML 赛程页时也不能把当天刚开赛的比赛过滤掉。"""
+    stale = datetime(2026, 11, 15, 14, 0, tzinfo=NC_TZ).strftime("%Y-%m-%d %H:%M")
+    recent = (NC_NOW - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M")
+    html = (f'<li><a href="/acm/contest/21">下午场</a><em>{stale} 19:00-21:00</em></li>'
+            f'<li><a href="/acm/contest/22">上午场</a><em>{recent} 10:30-12:00</em></li>')
+
+    async def nc_fetch(_url):
+        return html
+
+    async def cf_fetch(_url):
+        return json.dumps({"status": "OK", "result": []})
+
+    result = asyncio.run(crawler.fetch_contests(
+        NC_NOW, codeforces_fetch=cf_fetch, nowcoder_fetch=nc_fetch))
+    names = [item["name"] for item in result["nowcoder"]]
+    assert "上午场" in names
+
+
+def test_nowcoder_fetch_sends_referer_header(monkeypatch):
+    """默认抓取通道必须带上来源页 Referer。"""
+    captured: dict = {}
+
+    async def fake_fetch(url, headers=None):
+        captured["url"] = url
+        captured["headers"] = headers
+        return "{}"
+
+    monkeypatch.setattr(crawler.fetcher, "fetch_text_with_extra_headers", fake_fetch)
+    asyncio.run(crawler._nowcoder_http_get_text(f"{NC_CALENDAR}2026-11"))
+    assert captured["url"] == f"{NC_CALENDAR}2026-11"
+    assert captured["headers"] == {"Referer": "https://ac.nowcoder.com/acm/contest/vip-index"}
+
+
+@pytest.mark.parametrize("headers", [
+    {"Referer": "https://a.example.com/\r\nX-Injected: 1"},
+    {"Bad Name": "https://a.example.com/"},
+])
+def test_fetch_text_with_extra_headers_rejects_illegal_header(headers):
+    """附加请求头必须挡住 CRLF 注入与非法头名。"""
+    with pytest.raises(FetchError):
+        asyncio.run(crawler.fetcher.fetch_text_with_extra_headers(
+            "https://ac.nowcoder.com/acm/calendar/contest?token=&month=2026-11", headers))

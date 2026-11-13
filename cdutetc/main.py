@@ -455,6 +455,19 @@ class ACMBot:
             max_instances=1,
             coalesce=True,
         )
+        if config.AUTO_CONTEST_CRAWL_ENABLED:
+            # 外部赛程同步单独成 job：启动即同步一次（重启后不必干等到第二天），
+            # 之后每天同一时刻再拉；否则机器人重启当天会一直缺赛程。
+            sched.add_job(
+                self._contest_crawl_job,
+                "cron",
+                hour=config.CONTEST_CRAWL_HOUR,
+                minute=config.CONTEST_CRAWL_MINUTE,
+                id="contest-crawl",
+                next_run_time=now,
+                max_instances=1,
+                coalesce=True,
+            )
         if config.DAILY_DIGEST_ENABLED:
             # 每日固定时刻推送一次聚合晨报；coalesce 保证服务重启/休眠后只补一次。
             sched.add_job(
@@ -1440,13 +1453,18 @@ class ACMBot:
     async def _crawl_job(self):
         """周期抓取公共来源（默认关闭）：变化检测 → 待审更新，不自动广播。
 
-        来源抓取之后，若开启了赛程自动抓取，再顺带抓 CF / 牛客赛程；
-        两段各自兜底，任一段异常都不影响另一段，也不会让调度器崩掉。
+        外部赛程抓取已拆到 ``_contest_crawl_job``，两者互不影响。
         """
         try:
             await crawler.run_fetch(send_group=self._send_group_result)
         except Exception:  # noqa: BLE001 - 网络/解析/DB 异常统一兜底，不逸出调度器
             logger.exception("[抓取] 本轮调度执行异常，跳过本轮等待下次触发")
+
+    async def _contest_crawl_job(self):
+        """抓取 CF / 牛客外部赛程：启动时与每日固定时刻各调一次。
+
+        赛程抓取失败只记日志，任何异常都不逸出调度器。
+        """
         if not config.AUTO_CONTEST_CRAWL_ENABLED:
             return
         try:
