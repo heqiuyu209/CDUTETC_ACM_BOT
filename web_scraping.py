@@ -205,12 +205,15 @@ def get_all_links_playwright(url: str):
         return []
 
     html = ""
+    # 浏览器可能跟随重定向，相对链接必须以跳转后的地址为基准解析
+    final_url = url
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         try:
             page = browser.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=20000)
             page.wait_for_timeout(2000)
+            final_url = page.url or url
             html = page.content()
         except Exception as e:
             logger.error(f"网页加载失败: {e}")
@@ -218,7 +221,7 @@ def get_all_links_playwright(url: str):
         finally:
             browser.close()
 
-    all_links = parse_html(html, url)
+    all_links = parse_html(html, final_url)
     if not all_links:
         return []
 
