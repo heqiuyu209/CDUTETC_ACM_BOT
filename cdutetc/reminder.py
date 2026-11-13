@@ -1,7 +1,7 @@
 """定时提醒模块：周期检查临近比赛/活动，发送提醒并持久化去重。
 
 - 业务时间统一为北京时间 Asia/Shanghai（zoneinfo）。
-- 阶段一比赛提醒（contests/reminders 表，兼容保留）：
+- 阶段一比赛提醒（contests/reminders 表，兼容投递）：
   去重键 = (群, 比赛, 提醒类型, 目标时间)；比赛时间被修改后键变化，可重新提醒。
 - v2 通用提醒（reminder_deliveries 表）：
   覆盖「征集报名截止」「公共比赛报名截止/开赛」「周期课程具体开课实例」，
@@ -25,7 +25,9 @@ from cdutetc.database import (
     delivery_dedup_key,
     finish_delivery,
     list_competitions,
+    list_contests,
     list_training_sessions,
+    mark_reminded,
     record_delivery_success,
     reconcile_deliveries,
     training_occurrence_times,
@@ -331,6 +333,28 @@ def build_training_reminders(sessions: list[dict], now: datetime) -> list[dict]:
     return out
 
 
+def build_legacy_contest_reminders(contests: list[dict], now: datetime) -> list[dict]:
+    """沿用旧赛事单次提醒窗口，未归属或未授权的记录不发送。"""
+    out = []
+    labels = {"reg_deadline": "报名截止", "contest_time": "比赛开始"}
+    for contest in contests:
+        gid = contest.get("group_id") or ""
+        if not gid or gid not in config.ALLOWED_GROUPS:
+            continue
+        for field in config.REMIND_TYPES:
+            target = _parse_time(contest.get(field) or "")
+            if target is None or not timedelta(0) < target - now <= timedelta(hours=config.REMIND_BEFORE_HOURS):
+                continue
+            out.append({
+                "group_id": gid, "obj_type": "legacy_contest", "obj_id": contest["id"],
+                "remind_type": field, "target_str": contest[field],
+                "text": (f"【提醒】{contest['name']} {labels[field]}时间：{contest[field]}\n"
+                         f"形式：{contest.get('mode') or '待定'}  地点：{contest.get('location') or '待定'}\n"
+                         "请同学们做好准备，记得按时参加！"),
+            })
+    return out
+
+
 async def check_general_reminders(send_group, now: datetime | None = None,
                                   max_attempts: int = _DELIVERY_MAX_ATTEMPTS) -> int:
     """复核计划、原子领取并发送；成功回执 sent，失败有界重试。
@@ -356,6 +380,8 @@ async def check_general_reminders(send_group, now: datetime | None = None,
     items = [item for item in build_general_reminders(
         _list_collections_all(), list_competitions(status="confirmed"), current_time())
         if group_switch_enabled(item["group_id"], "contest_remind_enabled")]
+    items.extend(item for item in build_legacy_contest_reminders(list_contests(), current_time())
+                 if group_switch_enabled(item["group_id"], "contest_remind_enabled"))
     # 按群取课程，不按当前是否已生效过滤；首次开课前同样需要提前提醒。
     sessions = [session for gid in sorted(config.ALLOWED_GROUPS)
                 for session in list_training_sessions(gid, active_only=False)]
@@ -392,6 +418,11 @@ async def check_general_reminders(send_group, now: datetime | None = None,
             continue
         if ok and receipt_saved:
             sent += 1
+            if item["obj_type"] == "legacy_contest":
+                try:
+                    mark_reminded(item["group_id"], item["obj_id"], item["remind_type"], item["target_str"])
+                except sqlite3.Error:
+                    logger.exception("旧提醒标记写入失败，已保留成功回执: %s", key)
         elif not ok:
             logger.warning("通用提醒发送失败: %s", key)
     if sent:
