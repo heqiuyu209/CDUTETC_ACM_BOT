@@ -41,6 +41,8 @@ class DeliveryCode(str, Enum):
     AUTHENTICATION = "authentication"
     FORBIDDEN = "forbidden"
     ACTIVE_FORBIDDEN = "active_forbidden"
+    QUOTA_EXHAUSTED = "quota_exhausted"
+    NETWORK_ERROR = "network_error"
     NOT_FOUND = "not_found"
     RATE_LIMITED = "rate_limited"
     PLATFORM_ERROR = "platform_error"
@@ -55,6 +57,10 @@ class DeliveryMode(str, Enum):
     PASSIVE = "passive"
 
 
+# 官方主动消息配额/频次耗尽错误码；命中后必须停止重试并熔断该群。
+_QUOTA_EXHAUSTED_CODES = frozenset({11253, 11263})
+
+
 _SAFE_HINTS = {
     DeliveryCode.SENT: "[sent] 平台已确认接受消息。",
     DeliveryCode.DISABLED: "[disabled] 主动通知已关闭。",
@@ -65,6 +71,8 @@ _SAFE_HINTS = {
     DeliveryCode.AUTHENTICATION: "[authentication] 平台鉴权失败，请检查机器人凭证和授权状态。",
     DeliveryCode.FORBIDDEN: "[forbidden] 平台拒绝发送，请检查目标会话权限和机器人主动消息设置。",
     DeliveryCode.ACTIVE_FORBIDDEN: "[active_forbidden] QQ平台拒绝主动消息（40034105）。请检查目标群/会话的“允许主动发送/主动通知”和机器人权限，修复后用 /通知测试 验证。",
+    DeliveryCode.QUOTA_EXHAUSTED: "[quota_exhausted] QQ平台主动消息配额已耗尽（11253/11263），今日已停止重试并熔断该群；次日自动恢复尝试，也可用 /通知测试 验证。",
+    DeliveryCode.NETWORK_ERROR: "[network_error] 发信超时(10s)或网络异常，消息结果未确认；请检查网络与机器人连接后核对目标会话。",
     DeliveryCode.NOT_FOUND: "[not_found] 平台未找到目标会话，请确认机器人仍在目标群或会话有效。",
     DeliveryCode.RATE_LIMITED: "[rate_limited] 平台频率或配额限制了发送，请查看平台配额后再处理。",
     DeliveryCode.PLATFORM_ERROR: "[platform_error] 平台服务暂时无法确认发送结果，请检查平台状态。",
@@ -132,6 +140,11 @@ def _platform_error_code(error: BaseException) -> int | None:
         normalized = re.sub(r"\s+", "", payload).replace("，", ",")
         if normalized in ("主动消息失败,无权限", "主动消息发送失败,无权限"):
             return 40034105
+        # 官方主动消息配额/频次错误有时只在 msgs 文本里出现，兜底识别。
+        if len(normalized) <= 200:
+            for quota_code in _QUOTA_EXHAUSTED_CODES:
+                if str(quota_code) in normalized:
+                    return quota_code
     return None
 
 
@@ -141,6 +154,9 @@ def classify_exception(error: BaseException) -> DeliveryCode:
     platform_code = _platform_error_code(error)
     if platform_code == 40034105:
         return DeliveryCode.ACTIVE_FORBIDDEN
+    # 11253/11263：官方主动消息配额/频次已耗尽，必须熔断，不能当未知错误反复重试。
+    if platform_code in _QUOTA_EXHAUSTED_CODES:
+        return DeliveryCode.QUOTA_EXHAUSTED
     if platform_code == 40034100:
         return DeliveryCode.RATE_LIMITED
     status = getattr(error, "status", None)

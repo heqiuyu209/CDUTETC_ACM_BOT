@@ -38,7 +38,10 @@ async def bot(memory_db, monkeypatch):
     client = main.ACMBot(SimpleNamespace(send_group_msg_result=AsyncMock(
         return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
     )))
-    monkeypatch.setattr(client, "_send_group", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        client, "_send_group_result",
+        AsyncMock(return_value=SimpleNamespace(ok=False)),
+    )
     return client
 
 
@@ -68,7 +71,7 @@ async def test_weekly_generation_stores_concrete_beijing_window(bot, memory_db):
     assert memory_db.execute(
         "SELECT week_start, competition_id FROM weekly_contest_runs"
     ).fetchall() == [("2026-10-26", competition["id"])]
-    bot._send_group.assert_not_awaited()
+    bot._send_group_result.assert_not_awaited()
 
 
 async def test_same_week_remains_idempotent_after_restart_and_amendment(bot, memory_db, monkeypatch):

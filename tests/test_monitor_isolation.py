@@ -77,7 +77,8 @@ async def test_each_source_failure_preserves_baseline_and_continues(monitored, m
             if stage == "extract-shape":
                 return None
             if stage == "schema":
-                return {"name": "bad", "contest_time": []}, None
+                # 列表已由提取器归一化为字符串，这里用非法数字类型模拟结构校验失败
+                return {"name": "bad", "contest_time": 123}, None
         return await extract_ok(text)
 
     if stage == "lookup":

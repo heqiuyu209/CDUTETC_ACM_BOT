@@ -26,18 +26,23 @@ import logging
 import re
 import sqlite3
 import time
+import types
 from dataclasses import replace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from cdutetc.clients.base import BaseBotClient, capabilities_of
 from cdutetc.clients.onebot import OneBotClient, OneBotMessage
 
+from cdutetc import admin_session
 from cdutetc import commands
 from cdutetc import config
+from cdutetc.alias_helper import format_group_name, format_user_name
 from cdutetc import content_filter
 from cdutetc import crawler
+from cdutetc import daily_digest
 from cdutetc import database as db
 from cdutetc import llm
 from cdutetc import roles
@@ -47,14 +52,25 @@ from cdutetc.contest_fields import map_competition_info
 from cdutetc.database import create_published_competition_once, init_db
 from cdutetc.fetcher import FetchError, fetch_text
 from cdutetc.llm import extract_contest, normalize_time
-from cdutetc.publish_text import is_timed_contest_announcement, parse_simple_publication
-from cdutetc.reminder import check_general_reminders, check_reminders, check_contest_start_reminders
+from cdutetc.publish_text import (
+    extract_declared_contest_time,
+    extract_declared_tracks,
+    is_timed_contest_announcement,
+    parse_simple_publication,
+)
+from cdutetc.reminder import (
+    check_contest_start_reminders,
+    check_custom_reminders,
+    check_general_reminders,
+)
 from cdutetc.utils import (
     admin_group_id,
     can_manage_group,
     extract_url,
+    is_addressed_to_bot,
     is_allowed_group,
     match_publish_command,
+    message_mentions,
     is_super_admin,
     mentioned_user_ids,
     parse_command,
@@ -68,6 +84,28 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 _reply_sequence = contextvars.ContextVar("qq_reply_sequence", default=0)
 _private_reply_context = contextvars.ContextVar("qq_private_reply_context", default=None)
+
+# 官方协议严格限制被动回复 msg_seq 在 [1,5]，第 6 条会被平台判为 INVALID_REQUEST。
+_MAX_PASSIVE_REPLY_SEQ = 5
+# 溢出文本合并到最后一帧后的最大字符数，避免超出平台单条长度上限。
+_MERGED_REPLY_MAX_CHARS = 1500
+
+
+def _clamp_reply_seq(seq: int) -> int:
+    """被动回复序号硬封顶：1 <= seq <= 5。"""
+    return max(1, min(int(seq), _MAX_PASSIVE_REPLY_SEQ))
+
+
+def _merge_group_reply_texts(texts: list[str]) -> list[str]:
+    """同一条入站消息的同群回复超过平台上限时，把溢出部分合并进最后一帧。"""
+    if len(texts) <= _MAX_PASSIVE_REPLY_SEQ:
+        return list(texts)
+    head = list(texts[:_MAX_PASSIVE_REPLY_SEQ - 1])
+    merged = "\n".join(texts[_MAX_PASSIVE_REPLY_SEQ - 1:])
+    if len(merged) > _MERGED_REPLY_MAX_CHARS:
+        merged = merged[:_MERGED_REPLY_MAX_CHARS]
+    head.append(merged + "\n[消息过长已折叠]")
+    return head
 
 
 def _notification_summary(sent: int, total: int) -> str:
@@ -185,6 +223,75 @@ def _build_publish_receipt(info: dict, *, status: str, ref: int) -> str:
     return "\n".join(lines)
 
 
+def _runtime_teacher_record(account_id: str) -> dict | None:
+    """在动态老师名单里按 openid 精确匹配，命中才返回记录。
+
+    只做精确相等，绝不做前缀/模糊匹配——展示身份宁可落到兜底，也不能张冠李戴。
+    """
+    if not account_id:
+        return None
+    try:
+        teachers = db.list_runtime_teachers() or []
+    except (sqlite3.Error, ValueError):
+        return None
+    for record in teachers:
+        if str(record.get("user_id") or "").strip() == account_id:
+            return record
+    return None
+
+
+def _format_submitter(submitted_by: str) -> str:
+    """实时解析比赛发布人的展示文案（备注名 → 超管 → 老师 → 兜底）。
+
+    严格只认「当前这条消息触发者」的真实账号标识（群聊 member_id / 私聊 uid），
+    严禁回退成群默认负责老师：身份漂移会让待确认卡片把超管记成老师。
+    """
+    account_id = (submitted_by or "").strip()
+    if not account_id:
+        return "未知成员（无账号标识）"
+    short = account_id[:8]
+
+    try:
+        label_name = (db.get_account_label("user", account_id) or "").strip()
+    except (sqlite3.Error, ValueError):
+        label_name = ""
+    try:
+        alias = db.get_entity_alias("user", account_id) or {}
+    except (sqlite3.Error, ValueError):
+        alias = {}
+    alias_name = str(alias.get("display_name") or "").strip()
+    alias_qq = str(alias.get("numeric_id") or "").strip()
+
+    # 1) 超管身份锁定：有备注展示备注，没有就展示超级管理员；不读老师名单覆盖
+    if is_super_admin(account_id):
+        if label_name:
+            return f"{label_name}（超管）"
+        return f"超级管理员（ID: {short}...）"
+
+    # 2) 已绑定老师：runtime_teachers 里存在精确 openid 记录
+    teacher = _runtime_teacher_record(account_id)
+    if teacher is not None:
+        teacher_name = (
+            label_name
+            or alias_name
+            or str(teacher.get("note") or "").strip()
+        )
+        teacher_qq = alias_qq
+        if not teacher_name:
+            teacher_name = f"老师（ID: {short}...）"
+        if teacher_qq:
+            return f"{teacher_name}（老师, QQ: {teacher_qq}）"
+        return f"{teacher_name}（老师）"
+
+    # 3) 兜底：既不是超管也不在老师名单；有备注名/已绑 QQ 时仍展示，避免信息丢失
+    display_name = label_name or alias_name
+    if display_name and alias_qq:
+        return f"{display_name}（QQ: {alias_qq}）"
+    if display_name:
+        return f"{display_name}（ID: {short}...）"
+    return f"未知成员（ID: {short}...）"
+
+
 def _build_publish_review(pending: dict) -> str:
     """构造发给超管的待确认申请正文（含全部已整理字段与查重提示）。"""
     info = json.loads(pending.get("fields_json") or "{}")
@@ -201,8 +308,8 @@ def _build_publish_review(pending: dict) -> str:
         lines.append(f"{label}：{value or '未提供'}")
     if (info.get("official_time") or "").strip():
         lines.append(f"提醒计划：同意后安排开始前 {_format_remind_offsets()}的未来节点，已错过的不补发")
-    lines.append(f"来源群：{db.describe_account('group', pending.get('group_id') or '')}")
-    lines.append(f"提交人：{db.describe_account('user', pending.get('submitted_by') or '')}")
+    lines.append(f"来源群：{format_group_name(pending.get('group_id') or '')}")
+    lines.append(f"提交人：{_format_submitter(pending.get('submitted_by') or '')}")
     if pending.get("duplicate_note"):
         lines.append(f"⚠ 查重提示：{pending['duplicate_note']}")
     else:
@@ -290,7 +397,7 @@ def _weekly_contest_window(now: datetime):
 class ACMBot:
     """CDUTETC ACM 机器人：共用业务路由与双协议发送接口。"""
 
-    def __init__(self, client: OneBotClient | None = None):
+    def __init__(self, client: BaseBotClient | None = None):
         self.client = client
         self.sched: AsyncIOScheduler | None = None
         # 五层防护-4：频率防刷限流器（单用户滑动窗口，参数来自 config）
@@ -317,12 +424,16 @@ class ACMBot:
         now = now or datetime.now(tz)
         now = now.replace(tzinfo=tz) if now.tzinfo is None else now.astimezone(tz)
         sched = AsyncIOScheduler(timezone=config.TZ_NAME)
+        # legacy 比赛提醒（contests/reminders 旧表）已下线；此处只跑通用提醒
+        # （征集截止 / 公共比赛 / 课程开课），扫描节奏沿用原配置项。
         sched.add_job(
-            self._remind_job,
+            self._general_remind_job,
             "interval",
             minutes=config.REMIND_CHECK_INTERVAL_MINUTES,
-            id="remind-check",
+            id="general-remind-check",
             next_run_time=now,
+            max_instances=1,
+            coalesce=True,
         )
         sched.add_job(
             self._contest_remind_job,
@@ -333,12 +444,28 @@ class ACMBot:
             max_instances=1,
             coalesce=True,
         )
+        # 公共来源抓取改为每天固定时刻一次（默认 08:05，可用 ACM_CONTEST_CRAWL_TIME 覆盖）；
+        # FETCH_MIN_INTERVAL_MINUTES 只约束手动 /抓取 的触发频率，不再驱动定时任务。
         sched.add_job(
             self._crawl_job,
-            "interval",
-            minutes=config.FETCH_MIN_INTERVAL_MINUTES,
+            "cron",
+            hour=config.CONTEST_CRAWL_HOUR,
+            minute=config.CONTEST_CRAWL_MINUTE,
             id="source-crawl",
+            max_instances=1,
+            coalesce=True,
         )
+        if config.DAILY_DIGEST_ENABLED:
+            # 每日固定时刻推送一次聚合晨报；coalesce 保证服务重启/休眠后只补一次。
+            sched.add_job(
+                self._daily_digest_job,
+                "cron",
+                hour=config.DAILY_DIGEST_HOUR,
+                minute=config.DAILY_DIGEST_MINUTE,
+                id="daily-digest",
+                max_instances=1,
+                coalesce=True,
+            )
         if config.WEEKLY_CONTEST_ENABLED:
             _, start, _ = _weekly_contest_window(now)
             # 提醒窗口打开前一个扫描周期预生成，避免开赛时才生成及同刻调度竞争。
@@ -354,14 +481,17 @@ class ACMBot:
                 hour=generation_at.hour,
                 minute=generation_at.minute,
                 id="weekly-contest",
+                max_instances=1,
+                coalesce=True,
             )
             await self._weekly_contest_job(now=now)
         sched.start()
         self.sched = sched
         logger.info(
-            "机器人已上线：每 %d 分钟检查提醒，每 %d 分钟抓取公共来源%s",
+            "机器人已上线：每 %d 分钟检查提醒，每天 %02d:%02d 抓取一次公共来源%s",
             config.REMIND_CHECK_INTERVAL_MINUTES,
-            config.FETCH_MIN_INTERVAL_MINUTES,
+            config.CONTEST_CRAWL_HOUR,
+            config.CONTEST_CRAWL_MINUTE,
             "，自动周赛已开启（%s %s-%s）" % (
                 "周日" if config.WEEKLY_CONTEST_WEEKDAY == 6 else f"星期{config.WEEKLY_CONTEST_WEEKDAY + 1}",
                 config.WEEKLY_CONTEST_START,
@@ -378,6 +508,16 @@ class ACMBot:
         try:
             uid = message.user_id
             content = message.content or ""
+            # 私聊作用域闸门：只有超管能进管理链路，老师与普通成员一律在这里返回，
+            # 避免老师借私聊拿到跨群配置/比赛，也避免后续审批与命令被误触发。
+            if not is_super_admin(uid):
+                if content.strip().startswith("/"):
+                    await self._send_private_result(
+                        uid, "⛔ 私聊管理仅对超级管理员开放，请在已授权群内使用命令")
+                else:
+                    await self._send_private_result(
+                        uid, "你好～群内问题请在群里 @我，私聊管理仅向超管开放。")
+                return
             if config.DEBUG_LOG_IDENTITY:
                 logger.info("[私聊][调试] user_id=%s content=%s", uid, content[:50])
             # 超管私聊回复「同意/通过/拒绝 <编号>」处理待确认的发布申请
@@ -388,38 +528,92 @@ class ACMBot:
             if content.strip().startswith("/") and is_super_admin(uid):
                 cmd, args = parse_command(content)
                 from cdutetc import group_admin
+                # 目标群会话指令最先处理：它们决定后续业务指令作用到哪个群
+                if cmd in commands.PRIVATE_SESSION_COMMANDS:
+                    for reply in commands.handle_session_command(cmd, args, str(uid)) or []:
+                        if reply.get("text"):
+                            await self._send_private_result(uid, reply["text"])
+                    return
                 if cmd in group_admin.COMMANDS:
-                    replies = group_admin.handle_command(cmd, args, uid)
+                    # 已绑定目标群时，群配置类指令默认落到该群（不带参数的 /群配置 即查该群）；
+                    # 显式 /群配置 全部 属于跨群查询，仍按全局视角处理。
+                    bound = admin_session.get_active_group(str(uid)) or ""
+                    if "全部" in (args or ""):
+                        bound = ""
+                    # 私聊 /群配置 <序号> 解析成功后顺手锁定工作区（C5），后续业务指令
+                    # 无需再 /选群。仅处理候选列表序号，避免与「按群查询」只读语义混淆；
+                    # 且在本条指令执行之后绑定，保证本条查询仍按原作用域解析。
+                    replies = group_admin.handle_command(cmd, args, uid, bound)
+                    if cmd == "群配置":
+                        tokens = (args or "").split()
+                        if len(tokens) == 1 and tokens[0].isdigit():
+                            commands.bind_active_group(str(uid), tokens[0])
                     if any(reply.get("refresh_weekly") for reply in replies or []):
                         await self._weekly_contest_job()
-                    for reply in replies or []:
-                        await self._send_private(uid, reply["text"])
+                    # 私聊管理回执同样带工作区标牌，与业务指令出口保持一致
+                    for reply in commands.with_private_header(replies, str(uid)) or []:
+                        await self._send_private_result(uid, reply["text"])
+                    return
+                if cmd == "发布":
+                    # 超管私聊录入比赛：作用域=当前工作区群，抓取/提取/查重/入库全部复用
+                    # 群内 _handle_publish 链路，只是回执改走私聊，不在目标群刷屏。
+                    pub_group = admin_session.get_active_group(str(uid))
+                    if not pub_group:
+                        await self._send_private_result(
+                            uid,
+                            "还没有锁定工作区群，无法确定发布到哪个群。\n"
+                            "请先发送 /群配置 <序号> 选中目标群（/群配置 全部 可查看候选），"
+                            "再发送 /发布。",
+                        )
+                        return
+                    # 保留多行正文与链接：从原文里剥掉前缀命令词，不做任何摘要
+                    pub_text = content.strip()[3:].strip()
+                    if not pub_text:
+                        await self._send_private_result(
+                            uid,
+                            "用法：/发布 比赛名称 比赛时间（可附官网链接，支持多行）\n"
+                            f"本次将录入到工作区群 {pub_group}，所有回执只在当前私聊返回。",
+                        )
+                        return
+                    # 轻量消息对象：_handle_publish 只用到 group_id / id，
+                    # 另带 _private_uid 标记让 _safe_reply 改走私聊回执。
+                    priv_msg = types.SimpleNamespace(
+                        group_id=pub_group,
+                        user_id=uid,
+                        id=str(getattr(message, "id", "") or ""),
+                        _private_uid=uid,
+                    )
+                    await self._handle_publish(priv_msg, pub_text, pub_group, str(uid))
                     return
                 if cmd == "通知测试":
-                    await self._send_private(uid, await self._notification_test(uid, args))
+                    await self._send_private_result(uid, await self._notification_test(uid, args))
                     return
-                admin_gid = admin_group_id()
+                # 私聊绑定目标群后，业务指令按该群的单群视角执行（写库/查询/诊断都落到该群），
+                # 回执一律走私聊 _send_private_result，绝不向真实群发送任何消息。
+                active_group = admin_session.get_active_group(str(uid))
+                admin_gid = active_group or admin_group_id()
                 if not admin_gid:
                     # 引导场景：一个群都没配时，仍要允许超管用 /加群 把第一个群加进来，
                     # 否则会陷入“没群 → 不能用命令 → 永远加不了群”的死锁。
                     cmd, _ = parse_command(content)
                     if cmd not in _GROUP_FREE_COMMANDS:
-                        await self._send_private(
+                        await self._send_private_result(
                             uid,
                             "未配置允许群，无法定位管理群（可用 /加群 <群号> 添加，"
                             "或设置 ACM_ADMIN_GROUP / ACM_ALLOWED_GROUPS）",
                         )
                         return
-                replies = await commands.handle_command(content, admin_gid, uid)
+                replies = await commands.handle_command(
+                    content, admin_gid, uid, private=True, active_group=active_group)
                 for reply in replies or []:
                     if reply.get("text"):
-                        await self._send_private(uid, reply["text"])
+                        await self._send_private_result(uid, reply["text"])
                 return
             from cdutetc import group_admin
             if is_super_admin(uid):
-                await self._send_private(uid, group_admin.answer_private(content, uid))
+                await self._send_private_result(uid, group_admin.answer_private(content, uid))
             else:
-                await self._send_private(uid, "你好～群内问题请在群里 @我，私聊管理仅向超管开放。")
+                await self._send_private_result(uid, "你好～群内问题请在群里 @我，私聊管理仅向超管开放。")
         except Exception:
             logger.exception("私聊处理失败 [%s]", AppErrorCode.INTERNAL)
         finally:
@@ -439,7 +633,7 @@ class ACMBot:
         note = (match.group("note") or "").strip()
         pending = db.list_pending_publications()
         if not pending:
-            await self._send_private(uid, "当前没有待确认的发布申请。")
+            await self._send_private_result(uid, "当前没有待确认的发布申请。")
             return True
         if pid_text:
             pid = int(pid_text)
@@ -450,31 +644,37 @@ class ACMBot:
             for item in pending:
                 lines.append(f"#{item['id']} {item['name'] or '未命名'}｜{item['official_time'] or '时间待定'}")
             lines.append("例如：同意 3")
-            await self._send_private(uid, "\n".join(lines))
+            await self._send_private_result(uid, "\n".join(lines))
             return True
         try:
             if approve:
                 cid, created = db.approve_pending_publication(pid, operator=uid)
                 pending_item = db.get_pending_publication(pid) or {}
+                submitter_text = _format_submitter(pending_item.get("submitted_by") or "")
                 if created:
-                    await self._send_private(
+                    logger.info(
+                        "发布申请 #%s 已入库为比赛 #%s｜提交人=%s｜审批人=%s",
+                        pid, cid, submitter_text, uid,
+                    )
+                    await self._send_private_result(
                         uid, f"已入库：#{cid} {pending_item.get('name') or ''}。"
+                        f"提交人：{submitter_text}。"
                         f"已自动安排开赛前 {_format_remind_offsets()}的未来有效节点；"
                         "时间未定或已过节点不建计划。正在通知目标群。"
                     )
                     await self._notify_publish_group(pending_item, cid, uid)
                 else:
-                    await self._send_private(
+                    await self._send_private_result(
                         uid, f"该比赛已存在（编号 {cid}），未重复入库；"
                         "通知范围和未来提醒计划已按本次申请同步。"
                     )
             else:
                 if not db.reject_pending_publication(pid, operator=uid, note=note):
-                    await self._send_private(uid, f"申请 #{pid} 已处理过，无需重复操作。")
+                    await self._send_private_result(uid, f"申请 #{pid} 已处理过，无需重复操作。")
                     return True
-                await self._send_private(uid, f"已拒绝申请 #{pid}，未入库。")
+                await self._send_private_result(uid, f"已拒绝申请 #{pid}，未入库。")
         except ValueError:
-            await self._send_private(uid, safe_error_hint(AppErrorCode.VALIDATION))
+            await self._send_private_result(uid, safe_error_hint(AppErrorCode.VALIDATION))
         return True
 
     async def _notify_publish_group(self, pending_item: dict, cid: int, operator_id: str = "") -> None:
@@ -492,7 +692,7 @@ class ACMBot:
         if failures:
             codes = sorted({getattr(result.code, "value", str(result.code)) for result in failures})
             logger.warning("比赛 #%s 群通知结果失败码=%s", cid, ",".join(codes))
-            await self._send_private(
+            await self._send_private_result(
                 operator_id,
                 f"比赛 #{cid} 已获批并保存提醒计划，但群通知未全部确认送达："
                 + "、".join(f"[{code}]" for code in codes),
@@ -514,21 +714,35 @@ class ACMBot:
                     (message.content or "")[:50],
                 )
             if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
+                text = strip_at(message.content or "")
+                cmd, _ = parse_command(text)
+                member_id = self._extract_member_id(message)
+                addressed = is_addressed_to_bot(message, self.bot_identity)
+                targets = {item["id"] for item in message_mentions(message) if item["id"]}
+                if (cmd == "认领此群" and is_super_admin(member_id)
+                        and (addressed or (not config.GROUP_REQUIRE_AT and not targets))):
+                    replies = await commands.handle_command(text, group_id, member_id)
+                    for reply in replies or []:
+                        if reply.get("text"):
+                            if self.supports_passive_reply and not getattr(message, "id", ""):
+                                continue
+                            seq = _clamp_reply_seq(_reply_sequence.get() + 1)
+                            _reply_sequence.set(seq)
+                            await notifications.send_group(
+                                self.client, group_id, reply["text"],
+                                reply_to=str(getattr(message, "id", "") or ""), reply_seq=seq,
+                            )
+                    return
                 logger.info("非授权群消息已忽略: %s", group_id)
                 await self._notice_unauthorized_group(message, group_id)
                 return
-            targets = mentioned_user_ids(message.content)
-            # self_id 是当前连接账号的真实 QQ 号，最可信；ACM_BOT_QQ 只在
-            # 事件没带 self_id 时兜底。顺序反了会导致配错 BOT_QQ 后
-            # 所有 @ 都不被识别、普通提问被静默丢弃。
-            self_id = str(message.raw.get("self_id") or "")
-            bot_qq = self_id or config.BOT_QQ
-            # 官方接入层根据事件类型或平台 is_you 标记判断 @；
-            # OneBot 则靠 CQ 码解析，两条路径都保留群内喊话要求。
-            addressed = (
-                getattr(message, "always_addressed", False)
-                or (bool(bot_qq) and bot_qq in targets)
-            )
+            # 本机账号优先取客户端上报的真实标识，ACM_BOT_QQ 只作兜底。
+            # 顺序反了会导致配错 BOT_QQ 后所有 @ 都不被识别、普通提问被静默丢弃。
+            bot_qq = self.bot_identity
+            # 统一读适配层规范化的 message.mentions：官方协议采信平台 is_you，
+            # OneBot 用 CQ 码里的 QQ 号与自身上报账号比对。
+            addressed = is_addressed_to_bot(message, bot_qq)
+            targets = {item["id"] for item in message_mentions(message) if item["id"]}
             # 带 @ 的消息只有指向本机器人时才受理，包括发给他人的命令。
             if targets and not addressed:
                 logger.info(
@@ -588,6 +802,10 @@ class ACMBot:
                         logger.info("识别为发布比赛意图，转发布流程")
                         await self._handle_publish(message, text, group_id, member_id)
                         return
+                # 群开关闸门：问答关闭后不再自动回答自由文本，命令仍照常执行
+                if not db.group_switch_enabled(group_id, "qa_enabled"):
+                    logger.info("本群问答开关已关闭，跳过自动回答")
+                    return
                 replies = await commands.handle_non_command_message(
                     text, group_id, member_id, staff=can_manage_group(member_id)
                 )
@@ -605,15 +823,38 @@ class ACMBot:
             cross_sent = 0
             cross_total = 0
             admin_notice_texts = []
+            same_group_texts = [
+                reply["text"] for reply in (replies or [])
+                if reply.get("text") and reply.get("group_id", group_id) == group_id
+            ]
+            # 官方协议被动回复最多 5 条：超出的同群文本先合并进最后一帧再发，
+            # 严禁直接发起第 6 条 _safe_reply（会被拒为 INVALID_REQUEST）。
+            # OneBot 无此约束，保持原有逐条回复行为。
+            if self.supports_passive_reply:
+                merged_texts = _merge_group_reply_texts(same_group_texts)
+                # 被动搭便车：只读查询的被动回复尾部追加一条最紧急待办，
+                # 零消耗主动额度；单群冷却与内容提取都在命令层统一处理。
+                if merged_texts and config.DAILY_DIGEST_PIGGYBACK_ENABLED:
+                    # 出错/无权限的回复不搭车：先把问题讲清楚，别混入广告式提示。
+                    failed = any(reply.get("error_code") for reply in (replies or []))
+                    if not failed and cmd in commands.PIGGYBACK_COMMANDS:
+                        merged_texts[-1] = commands.append_piggyback_notice(
+                            group_id, merged_texts[-1]
+                        )
+            else:
+                merged_texts = same_group_texts
+            merged_cursor = 0
             for reply in replies:
                 if not reply.get("text"):
                     continue
                 target_group = reply.get("group_id", group_id)
                 if target_group == group_id:
-                    await self._safe_reply(message, reply["text"])
+                    if merged_cursor < len(merged_texts):
+                        await self._safe_reply(message, merged_texts[merged_cursor])
+                        merged_cursor += 1
                 else:
                     cross_total += 1
-                    if await self._send_group(target_group, reply["text"]):
+                    if (await self._send_group_result(target_group, reply["text"])).ok:
                         cross_sent += 1
                 if reply.get("notify_super_admin"):
                     admin_notice_texts.append(reply["text"])
@@ -622,7 +863,7 @@ class ACMBot:
                 sent = 0
                 for admin in sorted(config.SUPER_ADMIN):
                     try:
-                        if await self._send_private(admin, notice):
+                        if (await self._send_private_result(admin, notice)).ok:
                             sent += 1
                     except Exception:
                         logger.warning("管理变更超管确认发送异常", exc_info=True)
@@ -647,24 +888,49 @@ class ACMBot:
 
     # ---------- 内部处理 ----------
 
+    # ---------- 接入能力位（唯一协议差异出口） ----------
+
+    @property
+    def capabilities(self):
+        """当前接入客户端的能力位；缺失字段按配置协议兜底。"""
+        return capabilities_of(self.client)
+
+    @property
+    def supports_passive_reply(self) -> bool:
+        """是否支持被动回复：决定是否合并多帧、是否记忆群消息格式。"""
+        return self.capabilities.supports_passive_reply
+
+    @property
+    def supports_markdown(self) -> bool:
+        """主动群消息是否支持 markdown 消息体。"""
+        return self.capabilities.supports_markdown
+
+    @property
+    def protocol(self) -> str:
+        """接入协议标识，仅作数据库记录键与日志，不参与分支判断。"""
+        return self.capabilities.protocol
+
+    @property
+    def bot_identity(self) -> str:
+        """本机器人自身账号，用于判断群里 @ 的是不是自己。
+
+        优先取客户端上报的自身标识（真实账号，最可信），其次用配置兜底；
+        不再读原始事件里的 self_id（适配层不保证保留该字段）。
+        """
+        return str(
+            getattr(self.client, "self_id", "")
+            or getattr(self.client, "bot_qq", "")
+            or config.BOT_QQ
+            or ""
+        )
+
     def _extract_member_id(self, message: OneBotMessage) -> str:
         """提取消息成员标识。
 
-        OneBot 群消息直接取 user_id（QQ 号）；同时兼容旧 botpy 的
-        author.member_openid / 顶层 member_openid / author_id 等字段，
-        以便历史消息与测试消息都能稳定识别身份。返回统一字符串。
+        两套协议在适配层已把成员账号统一挂到 user_id 上（OneBot 即 QQ 号，
+        官方为 openid），无需再猜 member_openid / author_id 等旧字段。
         """
-        for attr in ("user_id", "member_openid", "author_id"):
-            value = getattr(message, attr, None)
-            if value not in (None, ""):
-                return str(value)
-        author = getattr(message, "author", None)
-        if author is not None:
-            for attr in ("member_openid", "user_id", "author_id"):
-                value = getattr(author, attr, None)
-                if value not in (None, ""):
-                    return str(value)
-        return ""
+        return str(getattr(message, "user_id", "") or "")
 
     def _qa_gate(self, member_id: str, text: str) -> tuple[bool, str | None]:
         """非命令消息进入问答链路前的输入侧闸门（五层防护中的 3/2/2.5/4 层）。
@@ -703,6 +969,27 @@ class ACMBot:
 
         return True, None
 
+    @staticmethod
+    def _apply_teacher_text_fallback(info: dict, text: str) -> dict:
+        """老师原文兜底：官网正文吞掉时间/赛道时，用原文写明的日期与赛道补回。
+
+        - 比赛时间：提取结果为空而原文明确给出日期时补全（不覆盖模型已提取的有效时间）；
+        - 赛道：老师原文点名的赛道优先级最高，覆盖官网列出的全部赛项。
+        """
+        if not isinstance(info, dict):
+            return info
+        reference = datetime.now(ZoneInfo(config.TZ_NAME))
+        declared_time = extract_declared_contest_time(text, now=reference)
+        if declared_time and not (info.get("official_time") or info.get("contest_time")):
+            info["official_time"] = declared_time
+            info["contest_time"] = declared_time
+            logger.info("官网正文未给出比赛时间，按老师原文补全: %s", declared_time)
+        declared_tracks = extract_declared_tracks(text)
+        if declared_tracks and declared_tracks != (info.get("tracks") or ""):
+            info["tracks"] = declared_tracks
+            logger.info("赛道按老师原文覆盖: %s", declared_tracks)
+        return info
+
     async def _handle_publish(self, message: OneBotMessage, text: str,
                               group_id: str, member_id: str):
         """发布命令：老师/超管权限校验 → 抓取 → 提取 → 校验 → 私聊超管确认。"""
@@ -728,7 +1015,15 @@ class ACMBot:
         else:
             page = ""
 
-        raw_text = f"链接正文：{page}\n老师原文：{text}" if page else f"老师原文：{text}"
+        # 老师原文永远排在最前：官网首页往往只有通用介绍，抢权会吞掉真实比赛信息
+        if page:
+            raw_text = (
+                f"【老师直接通知（最高优先级，必须优先提取其中的时间、赛道与报名要求）】\n{text}\n\n"
+                f"【官网链接抓取参考（仅用于补充老师通知中未提及的届次、主办方等背景信息，"
+                f"严禁覆盖老师通知中的时间和赛道）】\n{page}"
+            )
+        else:
+            raw_text = f"老师原文：{text}"
         try:
             info = None if url else parse_simple_publication(text, now=datetime.now(ZoneInfo(config.TZ_NAME)))
         except ValueError as error:
@@ -744,6 +1039,10 @@ class ACMBot:
                 "可以再发一次，尽量包含比赛名称和时间；实在没有也能先存个名字~",
             )
             return
+
+        # 有官网正文时再做一次「老师原文」确定性兜底：网页泛化内容不得吞掉原文写明的日期/赛道
+        if page:
+            info = self._apply_teacher_text_fallback(info, text)
 
         info["source_link"] = url
         try:
@@ -812,7 +1111,10 @@ class ACMBot:
                 receipt += (f"\n超管私聊推送失败（成功{sent}/{len(config.SUPER_ADMIN)}）：{codes}。"
                             f"申请 #{pid} 已保留，超管可私聊发送 /待确认列表 后回复“同意 {pid}”。")
             await self._safe_reply(message, receipt)
-            logger.info("发布申请 #%s 已提交超管确认：%s", pid, info.get("name"))
+            logger.info(
+                "发布申请 #%s 已提交超管确认：%s｜提交人=%s",
+                pid, info.get("name"), _format_submitter(member_id),
+            )
             return
 
         # 显式关闭确认流程时直接发布。
@@ -865,7 +1167,7 @@ class ACMBot:
         kind = parts[0] if parts else ("群" if message is not None else "私聊")
         if len(parts) > 2 or kind not in ("群", "私聊"):
             return "[validation] 用法：/通知测试 [群|私聊] [目标标识]；官方群测试可在末尾加 文本 或 Markdown"
-        if requested_format and (kind != "群" or config.BOT_PROTOCOL != "qqbot"):
+        if requested_format and (kind != "群" or not self.supports_markdown):
             return "[validation] 文本/Markdown 格式选择仅用于官方群通知测试。"
         default_target = message.group_id if kind == "群" and message is not None else uid
         target = parts[1] if len(parts) == 2 else default_target
@@ -885,8 +1187,8 @@ class ACMBot:
                 answer += " [internal] 平台已接受测试，但本地格式和暂停状态保存失败，尚未确认恢复，请检查数据库。"
             else:
                 answer += " 主动通道本次测试通过，权限暂停已解除；仍有效的未来提醒会按计划发送。"
-        if kind == "群" and config.BOT_PROTOCOL == "qqbot" and code not in ("disabled", "target_not_allowed"):
-            used_format = requested_format or db.get_group_notification_format(config.BOT_PROTOCOL, target)
+        if kind == "群" and self.supports_passive_reply and code not in ("disabled", "target_not_allowed"):
+            used_format = requested_format or db.get_group_notification_format(self.protocol, target)
             answer += "\n本次格式：" + ("Markdown" if used_format == "markdown" else "文本")
             if result.ok and result.detail != "channel_state_save_failed":
                 answer += "，已记住本群格式，后续主动通知沿用。"
@@ -919,19 +1221,21 @@ class ACMBot:
             return await notifications.send_private(self.client, user_id, text, **kwargs)
         except Exception as error:
             logger.warning("私聊发送异常 [%s]", type(error).__name__)
-            mode = DeliveryMode.PASSIVE if config.BOT_PROTOCOL == "qqbot" and kwargs else DeliveryMode.ACTIVE
-            return result_from_exception(error, protocol=config.BOT_PROTOCOL, mode=mode)
-
-    async def _send_private(self, user_id: str, text: str) -> bool:
-        """保留其他私聊调用方的布尔结果，确认推送可读取完整错误码。"""
-        return bool(await self._send_private_result(user_id, text))
+            mode = DeliveryMode.PASSIVE if self.supports_passive_reply and kwargs else DeliveryMode.ACTIVE
+            return result_from_exception(error, protocol=self.protocol, mode=mode)
 
     async def _safe_reply(self, message: OneBotMessage, content: str) -> bool:
         """只回复当前入站群消息，官方适配不得复用历史ID或转主动重发。"""
+        # 超管私聊录入比赛时，入参是 SimpleNamespace 轻量消息：没有真实群上下文，
+        # 一律走私聊回执，避免落进 send_group 的群白名单校验。
+        private_uid = getattr(message, "_private_uid", None)
+        if private_uid:
+            result = await self._send_private_result(str(private_uid), content)
+            return bool(result)
         group_id = message.group_id
         if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
             return False
-        seq = _reply_sequence.get() + 1
+        seq = _clamp_reply_seq(_reply_sequence.get() + 1)
         _reply_sequence.set(seq)
         result = await notifications.send_group(
             self.client, group_id, content,
@@ -949,12 +1253,8 @@ class ACMBot:
         if not config.NOTICE_UNAUTHORIZED_GROUP:
             return
         raw = message.content or ""
-        targets = mentioned_user_ids(raw)
-        bot_qq = config.BOT_QQ or str(message.raw.get("self_id") or "")
-        addressed = (
-            getattr(message, "always_addressed", False)
-            or (bool(bot_qq) and bot_qq in targets)
-        )
+        bot_qq = self.bot_identity
+        addressed = is_addressed_to_bot(message, bot_qq)
         text = strip_at(raw)
         if not (addressed or text.startswith("/")):
             return
@@ -963,7 +1263,7 @@ class ACMBot:
             return
         _unauthorized_notice_at[group_id] = now
         try:
-            seq = _reply_sequence.get() + 1
+            seq = _clamp_reply_seq(_reply_sequence.get() + 1)
             _reply_sequence.set(seq)
             await notifications.send_group(
                 self.client, group_id,
@@ -981,40 +1281,43 @@ class ACMBot:
         """主动通知唯一业务入口，返回可审计的结构化结果。"""
         from cdutetc.errors import DeliveryCode, DeliveryResult
         if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
-            return DeliveryResult(False, DeliveryCode.TARGET_NOT_ALLOWED, config.BOT_PROTOCOL)
+            return DeliveryResult(False, DeliveryCode.TARGET_NOT_ALLOWED, self.protocol)
         if not config.GROUP_ACTIVE_MESSAGES_ENABLED:
-            return DeliveryResult(False, DeliveryCode.DISABLED, config.BOT_PROTOCOL)
+            return DeliveryResult(False, DeliveryCode.DISABLED, self.protocol)
         if message_format is not None and message_format not in ("text", "markdown"):
-            return DeliveryResult(False, DeliveryCode.INVALID_REQUEST, config.BOT_PROTOCOL,
+            return DeliveryResult(False, DeliveryCode.INVALID_REQUEST, self.protocol,
                                   detail="invalid_message_format")
-        if config.BOT_PROTOCOL == "qqbot" and not permission_probe:
-            block = db.get_group_notification_block(config.BOT_PROTOCOL, group_id)
+        if self.supports_passive_reply and not permission_probe:
+            block = db.get_group_notification_block(self.protocol, group_id)
             if block:
-                return DeliveryResult(False, DeliveryCode.ACTIVE_FORBIDDEN, config.BOT_PROTOCOL,
+                return DeliveryResult(False, DeliveryCode.ACTIVE_FORBIDDEN, self.protocol,
                                       detail="active_permission_paused", platform_code=block["platform_code"])
-        if config.BOT_PROTOCOL == "qqbot":
-            message_format = message_format or db.get_group_notification_format(config.BOT_PROTOCOL, group_id)
+        if self.supports_passive_reply:
+            message_format = message_format or db.get_group_notification_format(self.protocol, group_id)
         else:
             message_format = "text"
         if message_format == "markdown":
             result = await notifications.send_group(self.client, group_id, text, message_format=message_format)
         else:
             result = await notifications.send_group(self.client, group_id, text)
-        if config.BOT_PROTOCOL == "qqbot":
+        if self.supports_passive_reply:
             if result.code == DeliveryCode.ACTIVE_FORBIDDEN:
-                db.block_group_notifications(config.BOT_PROTOCOL, group_id, result.code.value, result.platform_code)
+                db.block_group_notifications(self.protocol, group_id, result.code.value, result.platform_code)
                 logger.warning("QQ主动发送被平台拒绝，已持久暂停该群，需恢复权限后执行 /通知测试 群 验证 [40034105]")
+            elif result.code == DeliveryCode.QUOTA_EXHAUSTED:
+                # 配额耗尽当天无法恢复，必须熔断，否则30秒/30分钟定时任务会持续无效重试。
+                db.block_group_notifications(self.protocol, group_id, result.code.value, result.platform_code)
+                logger.warning(
+                    "[主动发信限流] 群 %s 今日主动消息配额已耗尽(11253/11263)，停止重试并触发今日熔断",
+                    group_id,
+                )
             elif result.ok and permission_probe:
                 try:
-                    db.confirm_group_notification_channel(config.BOT_PROTOCOL, group_id, message_format)
+                    db.confirm_group_notification_channel(self.protocol, group_id, message_format)
                 except sqlite3.Error:
                     logger.exception("平台已接受主动测试，但本群通知格式和暂停状态保存失败")
                     result = replace(result, detail="channel_state_save_failed")
         return result
-
-    async def _send_group(self, group_id: str, text: str) -> bool:
-        """兼容旧bool调用方；实际发送统一经过结构化入口。"""
-        return bool(await self._send_group_result(group_id, text))
 
     async def _contest_remind_job(self):
         """仅发送已持久化的开赛节点，失败不影响旧版提醒和后续轮次。"""
@@ -1025,21 +1328,63 @@ class ACMBot:
         except Exception:
             logger.exception("开赛提醒计划扫描失败 [%s]", AppErrorCode.INTERNAL)
 
-    async def _remind_job(self):
-        """周期检查提醒：比赛临近 + 征集登记截止 + 训练开始。"""
+    async def _general_remind_job(self):
+        """周期检查通用提醒：征集登记截止 + 公共比赛 + 训练开始。"""
         if not config.GROUP_ACTIVE_MESSAGES_ENABLED:
             logger.info("主动群消息未启用，暂停提醒投递")
             return
-        # 两套提醒表/计划彼此独立；一套的数据库或兼容数据故障不应
-        # 阻断另一套的投递，下一轮仍会按持久化状态重试。
-        try:
-            await check_reminders(self._send_group)
-        except Exception:  # noqa: BLE001
-            logger.exception("旧版比赛提醒扫描失败，继续执行通用提醒")
         try:
             await check_general_reminders(self._send_group_result)
+            await check_custom_reminders(self._send_group_result)
         except Exception:  # noqa: BLE001
             logger.exception("通用提醒扫描失败，等待下一轮重试")
+
+    async def _daily_digest_job(self, now: datetime | None = None) -> int:
+        """每日聚合晨报：每群最多 1 条主动消息，汇总当日课程/征集/赛事。
+
+        设计要点：
+        - 只对授权群（运行时白名单）逐个生成，某群内容为空则整群跳过，
+          不发空消息浪费额度；
+        - 单群失败不影响其他群：配额耗尽（11253/11263）已在
+          ``_send_group_result`` 内持久熔断，这里只记告警并继续下一个群；
+        - now 供离线验证注入，无时区按北京时间处理。
+        """
+        from cdutetc.errors import DeliveryCode
+
+        if not config.DAILY_DIGEST_ENABLED:
+            return 0
+        if not config.GROUP_ACTIVE_MESSAGES_ENABLED:
+            logger.info("主动群消息未启用，暂停晨报投递")
+            return 0
+        sent = 0
+        try:
+            for group_id in sorted(config.ALLOWED_GROUPS):
+                try:
+                    if not db.group_switch_enabled(group_id, "daily_digest_enabled"):
+                        continue
+                    text = daily_digest.build_daily_digest(group_id, now=now)
+                    if not text:
+                        continue
+                    result = await self._send_group_result(group_id, text)
+                except Exception:  # noqa: BLE001 - 单群异常不得中断其余群
+                    logger.exception("[晨报] 群 %s 生成或发送异常，继续下一个群", group_id)
+                    continue
+                if result.ok:
+                    sent += 1
+                    continue
+                if result.code == DeliveryCode.QUOTA_EXHAUSTED:
+                    logger.warning(
+                        "[晨报] 群 %s 主动消息配额已耗尽，本群今日跳过（已熔断，不再重试）",
+                        group_id,
+                    )
+                else:
+                    logger.warning("[晨报] 群 %s 未发送 [%s]",
+                                   group_id, getattr(result.code, "value", result.code))
+        except Exception:  # noqa: BLE001 - 循环外的兜底，异常不得逸出调度器
+            logger.exception("[晨报] 本次调度执行异常，跳过本轮等待下次触发")
+        if sent:
+            logger.info("[晨报] 本次成功推送 %d 个群的事务总览", sent)
+        return sent
 
     async def _weekly_contest_job(self, now: datetime | None = None):
         """提前生成下一场未来周赛（默认不通知全员）。
@@ -1049,6 +1394,13 @@ class ACMBot:
         """
         if not config.WEEKLY_CONTEST_ENABLED:
             return
+        try:
+            await self._create_weekly_contest(now=now)
+        except Exception:  # noqa: BLE001 - DB 锁/时区等意外异常统一兜底，不向上抛出
+            logger.exception("[周赛] 本轮调度执行异常，跳过本轮等待下次触发")
+
+    async def _create_weekly_contest(self, now: datetime | None = None) -> None:
+        """按周幂等生成下一场周赛（由 ``_weekly_contest_job`` 统一兜底调用）。"""
         template = config.WEEKLY_CONTEST_TEMPLATE
         try:
             now = now or datetime.now(ZoneInfo(config.TZ_NAME))
@@ -1086,8 +1438,23 @@ class ACMBot:
         logger.info("已自动生成周赛记录: %s（id=%s），未通知全员", template, cid)
 
     async def _crawl_job(self):
-        """周期抓取公共来源（默认关闭）：变化检测 → 待审更新，不自动广播。"""
-        await crawler.run_fetch(send_group=self._send_group)
+        """周期抓取公共来源（默认关闭）：变化检测 → 待审更新，不自动广播。
+
+        来源抓取之后，若开启了赛程自动抓取，再顺带抓 CF / 牛客赛程；
+        两段各自兜底，任一段异常都不影响另一段，也不会让调度器崩掉。
+        """
+        try:
+            await crawler.run_fetch(send_group=self._send_group_result)
+        except Exception:  # noqa: BLE001 - 网络/解析/DB 异常统一兜底，不逸出调度器
+            logger.exception("[抓取] 本轮调度执行异常，跳过本轮等待下次触发")
+        if not config.AUTO_CONTEST_CRAWL_ENABLED:
+            return
+        try:
+            results = await crawler.run_contest_fetch()
+            created = sum(1 for item in results if item.get("kind") == "created")
+            logger.info("[赛程抓取] 本轮处理 %s 条，新建 %s 条", len(results), created)
+        except Exception:  # noqa: BLE001 - 赛程抓取失败同样不逸出调度器
+            logger.exception("[赛程抓取] 本轮执行异常，跳过本轮等待下次触发")
 
 
 def _build_client():

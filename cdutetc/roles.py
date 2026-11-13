@@ -15,9 +15,13 @@ import logging
 
 from cdutetc import config
 from cdutetc import database as db
-from cdutetc.utils import is_valid_account_id
+from cdutetc.utils import is_super_admin, is_valid_account_id
 
 logger = logging.getLogger(__name__)
+
+# 管理信息作用域：global=全部已授权群（仅超管私聊），group=仅当前群。
+SCOPE_GLOBAL = "global"
+SCOPE_GROUP = "group"
 
 
 def refresh() -> None:
@@ -87,6 +91,33 @@ def remove_teacher(user_id: str, operator: str = "") -> tuple[bool, str]:
         return False, f"{uid} 不在动态老师名单中"
     refresh()
     return True, f"已移除老师 {uid}，立即生效"
+
+
+def resolve_admin_scope(user_id: str | None, group_id: str | None = None) -> str | None:
+    """按「身份 × 渠道」算出管理信息作用域。
+
+    - 私聊（``group_id`` 为空）：只有超管可用，返回 ``"global"``，可看全部已授权群；
+    - 群聊（``group_id`` 非空）：超管与老师都降级为本群视角，返回 ``"group"``；
+      群已登记负责老师时，老师需在该名单内；未登记时沿用全局老师白名单，
+      避免历史群因未登记负责人而突然失权（登记后即按名单收窄）；
+    - 其余（普通成员、未授权群、非本群老师）返回 ``None``，由调用方拦截。
+    """
+    uid = (user_id or "").strip()
+    if not uid:
+        return None
+    gid = (group_id or "").strip()
+    if not gid:
+        return SCOPE_GLOBAL if is_super_admin(uid) else None
+    if gid not in config.ALLOWED_GROUPS:
+        return None
+    if is_super_admin(uid):
+        return SCOPE_GROUP
+    if uid not in config.TEACHER_WHITELIST:
+        return None
+    owners = db.get_group_teachers(gid)
+    if owners and uid not in owners:
+        return None
+    return SCOPE_GROUP
 
 
 def describe() -> str:

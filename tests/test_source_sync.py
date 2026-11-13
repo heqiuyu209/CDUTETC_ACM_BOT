@@ -207,7 +207,8 @@ async def test_refetch_failures_preserve_all_existing_state(competition, monkeyp
     elif failure == "bad_time":
         extract.return_value = ({"name": "新名称", "reg_deadline": "2026-02-30 09:00"}, None)
     elif failure == "bad_type":
-        extract.return_value = ({"name": "新名称", "device_req": ["非法类型"]}, None)
+        # 列表会被归一化，改用非法数字类型触发字段类型校验失败
+        extract.return_value = ({"name": "新名称", "device_req": 123}, None)
     else:
         extract.return_value = (["非法对象"], None)
     monkeypatch.setattr(commands, "fetch_text", fetch)

@@ -10,12 +10,18 @@
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Awaitable, Callable
 
 import websockets
 
+from cdutetc.clients.base import BaseBotClient
+
 logger = logging.getLogger("onebot")
+
+# 与 utils.mentioned_user_ids 同一套语法：只认官方 @，不吞 @!id 旧语法。
+_AT_PATTERN = re.compile(r"\[CQ:at,qq=([^\]\s]+)\]")
 
 MessageHandler = Callable[["OneBotMessage"], Awaitable[None]]
 ReadyHandler = Callable[[], Awaitable[None]]
@@ -51,7 +57,8 @@ class OneBotMessage:
       group_id（QQ 群号）、user_id（QQ 号），统一转字符串便于白名单比较。
     """
 
-    __slots__ = ("raw", "id", "message_type", "group_id", "user_id", "content")
+    __slots__ = ("raw", "id", "message_type", "group_id", "user_id", "content",
+                 "mentions")
 
     def __init__(self, data: dict):
         self.raw = data
@@ -71,6 +78,13 @@ class OneBotMessage:
             self.content = rebuilt
         else:
             self.content = raw_message
+        # 统一 @ 载体：业务层只读 mentions，不再自己解析 CQ 码。
+        # OneBot 语义里 @ 目标就是 QQ 号，无法直接判定是不是本机，
+        # 故 is_you 交由调用方用自身账号比对。
+        self.mentions = [
+            {"id": target, "is_you": False}
+            for target in _AT_PATTERN.findall(self.content)
+        ]
 
     def __repr__(self):
         return (
@@ -79,8 +93,16 @@ class OneBotMessage:
         )
 
 
-class OneBotClient:
+class OneBotClient(BaseBotClient):
     """正向 WebSocket 客户端：接收事件 + 调用 OneBot API。"""
+
+    protocol = "onebot"
+    # OneBot 是主动发送模型：入站消息 id 不能复用为被动回复凭证。
+    supports_passive_reply = False
+    # 群标识就是数字 QQ 群号。
+    supports_numeric_group_id = True
+    # 纯文本消息体，没有 markdown 通道。
+    supports_markdown = False
 
     def __init__(self, ws_url: str, token: str = "", reconnect_delay: float = 5.0,
                  idle_timeout: float = 180.0):
@@ -93,6 +115,9 @@ class OneBotClient:
         self.idle_timeout = idle_timeout
         self._last_rx = 0.0
         self._ws: websockets.WebSocketClientProtocol | None = None
+        # 登录账号：连接后由 get_login_info 填充，供业务层判断群里 @ 的是不是本机器人。
+        self.self_id: str = ""
+        self._self_id_task: asyncio.Task | None = None
         self._pending: dict[str, asyncio.Future] = {}
         self._echo_seq = 0
         # 事件分发：由上层（main.py）注册
@@ -128,6 +153,8 @@ class OneBotClient:
             self._ws = ws
             self._last_rx = time.monotonic()
             logger.info("OneBot 已连接: %s", self.ws_url)
+            # 后台取一次登录账号，避免握手期阻塞事件读取。
+            self._self_id_task = asyncio.create_task(self._refresh_self_id())
             if self.on_ready is not None:
                 await self.on_ready()
             watchdog = asyncio.create_task(self._idle_watchdog(ws))
@@ -135,7 +162,22 @@ class OneBotClient:
                 await self._read_loop(ws)
             finally:
                 watchdog.cancel()
+                if self._self_id_task is not None:
+                    self._self_id_task.cancel()
+                    self._self_id_task = None
                 self._ws = None
+
+    async def _refresh_self_id(self) -> None:
+        """连接后取一次登录账号；失败只降级为取不到自身标识，不影响收发。"""
+        try:
+            resp = await self.call_api("get_login_info")
+        except Exception:  # noqa: BLE001
+            logger.debug("获取 OneBot 登录账号失败", exc_info=True)
+            return
+        data = (resp or {}).get("data")
+        user_id = data.get("user_id") if isinstance(data, dict) else None
+        if user_id:
+            self.self_id = str(user_id)
 
     async def _idle_watchdog(self, ws) -> None:
         """静默看门狗：长时间没有任何事件就主动断开，交给外层重连。"""

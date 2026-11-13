@@ -379,3 +379,128 @@ async def test_onebot_publish_twice_preserves_fields_without_second_notification
     assert counts(db_file[0]) == (1, 1, 1, 1)
     added = onebot.send_group_msg_result.await_args_list[len(first_calls):]
     assert len(added) == 1 and added[0].args[0] == "g1" and "未重复发布" in added[0].args[1]
+
+
+def test_list_valued_tracks_are_normalized_instead_of_rejected():
+    """模型把 tracks 输出成数组时应归一化为顿号字符串，而不是校验失败。"""
+    cleaned, error = validate_contest_info(
+        {"name": " 校赛 ", "tracks": ["C", "C++", "Python", "Java", " "]},
+    )
+    assert error is None
+    assert cleaned["tracks"] == "C、C++、Python、Java"
+    assert map_competition_info(cleaned)["tracks"] == "C、C++、Python、Java"
+    assert crawler._map_competition_info({"name": "校赛", "tracks": ["C", "Python"]}) == {
+        "name": "校赛", "tracks": "C、Python",
+    }
+
+
+def test_tuple_time_field_is_normalized_before_parsing():
+    cleaned, error = validate_contest_info(
+        {"name": "校赛", "contest_time": ("2026-11-29",), "reg_deadline": []},
+    )
+    assert error is None
+    assert cleaned["contest_time"] == "2026-11-29 00:00"
+    assert cleaned["reg_deadline"] == ""
+
+
+async def test_extraction_prompt_prefers_teacher_text_and_forbids_array_tracks(monkeypatch):
+    """链接首页无细节时，提示词要求以老师原文的时间与赛道为准，且禁止输出数组。"""
+    chat = AsyncMock(return_value=json.dumps({
+        "name": "成都理工程序设计校赛",
+        "contest_time": "2026-11-29 09:00",
+        "tracks": ["C", "C++", "Python", "Java"],
+    }, ensure_ascii=False))
+    monkeypatch.setattr(llm, "_chat_once", chat)
+    info, error = await llm.extract_contest(
+        "【老师直接通知（最高优先级）】\n11月29日上午9点开赛，赛道C、C++、Python、Java\n\n"
+        "【官网链接抓取参考】\n程序设计大赛官网首页，欢迎报名。",
+    )
+    assert error is None
+    assert info["contest_time"] == "2026-11-29 09:00"
+    assert info["tracks"] == "C、C++、Python、Java"
+    system = chat.await_args.args[0]
+    assert "老师通知" in system and "优先级高于任何网页内容" in system
+    assert "tracks 必须体现老师通知中的赛道" in system
+    assert "禁止输出 JSON 数组" in system
+
+
+TEACHER_TEXT = (
+    "发布 **程序设计挑战赛**：比赛时间：2026年11月29日，支持C，C++，Python，Java四种赛道 "
+    "https://contest.example.com/"
+)
+HOMEPAGE = (
+    "程序设计大赛官方网站首页。本届赛事共设软件应用与开发、数字媒体设计、人工智能应用、"
+    "大数据应用、程序设计五个赛项，欢迎各高校师生报名参加，详情见各赛项通知。"
+)
+
+
+def test_declared_contest_time_fallback_extracts_labeled_date():
+    from cdutetc.publish_text import extract_declared_contest_time
+
+    assert extract_declared_contest_time(TEACHER_TEXT) == "2026-11-29 00:00"
+    # 报名截止与比赛时间并存时只认「比赛时间」标签后的日期
+    assert extract_declared_contest_time(
+        "报名截止：2026年11月20日，比赛时间：2026年11月29日",
+    ) == "2026-11-29 00:00"
+    # 多个日期且无标签时不猜
+    assert extract_declared_contest_time("11月20日截止，11月29日比赛") is None
+    assert extract_declared_contest_time("官网首页，欢迎报名") is None
+
+
+def test_declared_tracks_fallback_prefers_teacher_languages():
+    from cdutetc.publish_text import extract_declared_tracks
+
+    assert extract_declared_tracks(TEACHER_TEXT) == "C、C++、Python、Java"
+    assert extract_declared_tracks("本届赛事共设软件应用与开发、数字媒体设计五个赛项") is None
+
+
+def test_teacher_text_fallback_fills_missing_time_and_overrides_tracks():
+    """模型被官网带偏（时间空、赛道为官网五赛项）时，兜底按老师原文修正。"""
+    info = {
+        "name": "程序设计挑战赛", "official_time": "", "contest_time": "",
+        "tracks": "软件应用与开发、数字媒体设计、人工智能应用、大数据应用、程序设计",
+    }
+    fixed = main.ACMBot._apply_teacher_text_fallback(dict(info), TEACHER_TEXT)
+    assert fixed["official_time"] == "2026-11-29 00:00"
+    assert fixed["contest_time"] == "2026-11-29 00:00"
+    assert fixed["tracks"] == "C、C++、Python、Java"
+
+
+def test_teacher_text_fallback_keeps_valid_model_time():
+    info = {"name": "程序设计挑战赛", "official_time": "2026-11-30 09:00",
+            "contest_time": "2026-11-30 09:00", "tracks": "C、C++"}
+    fixed = main.ACMBot._apply_teacher_text_fallback(dict(info), TEACHER_TEXT)
+    assert fixed["official_time"] == "2026-11-30 09:00"
+    assert fixed["tracks"] == "C、C++、Python、Java"
+
+
+async def test_publish_with_official_homepage_keeps_teacher_time_and_tracks(db_file, monkeypatch):
+    """端到端：官网首页无具体日期且列了五个赛项时，仍保留老师原文的时间与赛道。"""
+    monkeypatch.setattr(config, "PUBLISH_CONFIRM_ENABLED", False)
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
+    monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
+    monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
+    onebot = SimpleNamespace(send_group_msg_result=AsyncMock(
+        return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
+    ))
+    bot = main.ACMBot(onebot)
+    page = AsyncMock(return_value=HOMEPAGE)
+    monkeypatch.setattr(main, "fetch_text", page)
+    chat = AsyncMock(return_value=json.dumps({
+        "name": "程序设计挑战赛",
+        "tracks": "软件应用与开发、数字媒体设计、人工智能应用、大数据应用、程序设计",
+        "summary": "官网首页通用介绍",
+    }, ensure_ascii=False))
+    monkeypatch.setattr(llm, "_chat_once", chat)
+
+    message = OneBotMessage({"post_type": "message", "message_type": "group", "group_id": "g1",
+                             "user_id": "teacher", "message_id": "home-1", "self_id": 30001,
+                             "raw_message": f"[CQ:at,qq=30001] {TEACHER_TEXT}"})
+    await bot.on_group_at_message_create(message)
+
+    sent = chat.await_args.args[1]
+    assert sent.index("【老师直接通知") < sent.index("【官网链接抓取参考")
+    record = database.list_competitions(status="confirmed")[0]
+    assert record["name"] == "程序设计挑战赛"
+    assert record["official_time"] == "2026-11-29 00:00"
+    assert record["tracks"] == "C、C++、Python、Java"

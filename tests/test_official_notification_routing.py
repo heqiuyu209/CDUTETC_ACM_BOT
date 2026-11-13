@@ -51,7 +51,7 @@ async def test_direct_reply_uses_current_id_and_incrementing_seq(official_bot):
 async def test_active_notice_never_reuses_inbound_id(official_bot):
     bot, api = official_bot
     assert await bot._safe_reply(group_message(), "被动回复")
-    assert await bot._send_group("group-openid", "主动提醒")
+    assert await bot._send_group_result("group-openid", "主动提醒")
     assert "msg_id" not in api.post_group_message.await_args.kwargs
     assert 1 <= api.post_group_message.await_args.kwargs["msg_seq"] <= 2**31 - 1
 
@@ -83,7 +83,7 @@ async def test_private_reply_context_is_reset_and_test_is_active(official_bot):
     assert reply.kwargs["msg_seq"] == 1
     assert "[sent]" in reply.kwargs["content"]
     assert main._private_reply_context.get() is None
-    await bot._send_private("admin-openid", "之后的主动通知")
+    await bot._send_private_result("admin-openid", "之后的主动通知")
     assert "msg_id" not in api.post_c2c_message.await_args.kwargs
 
 

@@ -43,6 +43,8 @@ def private_message(protocol, text, msg_id="approve-inbound"):
 def app(request, monkeypatch, tmp_path):
     protocol = request.param
     monkeypatch.setattr(config, "BOT_PROTOCOL", protocol)
+    # 自身标识统一走配置：OneBot 用例的 @ 目标是 "bot"。
+    monkeypatch.setattr(config, "BOT_QQ", "bot")
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2"})
     monkeypatch.setattr(config, "SUPER_ADMIN", {"admin"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
@@ -174,7 +176,7 @@ async def test_one_admin_error_does_not_stop_other_review_recipients(app, monkey
     await app.bot.on_group_at_message_create(group_message(app.protocol, USER_PHRASES[0]))
     assert len(database.list_pending_publications()) == 1
     assert app.private_calls()[0]["openid"] == "another-admin"
-    assert any("成功1/2" in text and "[timeout_unknown]" in text for text in app.group_texts())
+    assert any("成功1/2" in text and "[network_error]" in text for text in app.group_texts())
 
 
 def test_pending_receipt_does_not_claim_reminders_are_already_scheduled():
