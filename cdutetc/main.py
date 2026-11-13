@@ -218,6 +218,75 @@ def _build_publish_receipt(info: dict, *, status: str, ref: int) -> str:
     return "\n".join(lines)
 
 
+def _runtime_teacher_record(account_id: str) -> dict | None:
+    """在动态老师名单里按 openid 精确匹配，命中才返回记录。
+
+    只做精确相等，绝不做前缀/模糊匹配——展示身份宁可落到兜底，也不能张冠李戴。
+    """
+    if not account_id:
+        return None
+    try:
+        teachers = db.list_runtime_teachers() or []
+    except (sqlite3.Error, ValueError):
+        return None
+    for record in teachers:
+        if str(record.get("user_id") or "").strip() == account_id:
+            return record
+    return None
+
+
+def _format_submitter(submitted_by: str) -> str:
+    """实时解析比赛发布人的展示文案（备注名 → 超管 → 老师 → 兜底）。
+
+    严格只认「当前这条消息触发者」的真实账号标识（群聊 member_id / 私聊 uid），
+    严禁回退成群默认负责老师：身份漂移会让待确认卡片把超管记成老师。
+    """
+    account_id = (submitted_by or "").strip()
+    if not account_id:
+        return "未知成员（无账号标识）"
+    short = account_id[:8]
+
+    try:
+        label_name = (db.get_account_label("user", account_id) or "").strip()
+    except (sqlite3.Error, ValueError):
+        label_name = ""
+    try:
+        alias = db.get_entity_alias("user", account_id) or {}
+    except (sqlite3.Error, ValueError):
+        alias = {}
+    alias_name = str(alias.get("display_name") or "").strip()
+    alias_qq = str(alias.get("numeric_id") or "").strip()
+
+    # 1) 超管身份锁定：有备注展示备注，没有就展示超级管理员；不读老师名单覆盖
+    if is_super_admin(account_id):
+        if label_name:
+            return f"{label_name}（超管）"
+        return f"超级管理员（ID: {short}...）"
+
+    # 2) 已绑定老师：runtime_teachers 里存在精确 openid 记录
+    teacher = _runtime_teacher_record(account_id)
+    if teacher is not None:
+        teacher_name = (
+            label_name
+            or alias_name
+            or str(teacher.get("note") or "").strip()
+        )
+        teacher_qq = alias_qq
+        if not teacher_name:
+            teacher_name = f"老师（ID: {short}...）"
+        if teacher_qq:
+            return f"{teacher_name}（老师, QQ: {teacher_qq}）"
+        return f"{teacher_name}（老师）"
+
+    # 3) 兜底：既不是超管也不在老师名单；有备注名/已绑 QQ 时仍展示，避免信息丢失
+    display_name = label_name or alias_name
+    if display_name and alias_qq:
+        return f"{display_name}（QQ: {alias_qq}）"
+    if display_name:
+        return f"{display_name}（ID: {short}...）"
+    return f"未知成员（ID: {short}...）"
+
+
 def _build_publish_review(pending: dict) -> str:
     """构造发给超管的待确认申请正文（含全部已整理字段与查重提示）。"""
     info = json.loads(pending.get("fields_json") or "{}")
@@ -235,7 +304,7 @@ def _build_publish_review(pending: dict) -> str:
     if (info.get("official_time") or "").strip():
         lines.append(f"提醒计划：同意后安排开始前 {_format_remind_offsets()}的未来节点，已错过的不补发")
     lines.append(f"来源群：{format_group_name(pending.get('group_id') or '')}")
-    lines.append(f"提交人：{format_user_name(pending.get('submitted_by') or '')}")
+    lines.append(f"提交人：{_format_submitter(pending.get('submitted_by') or '')}")
     if pending.get("duplicate_note"):
         lines.append(f"⚠ 查重提示：{pending['duplicate_note']}")
     else:
@@ -576,9 +645,15 @@ class ACMBot:
             if approve:
                 cid, created = db.approve_pending_publication(pid, operator=uid)
                 pending_item = db.get_pending_publication(pid) or {}
+                submitter_text = _format_submitter(pending_item.get("submitted_by") or "")
                 if created:
+                    logger.info(
+                        "发布申请 #%s 已入库为比赛 #%s｜提交人=%s｜审批人=%s",
+                        pid, cid, submitter_text, uid,
+                    )
                     await self._send_private_result(
                         uid, f"已入库：#{cid} {pending_item.get('name') or ''}。"
+                        f"提交人：{submitter_text}。"
                         f"已自动安排开赛前 {_format_remind_offsets()}的未来有效节点；"
                         "时间未定或已过节点不建计划。正在通知目标群。"
                     )
@@ -998,7 +1073,10 @@ class ACMBot:
                 receipt += (f"\n超管私聊推送失败（成功{sent}/{len(config.SUPER_ADMIN)}）：{codes}。"
                             f"申请 #{pid} 已保留，超管可私聊发送 /待确认列表 后回复“同意 {pid}”。")
             await self._safe_reply(message, receipt)
-            logger.info("发布申请 #%s 已提交超管确认：%s", pid, info.get("name"))
+            logger.info(
+                "发布申请 #%s 已提交超管确认：%s｜提交人=%s",
+                pid, info.get("name"), _format_submitter(member_id),
+            )
             return
 
         # 显式关闭确认流程时直接发布。

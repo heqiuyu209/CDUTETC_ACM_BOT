@@ -198,13 +198,15 @@ async def test_unauthorized_onebot_claim_checks_mention(memory_db, monkeypatch, 
     assert (GROUP in config.ALLOWED_GROUPS) is expected
 
 
-def test_claim_teacher_binds_sender(memory_db):
-    result = asyncio.run(commands.handle_command("/认领老师 10001 张老师", GROUP, "admin"))
+def test_claim_teacher_binds_sender(memory_db, monkeypatch):
+    # 超管不再允许认领老师（会污染超管身份），改用已授权老师账号验证落库
+    monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher1"})
+    result = asyncio.run(commands.handle_command("/认领老师 10001 张老师", GROUP, "teacher1"))
     text = result[0]["text"]
     assert "已认领老师身份" in text
     assert "张老师 (QQ: 10001)" in text
-    assert database.get_entity_alias("user", "admin")["display_name"] == "张老师"
-    assert "admin" in config.TEACHER_WHITELIST
+    assert database.get_entity_alias("user", "teacher1")["display_name"] == "张老师"
+    assert "teacher1" in config.TEACHER_WHITELIST
 
 
 def test_claim_teacher_requires_privilege(memory_db):
@@ -279,7 +281,8 @@ def test_publish_review_uses_claimed_names(memory_db):
     }
     text = main._build_publish_review(pending)
     assert "来源群：集训队群 (123456789)" in text
-    assert "提交人：张老师 (QQ: 10001)" in text
+    # 提交人改由实时身份解析渲染：已认领但未绑老师身份时只展示名字与 QQ
+    assert "提交人：张老师（QQ: 10001）" in text
     assert GROUP not in text and USER not in text
 
 
@@ -290,5 +293,6 @@ def test_publish_review_degrades_when_unclaimed(memory_db):
                "fields_json": json.dumps({"name": "蓝桥杯"})}
     text = main._build_publish_review(pending)
     assert "来源群：未命名群[A0EF5D...1FDE]" in text
-    assert "提交人：成员[DCF4F2...F3FD]" in text
+    # 未认领成员统一降级为「未知成员（ID: 前8位...）」，绝不裸露完整 openid
+    assert "提交人：未知成员（ID: DCF4F268...）" in text
     assert GROUP not in text and USER not in text

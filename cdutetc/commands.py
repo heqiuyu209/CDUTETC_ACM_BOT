@@ -1109,11 +1109,16 @@ def cmd_pub_pending_list(group_id: str, sender: str, args: str) -> list[dict]:
         return [{"group_id": group_id, "text": "当前没有待确认的发布申请"}]
     lines = ["待确认的发布申请："]
     from cdutetc.alias_helper import format_user_name
+    # 提交人展示与待确认卡片共用同一套实时身份解析，避免两处口径不一致
+    try:
+        from cdutetc.main import _format_submitter
+    except ImportError:  # 单模块加载等极端场景降级为旧渲染
+        _format_submitter = format_user_name
     for item in items:
         lines.append(
             f"#{item['id']} {item['name'] or '未命名'}"
             f"｜{item['official_time'] or '时间待定'}"
-            f"｜提交人 {format_user_name(item['submitted_by'] or '')}"
+            f"｜提交人 {_format_submitter(item['submitted_by'] or '')}"
         )
         if item.get("duplicate_note"):
             lines.append(f"   ⚠ {item['duplicate_note']}")
@@ -1249,7 +1254,14 @@ def cmd_claim_teacher(group_id: str, sender: str, args: str) -> list[dict]:
     from cdutetc.alias_helper import format_user_name
     if not group_id:
         return [{"group_id": group_id, "text": "请在群里 @我 发送该指令"}]
-    if not (is_super_admin(sender) or sender in config.TEACHER_WHITELIST):
+    # 超管身份由配置决定，认领老师会把超管 openid 写进老师表，
+    # 让后续发布人解析把超管当老师展示（身份串号），因此直接在入口拦下。
+    if is_super_admin(sender):
+        return [{"group_id": group_id, "text": (
+            "⚠️ 当前账号为超级管理员，请让老师本人用自己的 QQ 在群内发送 "
+            "/认领老师 <QQ号> <姓名> 完成绑定，避免覆盖超管身份"
+        )}]
+    if sender not in config.TEACHER_WHITELIST:
         return [{"group_id": group_id,
                  "text": "仅超管或已授权老师可认领身份；新老师请让超管先 /加老师。"}]
     parts = (args or "").strip().split(None, 1)
