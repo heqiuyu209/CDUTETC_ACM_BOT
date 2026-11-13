@@ -153,6 +153,97 @@ def parse_simple_publication(text: str, now: datetime | None = None) -> dict | N
     return info
 
 
+_CONTEST_TIME_LABEL = re.compile(
+    r"比赛时间|竞赛时间|开赛时间|正赛时间|比赛日期|竞赛日期|举行时间|开打时间|正式比赛时间"
+)
+_TRACK_HINT = re.compile(r"赛道|组别|分组|语言|项目|组")
+# 注意必须用非捕获组包住：裸交替插入列表正则会让 | 上浮，导致列表被截成首项
+_LANG_TOKEN = r"(?:C\+\+|Cpp|Python|JavaScript|Java|Kotlin|Rust|Golang|Go|Scratch|PHP|VB|C#|C)"
+_TRACK_SEQ = re.compile(
+    rf"(?<![A-Za-z])(?P<seq>{_LANG_TOKEN}(?:\s*(?:、|,|，|/|和|及|与)\s*{_LANG_TOKEN})+)(?![A-Za-z])",
+    re.I,
+)
+_TRACK_ALIAS = {
+    "c++": "C++", "cpp": "C++", "c#": "C#", "c": "C", "python": "Python",
+    "java": "Java", "javascript": "JavaScript", "go": "Go", "golang": "Go",
+    "rust": "Rust", "kotlin": "Kotlin", "scratch": "Scratch", "php": "PHP", "vb": "VB",
+}
+
+
+def _normalize_track_token(token: str) -> str:
+    token = token.strip()
+    return _TRACK_ALIAS.get(token.lower(), token)
+
+
+def _collect_dates(text: str, current: datetime) -> list[tuple[int, int, object]]:
+    """收集文本中的明确日期（绝对年月日优先，其次月日按当前年）；非法日期丢弃。"""
+    dates: list[tuple[int, int, object]] = []
+    for match in _DATE.finditer(text):
+        try:
+            date = datetime(int(match["year"]), int(match["month"]), int(match["day"])).date()
+        except ValueError:
+            continue
+        dates.append((match.start(), match.end(), date))
+    for match in _MONTH_DAY.finditer(text):
+        if any(start <= match.start() < end for start, end, _ in dates):
+            continue
+        try:
+            date = datetime(current.year, int(match["month"]), int(match["day"])).date()
+        except ValueError:
+            continue
+        dates.append((match.start(), match.end(), date))
+    dates.sort()
+    return dates
+
+
+def extract_declared_contest_time(text: str, now: datetime | None = None) -> str | None:
+    """老师通知里写明的比赛日期兜底（YYYY-MM-DD 00:00）。
+
+    只在原文确实给出明确日期时返回：优先取「比赛时间/开赛时间」等标签后的日期，
+    其次原文只有一个唯一日期时采用；多个日期且无标签一律不猜，避免误取报名截止。
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    source = unicodedata.normalize("NFKC", text)
+    dates = _collect_dates(source, _reference(now))
+    if not dates:
+        return None
+    for label in _CONTEST_TIME_LABEL.finditer(source):
+        tail = [item for item in dates if label.end() <= item[0] <= label.end() + 40]
+        if tail:
+            return f"{tail[0][2]:%Y-%m-%d} 00:00"
+    unique = {item[2] for item in dates}
+    if len(unique) == 1:
+        return f"{dates[0][2]:%Y-%m-%d} 00:00"
+    return None
+
+
+def extract_declared_tracks(text: str) -> str | None:
+    """老师通知里写明的赛道列表（如「支持C，C++，Python，Java四种赛道」）。
+
+    只认上下文出现「赛道/组别/分组/语言/项目」且由分隔符连成至少两项的语言列表，
+    其余情况返回 None，不猜测。
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    source = unicodedata.normalize("NFKC", text)
+    for match in _TRACK_SEQ.finditer(source):
+        window = source[max(0, match.start() - 30): match.end() + 30]
+        if not _TRACK_HINT.search(window):
+            continue
+        tokens: list[str] = []
+        seen: set[str] = set()
+        for raw in re.split(r"\s*(?:、|,|，|/|和|及|与)\s*", match["seq"]):
+            token = _normalize_track_token(raw)
+            key = token.lower()
+            if token and key not in seen:
+                seen.add(key)
+                tokens.append(token)
+        if len(tokens) >= 2:
+            return "、".join(tokens)
+    return None
+
+
 def normalize_local_time_value(text: str, now: datetime | None = None) -> str | None:
     """时间字段只允许日期/时刻词，不从夹带任意正文的字符串抽时间。"""
     remaining = unicodedata.normalize("NFKC", text)

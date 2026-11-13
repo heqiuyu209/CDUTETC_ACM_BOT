@@ -52,7 +52,12 @@ from cdutetc.contest_fields import map_competition_info
 from cdutetc.database import create_published_competition_once, init_db
 from cdutetc.fetcher import FetchError, fetch_text
 from cdutetc.llm import extract_contest, normalize_time
-from cdutetc.publish_text import is_timed_contest_announcement, parse_simple_publication
+from cdutetc.publish_text import (
+    extract_declared_contest_time,
+    extract_declared_tracks,
+    is_timed_contest_announcement,
+    parse_simple_publication,
+)
 from cdutetc.reminder import (
     check_contest_start_reminders,
     check_custom_reminders,
@@ -964,6 +969,27 @@ class ACMBot:
 
         return True, None
 
+    @staticmethod
+    def _apply_teacher_text_fallback(info: dict, text: str) -> dict:
+        """老师原文兜底：官网正文吞掉时间/赛道时，用原文写明的日期与赛道补回。
+
+        - 比赛时间：提取结果为空而原文明确给出日期时补全（不覆盖模型已提取的有效时间）；
+        - 赛道：老师原文点名的赛道优先级最高，覆盖官网列出的全部赛项。
+        """
+        if not isinstance(info, dict):
+            return info
+        reference = datetime.now(ZoneInfo(config.TZ_NAME))
+        declared_time = extract_declared_contest_time(text, now=reference)
+        if declared_time and not (info.get("official_time") or info.get("contest_time")):
+            info["official_time"] = declared_time
+            info["contest_time"] = declared_time
+            logger.info("官网正文未给出比赛时间，按老师原文补全: %s", declared_time)
+        declared_tracks = extract_declared_tracks(text)
+        if declared_tracks and declared_tracks != (info.get("tracks") or ""):
+            info["tracks"] = declared_tracks
+            logger.info("赛道按老师原文覆盖: %s", declared_tracks)
+        return info
+
     async def _handle_publish(self, message: OneBotMessage, text: str,
                               group_id: str, member_id: str):
         """发布命令：老师/超管权限校验 → 抓取 → 提取 → 校验 → 私聊超管确认。"""
@@ -989,7 +1015,15 @@ class ACMBot:
         else:
             page = ""
 
-        raw_text = f"链接正文：{page}\n老师原文：{text}" if page else f"老师原文：{text}"
+        # 老师原文永远排在最前：官网首页往往只有通用介绍，抢权会吞掉真实比赛信息
+        if page:
+            raw_text = (
+                f"【老师直接通知（最高优先级，必须优先提取其中的时间、赛道与报名要求）】\n{text}\n\n"
+                f"【官网链接抓取参考（仅用于补充老师通知中未提及的届次、主办方等背景信息，"
+                f"严禁覆盖老师通知中的时间和赛道）】\n{page}"
+            )
+        else:
+            raw_text = f"老师原文：{text}"
         try:
             info = None if url else parse_simple_publication(text, now=datetime.now(ZoneInfo(config.TZ_NAME)))
         except ValueError as error:
@@ -1005,6 +1039,10 @@ class ACMBot:
                 "可以再发一次，尽量包含比赛名称和时间；实在没有也能先存个名字~",
             )
             return
+
+        # 有官网正文时再做一次「老师原文」确定性兜底：网页泛化内容不得吞掉原文写明的日期/赛道
+        if page:
+            info = self._apply_teacher_text_fallback(info, text)
 
         info["source_link"] = url
         try:
