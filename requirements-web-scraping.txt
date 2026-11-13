@@ -1,0 +1,9 @@
+# 独立抓取脚本 web_scraping.py 的额外依赖
+# 机器人主体运行不需要这些依赖；只运行抓取脚本时安装：
+#   pip install -r requirements-web-scraping.txt
+#   python -m playwright install chromium
+-r requirements.txt
+requests>=2.31.0,<3.0.0
+lxml>=5.0.0,<7.0.0
+openai>=1.30.0,<3.0.0
+playwright>=1.40.0,<2.0.0
