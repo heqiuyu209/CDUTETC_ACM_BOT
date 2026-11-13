@@ -94,16 +94,38 @@ def _teacher_names(gid: str) -> str:
     return "、".join(format_user_name(uid) for uid in uids) or "未登记"
 
 
+_SORT_TAIL = datetime.max.replace(tzinfo=TZ)
+
+
+def _contest_sort_key(contest: dict) -> tuple:
+    """「近期比赛」统一排序键：开赛时间正序 → 同时间 id 升序 → 时间未定排最后。"""
+    kickoff = reminder_view._parse_time(contest.get("contest_time") or "")
+    cid = contest.get("id")
+    return (1 if kickoff is None else 0, kickoff or _SORT_TAIL,
+            cid if isinstance(cid, int) else 10 ** 9)
+
+
 def contests(gid: str, *, this_week: bool = False, now: datetime | None = None) -> list[dict]:
+    """本群「近期比赛」列表：所有入口（/群配置 面板、/近期比赛 等）共用同一套时间正序。
+
+    列表严格按开赛时间由近到远排列，时间未定的排最后，同时间按 id 升序；
+    面板与命令侧只负责截取前 10 条，因此截断后保留的必然是最靠前的比赛。
+    今日已开赛但仍在进行中的比赛同样保留，不会被「开赛时间已过」过滤掉。
+    """
     now = now or datetime.now(TZ)
     start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     result = []
-    for contest in db.list_question_contests(gid, limit=1000):
-        dates = [value for value in (reminder_view._parse_time(contest.get(field) or "")
-                                     for field in ("contest_time", "reg_deadline")) if value]
-        if ((this_week and any(start <= value < start + timedelta(days=7) for value in dates))
-                or (not this_week and (not dates or any(value >= now for value in dates)))):
+    for contest in db.list_question_contests(gid, limit=1000, order="start"):
+        kickoff = reminder_view._parse_time(contest.get("contest_time") or "")
+        dates = [value for value in (kickoff, reminder_view._parse_time(contest.get("reg_deadline") or ""))
+                 if value]
+        ongoing_today = kickoff is not None and kickoff.date() == now.date()
+        if this_week:
+            if any(start <= value < start + timedelta(days=7) for value in dates):
+                result.append(contest)
+        elif not dates or any(value >= now for value in dates) or ongoing_today:
             result.append(contest)
+    result.sort(key=_contest_sort_key)
     return result
 
 

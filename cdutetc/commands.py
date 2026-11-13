@@ -2027,7 +2027,7 @@ async def handle_non_command_message(text: str, group_id: str, sender: str,
         if config.QA_SOCIAL_CHAT_ENABLED:
             return [{"group_id": group_id, "text": await llm.answer_social_chat(text)}]
         return []
-    if re.fullmatch(r"(?:请问|查一下|看看)?(?:本群|我们群|群里|这周|本周|近期|最近|现在|今天|接下来)?"
+    if re.fullmatch(r"(?:请问|查一下|看看)?(?:(?:本群|我们群|群里|这周|本周|近期|最近|现在|今天|接下来)的?){0,2}"
                     r"(?:有什么|有哪些|有没有|有啥)(?:比赛|竞赛)(?:安排)?[吗呢啊呀?？。！!\s]*", text.strip()):
         from cdutetc import group_admin
         items = group_admin.contests(group_id, this_week=bool(re.search(r"这周|本周", text)))

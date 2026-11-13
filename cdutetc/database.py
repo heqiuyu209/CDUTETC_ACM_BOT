@@ -715,20 +715,29 @@ def list_contests(group_id: str | None = None) -> list[dict]:
     return [_row_to_contest(r) for r in rows]
 
 
-def list_question_contests(group_id: str, limit: int = 5) -> list[dict]:
+def list_question_contests(group_id: str, limit: int = 5, *, order: str = "recent") -> list[dict]:
     """查询问答用比赛：已确认公共比赛 + 本群已归属的旧记录。
 
     调用方须先校验群白名单。v2 公共正式比赛供允许群共享，草稿与待审
-    更新不进入上下文；旧记录在 SQL 层按群过滤。按最近更新/创建时间
-    排序并限量，统一为问答使用的名称、时间、形式、地点和来源字段。
+    更新不进入上下文；旧记录在 SQL 层按群过滤。按 ``order`` 排序并限量，
+    统一为问答使用的名称、时间、形式、地点和来源字段，并带出 id 供调用方
+    做同时间排序的稳定兜底。
+
+    ``order="recent"``：按最近更新/创建时间倒序（问答上下文用）；
+    ``order="start"``：按开赛时间正序 —— 有明确开赛时间的在前且由近到远，
+    时间未定（空值）排最后，开赛时间相同按 id 升序（「近期比赛」展示用）。
     """
     if not group_id or limit <= 0:
         return []
-    fields = ("name", "reg_deadline", "contest_time", "mode", "location", "source_link")
+    fields = ("name", "reg_deadline", "contest_time", "mode", "location", "source_link", "id")
+    order_sql = (
+        "CASE WHEN contest_time IS NULL OR TRIM(contest_time) = '' THEN 1 ELSE 0 END,"
+        " contest_time ASC, id ASC"
+        if order == "start" else "sort_time DESC, is_public DESC, id DESC")
     with _connect() as conn:
         rows = conn.execute(
-            """
-            SELECT name, reg_deadline, contest_time, mode, location, source_link
+            f"""
+            SELECT name, reg_deadline, contest_time, mode, location, source_link, id
             FROM (
                 SELECT name, official_reg_deadline AS reg_deadline,
                        official_time AS contest_time, '' AS mode, '' AS location,
@@ -753,7 +762,7 @@ def list_question_contests(group_id: str, limit: int = 5) -> list[dict]:
                        source_link, created_at AS sort_time, 0 AS is_public, id
                 FROM contests WHERE group_id = ?
             )
-            ORDER BY sort_time DESC, is_public DESC, id DESC
+            ORDER BY {order_sql}
             LIMIT ?
             """,
             (group_id, group_id, limit),
