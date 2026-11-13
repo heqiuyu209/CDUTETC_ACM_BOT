@@ -386,6 +386,50 @@ def render_digest(sessions: list[dict], reminders: list[dict], competitions: lis
     return "\n".join(lines)
 
 
+def collect_daily_digest(group_id: str, now: datetime | None = None) -> dict:
+    """收集某群当日晨报素材，并给出「是否今日无赛」等判定信息。
+
+    晨报筛选严格按北京时间当天（00:00:00–23:59:59）开赛：
+    ``today_competitions`` 只保留 ``official_time`` 日期恰好等于今天、且
+    已关联到本群、状态为 confirmed 的比赛；时间未定（无法解析）、草稿、
+    已取消（状态非 confirmed）的场次一律不进晨报。
+
+    返回值供定时任务区分「今日无比赛静默跳过」与「其它原因无可推送内容」，
+    ``text`` 与 :func:`build_daily_digest` 完全一致（三段皆空时为 None）。
+
+    Returns:
+        字典，包含 ``text`` / ``sessions`` / ``reminders`` / ``competitions``
+        / ``today_contest_count`` / ``course_enabled`` / ``contest_enabled``。
+    """
+    current = _now(now)
+    gid = (group_id or "").strip()
+    detail = {
+        "group_id": gid,
+        "text": None,
+        "sessions": [],
+        "reminders": [],
+        "competitions": [],
+        "today_contest_count": 0,
+        "course_enabled": False,
+        "contest_enabled": False,
+    }
+    if not gid:
+        return detail
+    detail["course_enabled"] = db.group_switch_enabled(gid, "course_remind_enabled")
+    detail["contest_enabled"] = db.group_switch_enabled(gid, "contest_remind_enabled")
+    if detail["course_enabled"]:
+        detail["sessions"] = today_sessions(gid, current)
+    if detail["contest_enabled"]:
+        detail["competitions"] = today_competitions(gid, current)
+    # 自定义提醒属于老师手工维护的事务，不受上面两个群开关约束。
+    detail["reminders"] = today_reminders(gid, current)
+    detail["today_contest_count"] = len(detail["competitions"])
+    detail["text"] = render_digest(
+        detail["sessions"], detail["reminders"], detail["competitions"], current
+    )
+    return detail
+
+
 def build_daily_digest(group_id: str, now: datetime | None = None) -> str | None:
     """构建某群的「当日总览」；三段皆空时返回 None（不发空消息、不占主动额度）。
 
@@ -400,19 +444,7 @@ def build_daily_digest(group_id: str, now: datetime | None = None) -> str | None
     Returns:
         纯文本晨报正文，或 None。
     """
-    current = _now(now)
-    gid = (group_id or "").strip()
-    if not gid:
-        return None
-    sessions: list[dict] = []
-    competitions: list[dict] = []
-    if db.group_switch_enabled(gid, "course_remind_enabled"):
-        sessions = today_sessions(gid, current)
-    if db.group_switch_enabled(gid, "contest_remind_enabled"):
-        competitions = today_competitions(gid, current)
-    # 自定义提醒属于老师手工维护的事务，不受上面两个群开关约束。
-    reminders = today_reminders(gid, current)
-    return render_digest(sessions, reminders, competitions, current)
+    return collect_daily_digest(group_id, now)["text"]
 
 
 def build_piggyback_notice(group_id: str, now: datetime | None = None) -> str | None:

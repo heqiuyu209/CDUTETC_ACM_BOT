@@ -11,6 +11,7 @@
 """
 
 import asyncio
+import logging
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -174,3 +175,55 @@ def test_digest_job_respects_global_switch(env, monkeypatch):
 
     monkeypatch.setattr(config, "DAILY_DIGEST_ENABLED", True)
     assert asyncio.run(bot._daily_digest_job(now=THU)) == 1
+
+
+# ------------------------------------------------- F. 今日筛选 + 无赛静默跳过
+
+def test_digest_lists_only_today_when_two_today_and_one_tomorrow(env):
+    """今日 2 场 + 明日 1 场：晨报只能出现今日 2 场，明日场次一个字都不能有。"""
+    _contest(name="CF 今日 19:00 场", official_time="2026-11-12 19:00")
+    _contest(name="CF 今日 23:30 场", official_time="2026-11-12 23:30")
+    _contest(name="CF 明日 22:00 场", official_time="2026-11-13 22:00")
+
+    detail = daily_digest.collect_daily_digest("g1", THU)
+
+    assert detail["today_contest_count"] == 2
+    text = detail["text"]
+    assert "CF 今日 19:00 场" in text
+    assert "CF 今日 23:30 场" in text
+    assert "CF 明日 22:00 场" not in text
+
+
+def test_digest_excludes_retracted_and_undated_contests(env):
+    """被撤回为 draft（非 confirmed）与时间未定（无法解析 00:00:00–23:59:59）的场次都不进晨报。"""
+    _contest(name="CF 今日正常场", official_time="2026-11-12 20:00")
+    retracted = _contest(name="CF 今日撤回场", official_time="2026-11-12 21:00")
+    db.set_competition_status(retracted, "draft", operator="admin")
+    _contest(name="CF 今日待定场", official_time="")
+
+    detail = daily_digest.collect_daily_digest("g1", THU)
+
+    assert detail["today_contest_count"] == 1
+    assert "CF 今日正常场" in detail["text"]
+    assert "CF 今日撤回场" not in detail["text"]
+    assert "CF 今日待定场" not in detail["text"]
+
+
+def test_digest_job_silently_skips_when_no_contest_today(env, caplog):
+    """今日 0 场（明天、后天都有）时必须静默跳过：不调发送接口、返回 0、只记 INFO。"""
+    _contest(name="CF 明日 22:00 场", official_time="2026-11-13 22:00")
+    _contest(name="CF 后天 22:00 场", official_time="2026-11-14 22:00")
+    api = SimpleNamespace(post_group_message=AsyncMock(return_value={"id": "sent"}))
+    client = QQBotClient("offline-app", "offline-secret")
+    client._client = SimpleNamespace(api=api)
+    bot = main.ACMBot(client)
+
+    assert daily_digest.collect_daily_digest("g1", THU)["text"] is None
+    with caplog.at_level(logging.INFO):
+        assert asyncio.run(bot._daily_digest_job(now=THU)) == 0
+
+    api.post_group_message.assert_not_awaited()
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("[晨报] 群 g1 今日无比赛，已跳过发送" in text for text in messages)
+    assert any("[晨报] 群 g2 今日无比赛，已跳过发送" in text for text in messages)
+    assert all("今日暂无比赛" not in text for text in messages)

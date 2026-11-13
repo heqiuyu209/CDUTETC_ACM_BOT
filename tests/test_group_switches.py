@@ -167,11 +167,21 @@ async def test_qa_switch_off_still_allows_teacher_commands(gate_bot, monkeypatch
 
 # ---------------------------------------------------------------- 晨报推送门控
 
+def _digest_detail(group_id, now=None):
+    """晨报收集结果的最小替身：有内容、有今日比赛。"""
+    return {
+        "text": "晨报内容",
+        "today_contest_count": 1,
+        "contest_enabled": True,
+        "section_count": 1,
+    }
+
+
 async def test_daily_digest_skips_group_when_switch_off(gate_bot, monkeypatch):
     bot, _, _ = gate_bot
     monkeypatch.setattr(config, "DAILY_DIGEST_ENABLED", True)
     monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
-    monkeypatch.setattr(daily_digest, "build_daily_digest", lambda group_id, now=None: "晨报内容")
+    monkeypatch.setattr(daily_digest, "collect_daily_digest", _digest_detail)
     sent = AsyncMock(return_value=SimpleNamespace(ok=True, code=None))
     monkeypatch.setattr(bot, "_send_group_result", sent)
     database.set_group_switch("g1", "daily_digest_enabled", False, "teacher")
@@ -184,7 +194,7 @@ async def test_daily_digest_sends_when_switch_on(gate_bot, monkeypatch):
     bot, _, _ = gate_bot
     monkeypatch.setattr(config, "DAILY_DIGEST_ENABLED", True)
     monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
-    monkeypatch.setattr(daily_digest, "build_daily_digest", lambda group_id, now=None: "晨报内容")
+    monkeypatch.setattr(daily_digest, "collect_daily_digest", _digest_detail)
     sent = AsyncMock(return_value=SimpleNamespace(ok=True, code=None))
     monkeypatch.setattr(bot, "_send_group_result", sent)
 

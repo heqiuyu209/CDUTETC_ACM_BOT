@@ -2616,6 +2616,13 @@ def _sync_contest_start_reminders(conn: sqlite3.Connection, competition_id: int,
         "SELECT status, official_time FROM competitions WHERE id = ?", (competition_id,)
     ).fetchone()
     if row is None:
+        # 比赛记录已不存在（物理清理或被替换）：残留的待发节点必须一并取消，
+        # 否则开赛前 15 分钟会推一条指向不存在比赛的提醒。
+        conn.execute(
+            "UPDATE reminder_deliveries SET status = 'cancelled', lease_token = '', lease_until = ''"
+            " WHERE obj_type = 'competition' AND obj_id = ? AND remind_type = 'contest_start'"
+            " AND status IN ('pending', 'sending')", (competition_id,),
+        )
         return
     offsets = tuple(getattr(config, "CONTEST_REMIND_OFFSETS_MINUTES", (30, 15)))
     try:

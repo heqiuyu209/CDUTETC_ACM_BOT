@@ -221,3 +221,98 @@ def test_weekly_confirmed_creation_uses_weekly_group_scope(db_conn, monkeypatch)
     )
     assert created
     assert {row[0] for row in _plans(db_conn, cid) if row[2] == "pending"} == {"g2"}
+
+
+# ------------------------------------------------- 全渠道：开赛前 15 分钟节点
+
+def test_crawl_created_contest_schedules_start_15min_delivery(db_conn, monkeypatch):
+    """渠道① 定时爬虫：新抓比赛自动关联群后，必须生成 start-15min 待发送节点。"""
+    from cdutetc import crawler
+
+    now = datetime(2026, 11, 6, 10, 0, tzinfo=TZ)
+    monkeypatch.setattr(database, "_delivery_now", lambda value=None: value or now)
+    monkeypatch.setattr(config, "AUTO_CONTEST_CRAWL_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "AUTO_CONTEST_AUTO_CONFIRM", True, raising=False)
+    monkeypatch.setattr(config, "AUTO_CONTEST_WINDOW_DAYS", 14, raising=False)
+    monkeypatch.setattr(config, "AUTO_CONTEST_NOTIFY_GROUPS", frozenset(), raising=False)
+    start = now + timedelta(hours=3)  # 13:00 开赛
+
+    async def cf_fetch(url):
+        return {"status": "OK", "result": [{
+            "id": 9001, "name": "Codeforces Round 1201",
+            "startTimeSeconds": int(start.timestamp()),
+            "durationSeconds": 7200, "phase": "BEFORE",
+        }]}
+
+    async def nc_fetch(url):
+        return ""
+
+    result = asyncio.run(crawler.run_contest_fetch(
+        now, fetchers={"codeforces_fetch": cf_fetch, "nowcoder_fetch": nc_fetch}))
+    created = [item for item in result if item["kind"] == "created"]
+    assert len(created) == 1
+    cid = created[0]["competition_id"]
+
+    nodes = [p for p in _plans(db_conn, cid) if p[2] == "pending"]
+    assert {p[0] for p in nodes} == {"g1", "g2"}          # 每群各排一条
+    fifteen = [p for p in nodes if p[3] == "2026-11-06 12:45:00"]
+    assert len(fifteen) == 2                              # 13:00 开赛 → 12:45
+    assert all(p[6].endswith("|0.25") for p in fifteen)    # 15 分钟 = 0.25 小时
+
+
+def test_approval_creates_start_15min_delivery(db_conn):
+    """渠道② 超管私聊「同意 <编号>」审批入库：必须生成 start-15min 待发送节点。"""
+    now = datetime(2026, 11, 6, 10, 0, tzinfo=TZ)
+    pid = _pending(contest_time=now + timedelta(hours=2))   # 12:00 开赛
+    cid, created = database.approve_pending_publication(pid, "admin")
+    assert created is True
+
+    fifteen = [p for p in _plans(db_conn, cid)
+               if p[2] == "pending" and p[6].endswith("|0.25")]
+    assert len(fifteen) == 1
+    assert fifteen[0][0] == "g1"
+    assert fifteen[0][3] == "2026-11-06 11:45:00"
+    assert fifteen[0][1] == "2026-11-06 12:00"
+
+
+def test_amend_time_reschedules_start_15min_delivery(db_conn):
+    """渠道③ /修正 time="..."：旧 15 分钟节点取消，新时间重新排 start-15min。"""
+    now = datetime(2026, 11, 6, 10, 0, tzinfo=TZ)
+    pid = _pending(contest_time=now + timedelta(hours=2))   # 12:00 开赛
+    cid, _ = database.approve_pending_publication(pid, "admin")
+
+    assert database.amend_competition(
+        cid, {"official_time": "2026-11-06 14:00"}, operator="admin"
+    )
+
+    rows = [p for p in _plans(db_conn, cid) if p[6].endswith("|0.25")]
+    old = [p for p in rows if p[1] == "2026-11-06 12:00"]
+    new = [p for p in rows if p[1] == "2026-11-06 14:00"]
+    assert old and all(p[2] == "cancelled" for p in old)    # 旧节点不误报
+    assert len(new) == 1 and new[0][2] == "pending"
+    assert new[0][3] == "2026-11-06 13:45:00"
+
+
+def test_retracted_contest_drops_pending_start_15min_delivery(db_conn):
+    """比赛被撤回为 draft（不再 confirmed）时，待发送的 15 分钟节点必须一并取消。"""
+    now = datetime(2026, 11, 6, 10, 0, tzinfo=TZ)
+    pid = _pending(contest_time=now + timedelta(hours=2))
+    cid, _ = database.approve_pending_publication(pid, "admin")
+    assert [p for p in _plans(db_conn, cid) if p[2] == "pending"]
+
+    assert database.set_competition_status(cid, "draft", operator="admin")
+
+    statuses = {p[2] for p in _plans(db_conn, cid)}
+    assert statuses == {"cancelled"}
+
+
+def test_removed_contest_purges_pending_start_15min_delivery(db_conn):
+    """比赛记录被物理移除后再次同步，残留待发节点必须被取消而不是静默遗留。"""
+    now = datetime(2026, 11, 6, 10, 0, tzinfo=TZ)
+    pid = _pending(contest_time=now + timedelta(hours=2))
+    cid, _ = database.approve_pending_publication(pid, "admin")
+    db_conn.execute("DELETE FROM competitions WHERE id = ?", (cid,))
+
+    database._sync_contest_start_reminders(db_conn, cid)
+
+    assert {p[2] for p in _plans(db_conn, cid)} == {"cancelled"}

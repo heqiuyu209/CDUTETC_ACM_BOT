@@ -84,6 +84,47 @@ def test_contest_crawl_time_falls_back_on_invalid(monkeypatch, raw):
         importlib.reload(config)
 
 
+# ---------------------------------------------------------------- 晨报时刻
+
+def test_daily_digest_default_fires_after_contest_crawl(monkeypatch):
+    """默认配置下晨报必须晚于赛程抓取，否则会把当天新抓到的比赛漏掉。"""
+    try:
+        with monkeypatch.context() as env:
+            env.delenv("ACM_CONTEST_CRAWL_TIME", raising=False)
+            env.delenv("ACM_DAILY_DIGEST_TIME", raising=False)
+            importlib.reload(config)
+            crawl = config.CONTEST_CRAWL_HOUR * 60 + config.CONTEST_CRAWL_MINUTE
+            digest = config.DAILY_DIGEST_HOUR * 60 + config.DAILY_DIGEST_MINUTE
+            assert crawl == 8 * 60 + 5
+            assert digest > crawl
+    finally:
+        importlib.reload(config)
+
+
+def test_daily_digest_clock_is_pushed_after_crawl_when_misconfigured(monkeypatch):
+    """晨报时刻配得比抓取更早时自动顺延，而不是读到昨天的赛程。"""
+    try:
+        with monkeypatch.context() as env:
+            env.setenv("ACM_CONTEST_CRAWL_TIME", "08:05")
+            env.setenv("ACM_DAILY_DIGEST_TIME", "08:00")
+            importlib.reload(config)
+            assert (config.DAILY_DIGEST_HOUR, config.DAILY_DIGEST_MINUTE) == (8, 15)
+    finally:
+        importlib.reload(config)
+
+
+def test_contest_remind_offsets_always_contain_required_15_minutes(monkeypatch):
+    """环境变量只写 30 时也不能剔除 15 分钟节点，否则全渠道会静默丢失该提醒。"""
+    try:
+        with monkeypatch.context() as env:
+            env.setenv("ACM_CONTEST_REMIND_OFFSETS_MINUTES", "30")
+            importlib.reload(config)
+            assert 15 in config.CONTEST_REMIND_OFFSETS_MINUTES
+            assert 30 in config.CONTEST_REMIND_OFFSETS_MINUTES
+    finally:
+        importlib.reload(config)
+
+
 # ---------------------------------------------------------------- 调度注册
 
 async def test_source_crawl_job_is_daily_cron(memory_db, monkeypatch):

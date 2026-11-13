@@ -1358,6 +1358,8 @@ class ACMBot:
         设计要点：
         - 只对授权群（运行时白名单）逐个生成，某群内容为空则整群跳过，
           不发空消息浪费额度；
+        - 今日无比赛（且当天没有其它可报事务）时静默跳过，只记 INFO 日志，
+          绝不发送「今日暂无比赛」这类空通知占用主动额度；
         - 单群失败不影响其他群：配额耗尽（11253/11263）已在
           ``_send_group_result`` 内持久熔断，这里只记告警并继续下一个群；
         - now 供离线验证注入，无时区按北京时间处理。
@@ -1370,13 +1372,22 @@ class ACMBot:
             logger.info("主动群消息未启用，暂停晨报投递")
             return 0
         sent = 0
+        skipped = 0
         try:
             for group_id in sorted(config.ALLOWED_GROUPS):
                 try:
                     if not db.group_switch_enabled(group_id, "daily_digest_enabled"):
                         continue
-                    text = daily_digest.build_daily_digest(group_id, now=now)
+                    detail = daily_digest.collect_daily_digest(group_id, now=now)
+                    text = detail["text"]
                     if not text:
+                        # 硬性跳过规则：全天无赛即静默跳过；即便群开关关闭导致
+                        # 赛事段为空，也不会发出任何「今日暂无比赛」字样。
+                        if detail["contest_enabled"] and detail["today_contest_count"] == 0:
+                            logger.info("[晨报] 群 %s 今日无比赛，已跳过发送", group_id)
+                        else:
+                            logger.info("[晨报] 群 %s 今日无可推送内容，已跳过发送", group_id)
+                        skipped += 1
                         continue
                     result = await self._send_group_result(group_id, text)
                 except Exception:  # noqa: BLE001 - 单群异常不得中断其余群
@@ -1397,6 +1408,8 @@ class ACMBot:
             logger.exception("[晨报] 本次调度执行异常，跳过本轮等待下次触发")
         if sent:
             logger.info("[晨报] 本次成功推送 %d 个群的事务总览", sent)
+        if skipped:
+            logger.info("[晨报] 本次跳过 %d 个无可推送内容的群", skipped)
         return sent
 
     async def _weekly_contest_job(self, now: datetime | None = None):
