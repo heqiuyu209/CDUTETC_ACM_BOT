@@ -460,9 +460,27 @@ DAILY_DIGEST_HOUR, DAILY_DIGEST_MINUTE = _digest_clock()
 DAILY_DIGEST_PIGGYBACK_ENABLED = os.getenv("ACM_DAILY_DIGEST_PIGGYBACK_ENABLED", "1") != "0"
 
 # ================= 公共来源低频集中抓取（v2，默认关闭） =================
-# 自动抓取默认关闭：开启后同一来源两次抓取的最小间隔（分钟）由下值控制。
+# 自动抓取默认关闭：开启后每天固定时刻抓一次（时刻见 CONTEST_CRAWL_*），
+# 避免按小时轮询把有限的对外请求与主动额度浪费在无变化的时间段上。
 AUTO_FETCH_ENABLED = os.getenv("ACM_AUTO_FETCH_ENABLED", "0") != "0"
+# 仅保留给「手动 /抓取」等入口的频率下限：两次手动抓取的最小间隔（分钟）。
 FETCH_MIN_INTERVAL_MINUTES = int(os.getenv("ACM_FETCH_MIN_INTERVAL_MINUTES", "60"))
+
+
+def _contest_crawl_clock() -> tuple[int, int]:
+    """解析比赛抓取时刻（HH:MM）；非法值回落到 08:05，不让机器人因配置笔误起不来。"""
+    raw = os.getenv("ACM_CONTEST_CRAWL_TIME", "08:05").strip()
+    try:
+        hour_text, minute_text = raw.split(":", 1)
+        hour, minute = int(hour_text), int(minute_text)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError(raw)
+        return hour, minute
+    except (ValueError, AttributeError):
+        return 8, 5
+
+
+CONTEST_CRAWL_HOUR, CONTEST_CRAWL_MINUTE = _contest_crawl_clock()
 # 自动抓取生成的记录默认不通知全员，由超管确认后处理（/修正 或 /比赛详情 人工核对）。
 
 # ================= 本地数据 =================

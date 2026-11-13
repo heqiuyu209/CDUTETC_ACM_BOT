@@ -369,10 +369,13 @@ class ACMBot:
             max_instances=1,
             coalesce=True,
         )
+        # 公共来源抓取改为每天固定时刻一次（默认 08:05，可用 ACM_CONTEST_CRAWL_TIME 覆盖）；
+        # FETCH_MIN_INTERVAL_MINUTES 只约束手动 /抓取 的触发频率，不再驱动定时任务。
         sched.add_job(
             self._crawl_job,
-            "interval",
-            minutes=config.FETCH_MIN_INTERVAL_MINUTES,
+            "cron",
+            hour=config.CONTEST_CRAWL_HOUR,
+            minute=config.CONTEST_CRAWL_MINUTE,
             id="source-crawl",
             max_instances=1,
             coalesce=True,
@@ -410,9 +413,10 @@ class ACMBot:
         sched.start()
         self.sched = sched
         logger.info(
-            "机器人已上线：每 %d 分钟检查提醒，每 %d 分钟抓取公共来源%s",
+            "机器人已上线：每 %d 分钟检查提醒，每天 %02d:%02d 抓取一次公共来源%s",
             config.REMIND_CHECK_INTERVAL_MINUTES,
-            config.FETCH_MIN_INTERVAL_MINUTES,
+            config.CONTEST_CRAWL_HOUR,
+            config.CONTEST_CRAWL_MINUTE,
             "，自动周赛已开启（%s %s-%s）" % (
                 "周日" if config.WEEKLY_CONTEST_WEEKDAY == 6 else f"星期{config.WEEKLY_CONTEST_WEEKDAY + 1}",
                 config.WEEKLY_CONTEST_START,

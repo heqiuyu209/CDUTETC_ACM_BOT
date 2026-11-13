@@ -134,27 +134,27 @@ def test_digest_is_none_when_everything_empty(env):
 
 def test_digest_renders_plain_text_overview(env):
     _course()
-    _collection(capacity=2)
+    db.create_custom_reminder("g1", "交周报", "2026-11-11 20:00")
     _contest()
 
     text = daily_digest.build_daily_digest("g1", NOW)
 
     assert text.startswith(daily_digest.DIGEST_TITLE)
     assert "📚 今日课程/训练：" in text
-    assert "2026-11-11 19:00-21:00 图论进阶 (实训楼 B302)" in text
-    assert "⏳ 征集截止：" in text and "剩 2 个名额" in text
-    assert "🏆 近期赛事：" in text and "Codeforces Round 990" in text
+    assert "2026-11-11 19:00-21:00 图论进阶 (地点：实训楼 B302)" in text
+    assert "🏆 今日赛事：" in text and "Codeforces Round 990" in text
+    assert "🗓 今日其他安排：" in text and "20:00 交周报" in text
     assert text.rstrip().endswith(daily_digest.DIGEST_FOOTER)
     for markdown in ("**", "##", "|", "`"):  # 纯文本，防官方客户端拦截
         assert markdown not in text
 
 
 def test_digest_omits_empty_sections(env):
-    _collection(deadline="2026-11-12 12:00")
+    db.create_custom_reminder("g1", "交周报", "2026-11-11 20:00")
     text = daily_digest.build_daily_digest("g1", NOW)
-    assert "⏳ 征集截止：" in text
+    assert "🗓 今日其他安排：" in text
     assert "📚 今日课程/训练：" not in text
-    assert "🏆 近期赛事：" not in text
+    assert "🏆 今日赛事：" not in text
 
 
 # --------------------------------------------------------------- 搭便车
@@ -267,8 +267,8 @@ def _bot(api):
 
 
 def test_daily_digest_job_skips_quota_exhausted_group(env, caplog):
-    _collection("g1", deadline="2026-11-11 21:00")
-    _collection("g2", deadline="2026-11-11 21:00")
+    _course(group_id="g1")
+    _course(group_id="g2")
 
     async def post_group_message(*args, **kwargs):
         target = kwargs.get("group_openid") or kwargs.get("group_id") or (args[0] if args else "")

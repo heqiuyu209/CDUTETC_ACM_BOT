@@ -592,7 +592,7 @@ def cmd_org_events(group_id: str, sender: str, args: str) -> list[dict]:
     lines = ["学校统一安排："]
     for e in events:
         t = e["contest_time"] or e["reg_deadline"] or ""
-        lines.append(f"#{e['id']} {e['title']}｜{t}｜{e.get('location') or '地点待定'}")
+        lines.append(f"#{e['id']} {e['title']}｜{t}｜{(e.get('location') or '').strip() or '待定'}")
     return [{"group_id": group_id, "text": "\n".join(lines)}]
 
 
@@ -611,8 +611,9 @@ def cmd_training_list(group_id: str, sender: str, args: str) -> list[dict]:
         )
         if span:
             cell.append(span)
-        elif s.get("location"):
-            cell.append(f"地点：{s['location']}")
+        # 地点统一兜底：None / 空串 / 纯空白都渲染成「待定」，
+        # 且与「要求：」各自独占一段，避免拼接后粘成一行。
+        cell.append(f"地点：{(s.get('location') or '').strip() or '待定'}")
         requirement = (s.get("requirement") or "").strip()
         if requirement:
             cell.append(f"要求：{requirement}")
@@ -691,7 +692,7 @@ def cmd_notice_list(group_id: str, sender: str, args: str) -> list[dict]:
             t = e.get("contest_time") or e.get("reg_deadline") or ""
             if t:
                 extra.append(t)
-            extra.append(e.get("location") or "地点待定")
+            extra.append((e.get("location") or "").strip() or "待定")
             lines.append("· " + (e.get("title") or "未命名安排") + "｜" + "｜".join(extra))
     if sessions:
         lines.append(f"【课程安排】{len(sessions)} 条")
@@ -700,7 +701,7 @@ def cmd_notice_list(group_id: str, sender: str, args: str) -> list[dict]:
             lines.append(
                 "· " + f"{s.get('title') or '课程'}{need}"
                 f"｜{s.get('weekday') or ''} {s.get('start_time') or ''}-{s.get('end_time') or ''}"
-                f"｜{s.get('location') or '地点待定'}"
+                f"｜{(s.get('location') or '').strip() or '待定'}"
             )
     if collections:
         lines.append(f"【报名中的征集】{len(collections)} 条")

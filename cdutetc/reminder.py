@@ -309,16 +309,24 @@ def build_training_reminders(sessions: list[dict], now: datetime) -> list[dict]:
                 details.append(f"软件：{session['software']}")
             if session.get("device_req"):
                 details.append(f"设备：{session['device_req']}")
+            # 地点缺失（None / 空串 / 纯空白）统一兜底为「待定」；
+            # 每一行独立换行，避免「地点：待定要求：…」这类粘连毁掉可读性。
+            location = (session.get("location") or "").strip() or "待定"
+            requirement = (session.get("requirement") or "").strip()
+            text_lines = [
+                f"【提醒】课程「{session['title']}」开始：{target_str}",
+                f"地点：{location}",
+            ]
+            if requirement:
+                text_lines.append(f"要求：{requirement}")
+            if details:
+                text_lines.append("；".join(details))
+            text_lines.append("记得留好时间，我们课上见。")
             out.append({
                 "group_id": group_id, "obj_type": "training_session", "obj_id": session["id"],
                 "remind_type": "start_time", "target_str": target_str,
                 "offset_hours": offset,
-                "text": (
-                    f"【提醒】课程「{session['title']}」开始：{target_str}\n"
-                    f"地点：{session.get('location') or '待定'}"
-                    + ("\n" + "；".join(details) if details else "")
-                    + "\n记得留好时间，我们课上见。"
-                ),
+                "text": "\n".join(text_lines),
             })
     return out
 
