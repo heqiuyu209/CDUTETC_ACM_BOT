@@ -47,6 +47,20 @@ _CONTEST_TIME_FIELDS = (
 _FALLBACK_ERR = "模型调用失败，请稍后再试或直接发送比赛信息"
 
 
+def normalize_text_value(value) -> str | None:
+    """把模型偶发返回的 list/tuple 文本字段归一化为顿号分隔字符串。
+
+    模型经常把 tracks 等文本字段输出成 JSON 数组（如 ["C","C++"]），
+    直接按严格类型校验会整条拒绝提取结果。这里统一清洗：
+    - list/tuple → "、".join(去空后的字符串元素)
+    - 其它类型原样返回，由调用方做严格校验
+    """
+    if isinstance(value, (list, tuple)):
+        parts = [str(x).strip() for x in value if str(x).strip()]
+        return "、".join(parts)
+    return value
+
+
 def normalize_time(text, *, now: datetime | None = None) -> str | None:
     """非空时间必须是合法日期，统一为 YYYY-MM-DD HH:MM；非法返回 None。
 
@@ -90,7 +104,7 @@ def validate_contest_info(info, *, now: datetime | None = None) -> tuple[dict | 
 
     cleaned: dict = {"name": name.strip()}
     for field in _CONTEST_TIME_FIELDS:
-        raw = info.get(field)
+        raw = normalize_text_value(info.get(field))
         if raw is None or (isinstance(raw, str) and not raw.strip()):
             cleaned[field] = ""  # 时间缺失 = 待定
             continue
@@ -101,7 +115,7 @@ def validate_contest_info(info, *, now: datetime | None = None) -> tuple[dict | 
             return None, f"{field} 时间无法解析：{raw}（请使用 YYYY-MM-DD HH:MM 格式）"
         cleaned[field] = norm
     for field in _STRING_FIELDS:
-        value = info.get(field)
+        value = normalize_text_value(info.get(field))
         if value is None:
             cleaned[field] = ""
         elif isinstance(value, str):
@@ -277,6 +291,14 @@ async def extract_contest(raw_text: str) -> tuple[dict | None, str | None]:
         "contest_time（比赛时间，YYYY-MM-DD HH:MM）、mode（形式）、location（地点）。\n"
         "可选字段：edition（届次）、official_reg_start（报名开始，YYYY-MM-DD HH:MM）、"
         "tracks（赛道）、raw_note（官方规则）、device_req（设备要求）、summary（摘要）。\n"
+        "tracks 等文本字段一律输出字符串；赛道有多个时用顿号连接，"
+        "如 \"C、C++、Python、Java\"，禁止输出 JSON 数组。\n"
+        "输入可能含「链接正文」与「老师原文」两段，老师原文是本群老师/负责人的直接通知，"
+        "优先级高于链接正文：\n"
+        "- 老师原文明确给出的比赛时间、报名截止、赛道、地点，必须原样采用；\n"
+        "- 链接正文只是官网首页、栏目页等泛化内容时，其中没有具体日期或赛道，"
+        "不得据此外推，也不得把老师原文已写明的时间/赛道置空；\n"
+        "- 两段冲突时以老师原文为准，链接正文只用于补充原文没有的信息。\n"
         "无法确定的字段省略，不猜测或用空字段覆盖原信息。\n"
         f"当前北京时间：{reference:%Y-%m-%d %H:%M}。聊天中的今天/明天以此为准；未写日期的明确钟点按今天解释。"
         "网页相对日期应依据其明确的发布日期，参照不明时省略，不直接套用今天。\n"

@@ -379,3 +379,44 @@ async def test_onebot_publish_twice_preserves_fields_without_second_notification
     assert counts(db_file[0]) == (1, 1, 1, 1)
     added = onebot.send_group_msg_result.await_args_list[len(first_calls):]
     assert len(added) == 1 and added[0].args[0] == "g1" and "未重复发布" in added[0].args[1]
+
+
+def test_list_valued_tracks_are_normalized_instead_of_rejected():
+    """模型把 tracks 输出成数组时应归一化为顿号字符串，而不是校验失败。"""
+    cleaned, error = validate_contest_info(
+        {"name": " 校赛 ", "tracks": ["C", "C++", "Python", "Java", " "]},
+    )
+    assert error is None
+    assert cleaned["tracks"] == "C、C++、Python、Java"
+    assert map_competition_info(cleaned)["tracks"] == "C、C++、Python、Java"
+    assert crawler._map_competition_info({"name": "校赛", "tracks": ["C", "Python"]}) == {
+        "name": "校赛", "tracks": "C、Python",
+    }
+
+
+def test_tuple_time_field_is_normalized_before_parsing():
+    cleaned, error = validate_contest_info(
+        {"name": "校赛", "contest_time": ("2026-11-29",), "reg_deadline": []},
+    )
+    assert error is None
+    assert cleaned["contest_time"] == "2026-11-29 00:00"
+    assert cleaned["reg_deadline"] == ""
+
+
+async def test_extraction_prompt_prefers_teacher_text_and_forbids_array_tracks(monkeypatch):
+    """链接首页无细节时，提示词要求以老师原文的时间与赛道为准，且禁止输出数组。"""
+    chat = AsyncMock(return_value=json.dumps({
+        "name": "成都理工程序设计校赛",
+        "contest_time": "2026-11-29 09:00",
+        "tracks": ["C", "C++", "Python", "Java"],
+    }, ensure_ascii=False))
+    monkeypatch.setattr(llm, "_chat_once", chat)
+    info, error = await llm.extract_contest(
+        "链接正文：程序设计大赛官网首页，欢迎报名。\n老师原文：11月29日上午9点开赛，赛道C、C++、Python、Java",
+    )
+    assert error is None
+    assert info["contest_time"] == "2026-11-29 09:00"
+    assert info["tracks"] == "C、C++、Python、Java"
+    system = chat.await_args.args[0]
+    assert "老师原文" in system and ("优先级高于链接正文" in system)
+    assert "禁止输出 JSON 数组" in system
