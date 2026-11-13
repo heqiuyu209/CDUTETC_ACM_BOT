@@ -52,7 +52,11 @@ from cdutetc.database import create_published_competition_once, init_db
 from cdutetc.fetcher import FetchError, fetch_text
 from cdutetc.llm import extract_contest, normalize_time
 from cdutetc.publish_text import is_timed_contest_announcement, parse_simple_publication
-from cdutetc.reminder import check_general_reminders, check_contest_start_reminders
+from cdutetc.reminder import (
+    check_contest_start_reminders,
+    check_custom_reminders,
+    check_general_reminders,
+)
 from cdutetc.utils import (
     admin_group_id,
     can_manage_group,
@@ -352,6 +356,8 @@ class ACMBot:
             minutes=config.REMIND_CHECK_INTERVAL_MINUTES,
             id="general-remind-check",
             next_run_time=now,
+            max_instances=1,
+            coalesce=True,
         )
         sched.add_job(
             self._contest_remind_job,
@@ -362,11 +368,16 @@ class ACMBot:
             max_instances=1,
             coalesce=True,
         )
+        # 公共来源抓取改为每天固定时刻一次（默认 08:05，可用 ACM_CONTEST_CRAWL_TIME 覆盖）；
+        # FETCH_MIN_INTERVAL_MINUTES 只约束手动 /抓取 的触发频率，不再驱动定时任务。
         sched.add_job(
             self._crawl_job,
-            "interval",
-            minutes=config.FETCH_MIN_INTERVAL_MINUTES,
+            "cron",
+            hour=config.CONTEST_CRAWL_HOUR,
+            minute=config.CONTEST_CRAWL_MINUTE,
             id="source-crawl",
+            max_instances=1,
+            coalesce=True,
         )
         if config.DAILY_DIGEST_ENABLED:
             # 每日固定时刻推送一次聚合晨报；coalesce 保证服务重启/休眠后只补一次。
@@ -394,14 +405,17 @@ class ACMBot:
                 hour=generation_at.hour,
                 minute=generation_at.minute,
                 id="weekly-contest",
+                max_instances=1,
+                coalesce=True,
             )
             await self._weekly_contest_job(now=now)
         sched.start()
         self.sched = sched
         logger.info(
-            "机器人已上线：每 %d 分钟检查提醒，每 %d 分钟抓取公共来源%s",
+            "机器人已上线：每 %d 分钟检查提醒，每天 %02d:%02d 抓取一次公共来源%s",
             config.REMIND_CHECK_INTERVAL_MINUTES,
-            config.FETCH_MIN_INTERVAL_MINUTES,
+            config.CONTEST_CRAWL_HOUR,
+            config.CONTEST_CRAWL_MINUTE,
             "，自动周赛已开启（%s %s-%s）" % (
                 "周日" if config.WEEKLY_CONTEST_WEEKDAY == 6 else f"星期{config.WEEKLY_CONTEST_WEEKDAY + 1}",
                 config.WEEKLY_CONTEST_START,
@@ -450,10 +464,18 @@ class ACMBot:
                     bound = admin_session.get_active_group(str(uid)) or ""
                     if "全部" in (args or ""):
                         bound = ""
+                    # 私聊 /群配置 <序号> 解析成功后顺手锁定工作区（C5），后续业务指令
+                    # 无需再 /选群。仅处理候选列表序号，避免与「按群查询」只读语义混淆；
+                    # 且在本条指令执行之后绑定，保证本条查询仍按原作用域解析。
                     replies = group_admin.handle_command(cmd, args, uid, bound)
+                    if cmd == "群配置":
+                        tokens = (args or "").split()
+                        if len(tokens) == 1 and tokens[0].isdigit():
+                            commands.bind_active_group(str(uid), tokens[0])
                     if any(reply.get("refresh_weekly") for reply in replies or []):
                         await self._weekly_contest_job()
-                    for reply in replies or []:
+                    # 私聊管理回执同样带工作区标牌，与业务指令出口保持一致
+                    for reply in commands.with_private_header(replies, str(uid)) or []:
                         await self._send_private_result(uid, reply["text"])
                     return
                 if cmd == "通知测试":
@@ -579,6 +601,25 @@ class ACMBot:
                     (message.content or "")[:50],
                 )
             if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
+                text = strip_at(message.content or "")
+                cmd, _ = parse_command(text)
+                member_id = self._extract_member_id(message)
+                addressed = is_addressed_to_bot(message, self.bot_identity)
+                targets = {item["id"] for item in message_mentions(message) if item["id"]}
+                if (cmd == "认领此群" and is_super_admin(member_id)
+                        and (addressed or (not config.GROUP_REQUIRE_AT and not targets))):
+                    replies = await commands.handle_command(text, group_id, member_id)
+                    for reply in replies or []:
+                        if reply.get("text"):
+                            if self.supports_passive_reply and not getattr(message, "id", ""):
+                                continue
+                            seq = _clamp_reply_seq(_reply_sequence.get() + 1)
+                            _reply_sequence.set(seq)
+                            await notifications.send_group(
+                                self.client, group_id, reply["text"],
+                                reply_to=str(getattr(message, "id", "") or ""), reply_seq=seq,
+                            )
+                    return
                 logger.info("非授权群消息已忽略: %s", group_id)
                 await self._notice_unauthorized_group(message, group_id)
                 return
@@ -648,6 +689,10 @@ class ACMBot:
                         logger.info("识别为发布比赛意图，转发布流程")
                         await self._handle_publish(message, text, group_id, member_id)
                         return
+                # 群开关闸门：问答关闭后不再自动回答自由文本，命令仍照常执行
+                if not db.group_switch_enabled(group_id, "qa_enabled"):
+                    logger.info("本群问答开关已关闭，跳过自动回答")
+                    return
                 replies = await commands.handle_non_command_message(
                     text, group_id, member_id, staff=can_manage_group(member_id)
                 )
@@ -1135,6 +1180,7 @@ class ACMBot:
             return
         try:
             await check_general_reminders(self._send_group_result)
+            await check_custom_reminders(self._send_group_result)
         except Exception:  # noqa: BLE001
             logger.exception("通用提醒扫描失败，等待下一轮重试")
 
@@ -1156,26 +1202,31 @@ class ACMBot:
             logger.info("主动群消息未启用，暂停晨报投递")
             return 0
         sent = 0
-        for group_id in sorted(config.ALLOWED_GROUPS):
-            try:
-                text = daily_digest.build_daily_digest(group_id, now=now)
-                if not text:
+        try:
+            for group_id in sorted(config.ALLOWED_GROUPS):
+                try:
+                    if not db.group_switch_enabled(group_id, "daily_digest_enabled"):
+                        continue
+                    text = daily_digest.build_daily_digest(group_id, now=now)
+                    if not text:
+                        continue
+                    result = await self._send_group_result(group_id, text)
+                except Exception:  # noqa: BLE001 - 单群异常不得中断其余群
+                    logger.exception("[晨报] 群 %s 生成或发送异常，继续下一个群", group_id)
                     continue
-                result = await self._send_group_result(group_id, text)
-            except Exception:  # noqa: BLE001 - 单群异常不得中断其余群
-                logger.exception("[晨报] 群 %s 生成或发送异常，继续下一个群", group_id)
-                continue
-            if result.ok:
-                sent += 1
-                continue
-            if result.code == DeliveryCode.QUOTA_EXHAUSTED:
-                logger.warning(
-                    "[晨报] 群 %s 主动消息配额已耗尽，本群今日跳过（已熔断，不再重试）",
-                    group_id,
-                )
-            else:
-                logger.warning("[晨报] 群 %s 未发送 [%s]",
-                               group_id, getattr(result.code, "value", result.code))
+                if result.ok:
+                    sent += 1
+                    continue
+                if result.code == DeliveryCode.QUOTA_EXHAUSTED:
+                    logger.warning(
+                        "[晨报] 群 %s 主动消息配额已耗尽，本群今日跳过（已熔断，不再重试）",
+                        group_id,
+                    )
+                else:
+                    logger.warning("[晨报] 群 %s 未发送 [%s]",
+                                   group_id, getattr(result.code, "value", result.code))
+        except Exception:  # noqa: BLE001 - 循环外的兜底，异常不得逸出调度器
+            logger.exception("[晨报] 本次调度执行异常，跳过本轮等待下次触发")
         if sent:
             logger.info("[晨报] 本次成功推送 %d 个群的事务总览", sent)
         return sent
@@ -1188,6 +1239,13 @@ class ACMBot:
         """
         if not config.WEEKLY_CONTEST_ENABLED:
             return
+        try:
+            await self._create_weekly_contest(now=now)
+        except Exception:  # noqa: BLE001 - DB 锁/时区等意外异常统一兜底，不向上抛出
+            logger.exception("[周赛] 本轮调度执行异常，跳过本轮等待下次触发")
+
+    async def _create_weekly_contest(self, now: datetime | None = None) -> None:
+        """按周幂等生成下一场周赛（由 ``_weekly_contest_job`` 统一兜底调用）。"""
         template = config.WEEKLY_CONTEST_TEMPLATE
         try:
             now = now or datetime.now(ZoneInfo(config.TZ_NAME))
@@ -1225,8 +1283,23 @@ class ACMBot:
         logger.info("已自动生成周赛记录: %s（id=%s），未通知全员", template, cid)
 
     async def _crawl_job(self):
-        """周期抓取公共来源（默认关闭）：变化检测 → 待审更新，不自动广播。"""
-        await crawler.run_fetch(send_group=self._send_group_result)
+        """周期抓取公共来源（默认关闭）：变化检测 → 待审更新，不自动广播。
+
+        来源抓取之后，若开启了赛程自动抓取，再顺带抓 CF / 牛客赛程；
+        两段各自兜底，任一段异常都不影响另一段，也不会让调度器崩掉。
+        """
+        try:
+            await crawler.run_fetch(send_group=self._send_group_result)
+        except Exception:  # noqa: BLE001 - 网络/解析/DB 异常统一兜底，不逸出调度器
+            logger.exception("[抓取] 本轮调度执行异常，跳过本轮等待下次触发")
+        if not config.AUTO_CONTEST_CRAWL_ENABLED:
+            return
+        try:
+            results = await crawler.run_contest_fetch()
+            created = sum(1 for item in results if item.get("kind") == "created")
+            logger.info("[赛程抓取] 本轮处理 %s 条，新建 %s 条", len(results), created)
+        except Exception:  # noqa: BLE001 - 赛程抓取失败同样不逸出调度器
+            logger.exception("[赛程抓取] 本轮执行异常，跳过本轮等待下次触发")
 
 
 def _build_client():

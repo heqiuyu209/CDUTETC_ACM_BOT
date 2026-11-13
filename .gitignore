@@ -35,12 +35,18 @@ secrets.*
 # 数据库与数据文件
 *.db
 *.db-journal
+# WAL 模式伴生文件（-wal 未 checkpoint、-shm 为共享内存索引）
+*.db-wal
+*.db-shm
+*.db-3pr*
 *.sqlite
 *.sqlite3
 *.bak
 *.tmp
 private-exports/
 backups/
+pip-*
+.pip-cache/
 
 # 日志
 *.log

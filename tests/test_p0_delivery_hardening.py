@@ -106,3 +106,39 @@ async def test_quota_exhausted_blocks_group_and_stops_retry(bot, caplog):
     again = await bot.bot._send_group_result("g1", "今天有周赛")
     assert again.code is DeliveryCode.ACTIVE_FORBIDDEN
     assert bot.api.post_group_message.await_count == before
+
+
+async def test_quota_block_expires_next_day_and_is_refreshed(bot, monkeypatch):
+    clock = ["2026-11-11 23:59:00"]
+    monkeypatch.setattr(database, "now_str", lambda: clock[0])
+
+    assert (await bot.bot._send_group_result("g1", "first")).code is DeliveryCode.QUOTA_EXHAUSTED
+    assert database.get_group_notification_block("qqbot", "g1")["blocked_at"] == clock[0]
+    assert (await bot.bot._send_group_result("g1", "same day")).code is DeliveryCode.ACTIVE_FORBIDDEN
+    assert bot.api.post_group_message.await_count == 1
+
+    clock[0] = "2026-11-12 00:00:00"
+    assert database.get_group_notification_block("qqbot", "g1") is None
+    assert (await bot.bot._send_group_result("g1", "next day")).code is DeliveryCode.QUOTA_EXHAUSTED
+    assert bot.api.post_group_message.await_count == 2
+    assert database.get_group_notification_block("qqbot", "g1")["blocked_at"] == clock[0]
+    assert (await bot.bot._send_group_result("g1", "blocked again")).code is DeliveryCode.ACTIVE_FORBIDDEN
+
+
+def test_quota_expiry_preserves_other_blocks_and_bad_dates(bot, monkeypatch):
+    clock = ["2026-11-11 10:00:00"]
+    monkeypatch.setattr(database, "now_str", lambda: clock[0])
+    database.block_group_notifications("qqbot", "g1", DeliveryCode.QUOTA_EXHAUSTED.value, 11253)
+    database.block_group_notifications("qqbot", "g2", DeliveryCode.ACTIVE_FORBIDDEN.value, 40034105)
+    database.block_group_notifications("onebot", "g1", DeliveryCode.ACTIVE_FORBIDDEN.value, 40034105)
+    clock[0] = "2026-11-12 10:00:00"
+    assert database.get_group_notification_block("qqbot", "g1") is None
+    assert database.get_group_notification_block("qqbot", "g2")
+    assert database.get_group_notification_block("onebot", "g1")
+
+    with database._connect() as conn:
+        conn.execute("UPDATE group_notification_blocks SET blocked_at='invalid' WHERE protocol='qqbot' AND group_id='g1'")
+    assert database.get_group_notification_block("qqbot", "g1")
+    with database._connect() as conn:
+        conn.execute("UPDATE group_notification_blocks SET blocked_at='2026-11-13 10:00:00' WHERE protocol='qqbot' AND group_id='g1'")
+    assert database.get_group_notification_block("qqbot", "g1")

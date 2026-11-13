@@ -36,6 +36,8 @@ from cdutetc.database import (
 from cdutetc.database import list_collections_all as _list_collections_all
 from cdutetc.database import get_competition_target_groups
 from cdutetc.database import get_group_notification_block
+from cdutetc.database import group_course_remind_enabled
+from cdutetc.database import group_switch_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -58,10 +60,11 @@ def _parse_time(text: str) -> datetime | None:
     return None
 
 
-def _due_offset_hours(delta: timedelta) -> float | None:
+def _due_offset_hours(delta: timedelta, offsets: tuple[float, ...] | None = None) -> float | None:
     """返回该剩余时间命中的「最紧」提醒节点（小时）；未命中返回 None。
 
-    节点取自 config.REMIND_OFFSET_HOURS（降序存放）。判定方式是取所有
+    节点默认取自 config.REMIND_OFFSET_HOURS（降序存放），可用 ``offsets``
+    传入自定义节点集（课程提醒会在此之上追加分钟级节点）。判定方式是取所有
     「节点小时数 ≥ 剩余时间」的节点中最小的那个，也就是已进入的最紧窗口：
     剩 23 小时命中 24 小时节点，剩 0.5 小时命中 1 小时节点，剩 10 分钟
     （若配置了 0.167=10 分钟）命中 10 分钟节点。
@@ -72,11 +75,18 @@ def _due_offset_hours(delta: timedelta) -> float | None:
     """
     if delta <= timedelta(0):
         return None
+    nodes = config.REMIND_OFFSET_HOURS if offsets is None else tuple(offsets)
     candidates = [
-        offset for offset in config.REMIND_OFFSET_HOURS
+        offset for offset in nodes
         if delta <= timedelta(hours=offset)
     ]
     return min(candidates) if candidates else None
+
+
+def training_offset_hours() -> tuple[float, ...]:
+    """课程提醒节点：既有小时级节点 + 配置的分钟级额外节点（降序去重）。"""
+    extra = tuple(minutes / 60 for minutes in config.TRAINING_REMIND_EXTRA_OFFSETS_MINUTES)
+    return tuple(sorted(set(config.REMIND_OFFSET_HOURS) | set(extra), reverse=True))
 
 
 def _countdown(target: datetime, now: datetime) -> str:
@@ -117,6 +127,9 @@ async def check_contest_start_reminders(send_group, now: datetime | None = None,
     sent = 0
     for delivery in list_due_contest_start_deliveries(current, allowed):
         if _platform_paused(delivery["group_id"]):
+            continue
+        # 群开关：比赛提醒关闭时只跳过发送，节点保留，重新开启后仍按节点补发
+        if not group_switch_enabled(delivery["group_id"], "contest_remind_enabled"):
             continue
         current = clock()
         competition = comps.get(delivery["obj_id"])
@@ -272,14 +285,22 @@ def _delivery_key(item: dict) -> str:
 
 
 def build_training_reminders(sessions: list[dict], now: datetime) -> list[dict]:
-    """按课程的具体开课日期生成群提醒；每周实例独立去重。"""
+    """按课程的具体开课日期生成群提醒；每周实例独立去重。
+
+    节点为 ``REMIND_OFFSET_HOURS`` 与 ``TRAINING_REMIND_EXTRA_OFFSETS_MINUTES``
+    的并集（含 30/15 分钟级），并尊重群级「课程提醒」开关。
+    """
     out = []
+    offsets = training_offset_hours()
+    horizon = max(offsets)
     for session in sessions:
         group_id = session.get("group_id")
         if group_id not in config.ALLOWED_GROUPS:
             continue
-        for target in training_occurrence_times(session, now, max(config.REMIND_OFFSET_HOURS)):
-            offset = _due_offset_hours(target - now)
+        if not group_course_remind_enabled(group_id):
+            continue
+        for target in training_occurrence_times(session, now, horizon):
+            offset = _due_offset_hours(target - now, offsets)
             if offset is None:
                 continue
             target_str = target.strftime("%Y-%m-%d %H:%M:%S" if target.second else "%Y-%m-%d %H:%M")
@@ -290,16 +311,24 @@ def build_training_reminders(sessions: list[dict], now: datetime) -> list[dict]:
                 details.append(f"软件：{session['software']}")
             if session.get("device_req"):
                 details.append(f"设备：{session['device_req']}")
+            # 地点缺失（None / 空串 / 纯空白）统一兜底为「待定」；
+            # 每一行独立换行，避免「地点：待定要求：…」这类粘连毁掉可读性。
+            location = (session.get("location") or "").strip() or "待定"
+            requirement = (session.get("requirement") or "").strip()
+            text_lines = [
+                f"【提醒】课程「{session['title']}」开始：{target_str}",
+                f"地点：{location}",
+            ]
+            if requirement:
+                text_lines.append(f"要求：{requirement}")
+            if details:
+                text_lines.append("；".join(details))
+            text_lines.append("记得留好时间，我们课上见。")
             out.append({
                 "group_id": group_id, "obj_type": "training_session", "obj_id": session["id"],
                 "remind_type": "start_time", "target_str": target_str,
                 "offset_hours": offset,
-                "text": (
-                    f"【提醒】课程「{session['title']}」开始：{target_str}\n"
-                    f"地点：{session.get('location') or '待定'}"
-                    + ("\n" + "；".join(details) if details else "")
-                    + "\n记得留好时间，我们课上见。"
-                ),
+                "text": "\n".join(text_lines),
             })
     return out
 
@@ -348,12 +377,16 @@ async def check_general_reminders(send_group, now: datetime | None = None,
 
     reconcile_deliveries(current_time(), max_attempts=max_attempts,
                          allowed_groups=set(config.ALLOWED_GROUPS))
-    items = build_general_reminders(_list_collections_all(), list_competitions(status="confirmed"), current_time())
-    items.extend(build_legacy_contest_reminders(list_contests(), current_time()))
+    items = [item for item in build_general_reminders(
+        _list_collections_all(), list_competitions(status="confirmed"), current_time())
+        if group_switch_enabled(item["group_id"], "contest_remind_enabled")]
+    items.extend(item for item in build_legacy_contest_reminders(list_contests(), current_time())
+                 if group_switch_enabled(item["group_id"], "contest_remind_enabled"))
     # 按群取课程，不按当前是否已生效过滤；首次开课前同样需要提前提醒。
     sessions = [session for gid in sorted(config.ALLOWED_GROUPS)
                 for session in list_training_sessions(gid, active_only=False)]
-    items.extend(build_training_reminders(sessions, current_time()))
+    items.extend(item for item in build_training_reminders(sessions, current_time())
+                 if group_switch_enabled(item["group_id"], "course_remind_enabled"))
     sent = 0
     for item in items:
         if _platform_paused(item["group_id"]):
@@ -395,3 +428,164 @@ async def check_general_reminders(send_group, now: datetime | None = None,
     if sent:
         logger.info("本次通用提醒成功发送 %d 条", sent)
     return sent
+
+
+# ---------------------------------------------------------------------
+# 统一主动提醒中心：待发清单聚合（比赛 / 课程 / 自定义）
+# ---------------------------------------------------------------------
+
+SOURCE_LABELS = {"contest": "比赛", "course": "课程", "custom": "自定义"}
+STATUS_LABELS = {"pending": "待发", "sending": "发送中", "sent": "已发",
+                 "failed": "发送失败", "done": "已完成", "cancelled": "已取消"}
+
+
+def _delivery_state_map(group_id: str) -> dict:
+    """该群已排定投递的 dedup_key -> 状态，用于给清单标注真实状态。"""
+    from cdutetc.database import list_deliveries
+
+    try:
+        rows = list_deliveries(group_id)
+    except sqlite3.Error:
+        return {}
+    return {row["dedup_key"]: row["status"] for row in rows if row.get("dedup_key")}
+
+
+def _upcoming_custom_entries(group_id: str, now: datetime, horizon: datetime) -> list:
+    from cdutetc.database import list_custom_reminders
+
+    entries = []
+    for reminder in list_custom_reminders(group_id):
+        target = _parse_time(reminder.get("target_time") or "")
+        if target is None or not now <= target <= horizon:
+            continue
+        entries.append({
+            "source": "custom",
+            "trigger": target,
+            "text": reminder.get("content") or "",
+            "repeat": reminder.get("repeat_rule") or "none",
+            "status": reminder.get("status") or "pending",
+            "obj_id": reminder.get("id"),
+        })
+    return entries
+
+
+def _upcoming_course_entries(group_id: str, now: datetime, horizon: datetime,
+                             states: dict) -> list:
+    """按课程实例与提醒节点推算触发时间，与实际发送口径保持一致。"""
+    if not group_switch_enabled(group_id, "course_remind_enabled"):
+        return []
+    offsets = training_offset_hours()
+    entries = []
+    for session in list_training_sessions(group_id, active_only=False):
+        for occurrence in training_occurrence_times(session, now, max(offsets)):
+            for offset in offsets:
+                trigger = occurrence - timedelta(hours=offset)
+                if not now <= trigger <= horizon:
+                    continue
+                key = delivery_dedup_key(
+                    group_id, "training_session", session["id"], "start_time",
+                    occurrence.strftime("%Y-%m-%d %H:%M"), offset,
+                )
+                text = session.get("title") or ""
+                if session.get("requirement"):
+                    text += f"（要求：{session['requirement']}）"
+                entries.append({
+                    "source": "course", "trigger": trigger, "text": text,
+                    "repeat": "none", "status": states.get(key, "pending"),
+                    "obj_id": session["id"],
+                })
+    return entries
+
+
+def _upcoming_contest_entries(group_id: str, now: datetime, horizon: datetime,
+                              states: dict) -> list:
+    if not group_switch_enabled(group_id, "contest_remind_enabled"):
+        return []
+    offsets = tuple(getattr(config, "CONTEST_REMIND_OFFSETS_MINUTES", (30, 15)))
+    entries = []
+    for competition in list_competitions(status="confirmed"):
+        target = _parse_time(competition.get("official_time") or "")
+        if target is None:
+            continue
+        try:
+            targets = get_competition_target_groups(competition["id"])
+        except (sqlite3.Error, OSError):
+            continue
+        if group_id not in targets:
+            continue
+        for raw_offset in offsets:
+            try:
+                minutes = int(raw_offset)
+            except (TypeError, ValueError):
+                continue
+            if minutes <= 0:
+                continue
+            trigger = target - timedelta(minutes=minutes)
+            if not now <= trigger <= horizon:
+                continue
+            key = delivery_dedup_key(
+                group_id, "competition", competition["id"], "contest_start",
+                competition.get("official_time"), minutes / 60,
+            )
+            entries.append({
+                "source": "contest", "trigger": trigger,
+                "text": f"「{competition.get('name')}」开赛前 {minutes} 分钟",
+                "repeat": "none", "status": states.get(key, "pending"),
+                "obj_id": competition["id"],
+            })
+    return entries
+
+
+def build_upcoming_reminders(group_id: str, now: datetime, days: int = 7) -> list:
+    """聚合本群未来 N 天所有待发提醒（比赛 / 课程 / 自定义），按触发时间升序。
+
+    只读聚合，不写投递状态；来源开关关闭时该来源不进入清单。
+    """
+    current = now.replace(tzinfo=TZ) if now.tzinfo is None else now.astimezone(TZ)
+    horizon = current + timedelta(days=days)
+    states = _delivery_state_map(group_id)
+    entries = []
+    entries.extend(_upcoming_contest_entries(group_id, current, horizon, states))
+    entries.extend(_upcoming_course_entries(group_id, current, horizon, states))
+    entries.extend(_upcoming_custom_entries(group_id, current, horizon))
+    entries.sort(key=lambda item: (item["trigger"], item["source"]))
+    return entries
+
+
+async def check_custom_reminders(send_group, now: datetime | None = None,
+                                 max_attempts: int = _DELIVERY_MAX_ATTEMPTS) -> int:
+    """投递到期的自定义提醒；每周循环顺延一周，单次提醒置 done。"""
+    from cdutetc.database import list_due_custom_reminders, update_custom_reminder
+
+    if max_attempts < 1:
+        raise ValueError("提醒尝试次数必须大于零")
+
+    def clock():
+        value = now if now is not None else datetime.now(TZ)
+        return value.replace(tzinfo=TZ) if value.tzinfo is None else value.astimezone(TZ)
+
+    sent = 0
+    allowed = set(config.ALLOWED_GROUPS)
+    for reminder in list_due_custom_reminders(clock()):
+        group_id = reminder.get("group_id")
+        if group_id not in allowed or _platform_paused(group_id):
+            continue
+        text = f"【提醒】{reminder.get('content') or ''}"
+        ok, error, code = await _send_reminder_result(send_group, group_id, text)
+        if not ok:
+            logger.warning("自定义提醒 #%s 未发送 [%s] %s", reminder.get("id"), code, error)
+            continue
+        if (reminder.get("repeat_rule") or "none") == "weekly":
+            target = _parse_time(reminder.get("target_time") or "")
+            if target is not None:
+                update_custom_reminder(
+                    reminder["id"],
+                    target_time=(target + timedelta(days=7)).strftime("%Y-%m-%d %H:%M"),
+                    operator="system",
+                )
+                sent += 1
+                continue
+        update_custom_reminder(reminder["id"], status="done", operator="system")
+        sent += 1
+    return sent
+

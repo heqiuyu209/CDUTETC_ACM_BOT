@@ -39,7 +39,10 @@ def training(group="123456", **values):
     info = {"title": "算法训练", "weekday": "周日", "start_time": "19:00", "end_time": "21:00",
             "location": "B201", "needs_laptop": True, "software": "IDE", "device_req": "充电器", **values}
     tid = database.create_training_session(group, info, operator="654321")
-    return tid, database.delivery_dedup_key(group, "training_session", tid, "start_time", TARGET, 1)
+    # NOW 距开课仅 1 分钟：命中「最紧」的节点，即训练节点集里的最小值
+    # （默认 15 分钟 = 0.25 小时，由 TRAINING_REMIND_EXTRA_OFFSETS_MINUTES 提供）。
+    offset = min(reminder.training_offset_hours())
+    return tid, database.delivery_dedup_key(group, "training_session", tid, "start_time", TARGET, offset)
 
 
 async def test_course_command_enters_actual_main_reminder_job(db, monkeypatch):

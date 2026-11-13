@@ -134,7 +134,9 @@ def test_context_lists_all_three_sections(env):
     assert "1. 近期课程" in context
     assert "2. 进行中的征集与报名" in context
     assert "3. 常见问题（FAQ）" in context
-    assert "图论进阶（实训楼 B302）" in context
+    assert "图论进阶" in context
+    assert "实训楼 B302" in context
+    assert "4. 每周常规训练" in context
 
 
 def test_empty_group_returns_empty_context(env):

@@ -134,29 +134,73 @@ def test_digest_is_none_when_everything_empty(env):
 
 def test_digest_renders_plain_text_overview(env):
     _course()
-    _collection(capacity=2)
+    db.create_custom_reminder("g1", "交周报", "2026-11-11 20:00")
     _contest()
 
     text = daily_digest.build_daily_digest("g1", NOW)
 
     assert text.startswith(daily_digest.DIGEST_TITLE)
-    assert "📅 今日课程：" in text and "19:00-21:00 图论进阶 (实训楼 B302)" in text
-    assert "⏳ 征集截止：" in text and "剩 2 个名额" in text
-    assert "🏆 近期赛事：" in text and "Codeforces Round 990" in text
+    assert "📚 今日课程/训练：" in text
+    assert "2026-11-11 19:00-21:00 图论进阶 (地点：实训楼 B302)" in text
+    assert "🏆 今日赛事：" in text and "Codeforces Round 990" in text
+    assert "🗓 今日其他安排：" in text and "20:00 交周报" in text
     assert text.rstrip().endswith(daily_digest.DIGEST_FOOTER)
     for markdown in ("**", "##", "|", "`"):  # 纯文本，防官方客户端拦截
         assert markdown not in text
 
 
 def test_digest_omits_empty_sections(env):
-    _collection(deadline="2026-11-12 12:00")
+    db.create_custom_reminder("g1", "交周报", "2026-11-11 20:00")
     text = daily_digest.build_daily_digest("g1", NOW)
-    assert "⏳ 征集截止：" in text
-    assert "📅 今日课程：" not in text
-    assert "🏆 近期赛事：" not in text
+    assert "🗓 今日其他安排：" in text
+    assert "📚 今日课程/训练：" not in text
+    assert "🏆 今日赛事：" not in text
 
 
 # --------------------------------------------------------------- 搭便车
+
+@pytest.mark.parametrize("reason", ["quota", "disabled", "cancelled", "sent"])
+def test_piggyback_contest_does_not_require_active_delivery(env, monkeypatch, reason):
+    cid = _contest(official_time="2026-11-11 19:30")
+    if reason == "quota":
+        db.block_group_notifications("qqbot", "g1", DeliveryCode.QUOTA_EXHAUSTED.value, 11253)
+    elif reason == "disabled":
+        monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", False)
+    else:
+        with db._connect() as conn:
+            conn.execute("UPDATE reminder_deliveries SET status=? WHERE obj_type='competition' AND obj_id=?",
+                         (reason, cid))
+
+    assert daily_digest.build_daily_digest("g1", NOW) is None
+    assert "Codeforces Round 990" in daily_digest.build_piggyback_notice("g1", NOW)
+
+
+def test_piggyback_contest_keeps_scope_status_and_time_filters(env):
+    _contest(group_id="g2", name="其他群比赛", official_time="2026-11-11 19:00")
+    db.create_competition({"name": "未确认比赛", "official_time": "2026-11-11 19:00"}, status="draft")
+    _contest(name="已经开赛", official_time="2026-11-11 17:59")
+    assert daily_digest.build_piggyback_notice("g1", NOW) is None
+
+
+def test_piggyback_weekly_respects_current_subscription(env, monkeypatch):
+    monkeypatch.setattr(config, "WEEKLY_CONTEST_GROUPS", {"g1"})
+    db.create_weekly_competition("2026-11-09", {"name": "周赛", "official_time": "2026-11-11 19:00"})
+    assert "周赛" in daily_digest.build_piggyback_notice("g1", NOW)
+    db.set_weekly_group_enabled("g1", False)
+    assert daily_digest.build_piggyback_notice("g1", NOW) is None
+    assert daily_digest.build_piggyback_notice("g2", NOW) is None
+
+
+def test_piggyback_contest_respects_group_switch(env):
+    _contest(official_time="2026-11-11 19:30")  # 1.5h 后开赛
+    db.set_group_switch("g1", "contest_remind_enabled", False, "teacher")
+    assert daily_digest.build_piggyback_notice("g1", NOW) is None
+
+    _collection(deadline="2026-11-12 05:00", capacity=2)  # 11h 后截止
+    notice = daily_digest.build_piggyback_notice("g1", NOW)
+    assert "天梯赛选拔" in notice
+    assert "Codeforces Round 990" not in notice
+
 
 def test_piggyback_prefers_most_urgent(env):
     _collection(title="天梯赛选拔", deadline="2026-11-12 05:00", capacity=2)   # 11h 后
@@ -223,8 +267,8 @@ def _bot(api):
 
 
 def test_daily_digest_job_skips_quota_exhausted_group(env, caplog):
-    _collection("g1", deadline="2026-11-11 21:00")
-    _collection("g2", deadline="2026-11-11 21:00")
+    _course(group_id="g1")
+    _course(group_id="g2")
 
     async def post_group_message(*args, **kwargs):
         target = kwargs.get("group_openid") or kwargs.get("group_id") or (args[0] if args else "")

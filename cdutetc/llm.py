@@ -227,7 +227,8 @@ def _context_block(group_context: str) -> str:
 
 
 async def _chat_once(system: str, user: str, json_mode: bool = False, *,
-                     max_tokens: int | None = None, temperature: float = 0) -> str:
+                     max_tokens: int | None = None, temperature: float = 0,
+                     timeout: float | None = None) -> str:
     """调用一次模型（并发受限），返回 assistant 文本。失败抛异常。
 
     json_mode=True 时启用 response_format=json_object（DeepSeek 要求
@@ -248,7 +249,7 @@ async def _chat_once(system: str, user: str, json_mode: bool = False, *,
     headers = {"Authorization": f"Bearer {config.LLM_API_KEY}"}
     url = f"{config.LLM_BASE_URL.rstrip('/')}/chat/completions"
     async with _sem:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=timeout or 60) as client:
             resp = await client.post(url, headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()
@@ -425,3 +426,119 @@ async def answer_question(question: str, contests: list[dict], *,
         max_length=config.QA_OUTPUT_MAX_LENGTH,
         max_link_length=config.QA_OUTPUT_MAX_LINK_LENGTH,
     )
+
+
+# =====================================================================
+# 入库前智能提炼（把老师的长段备注压成一句可读要求）
+# =====================================================================
+
+# 超过这个字数才值得调一次模型：短文本原样入库，避免无谓的时延与费用。
+ENTRY_SUMMARY_THRESHOLD = 35
+# 提炼结果上限，防止模型不听话时把长段落又抄回来。
+ENTRY_SUMMARY_MAX_CHARS = 60
+ENTRY_SUMMARY_TIMEOUT = 5.0
+
+_SUMMARY_SYSTEM = (
+    "你是校园社群的信息编辑。把老师给出的原始备注压缩成一句简洁的中文要求，"
+    "保留关键约束（需带物品、软件、地点、时间、人数、提交方式等），"
+    "删除口语和重复表达。只输出这一句话，不要引号、不要解释、不要列表，"
+    f"不超过 {ENTRY_SUMMARY_MAX_CHARS} 字。"
+)
+
+
+def _clean_entry_text(text: str) -> str:
+    """规范化模型输出：去引号、去前缀、压空白、按上限截断。"""
+    value = (text or "").strip()
+    for left, right in (("「", "」"), ("『", "』"), ("“", "”"), ('"', '"'), ("'", "'")):
+        if len(value) >= 2 and value.startswith(left) and value.endswith(right):
+            value = value[1:-1].strip()
+            break
+    for prefix in ("要求：", "要求:", "提炼：", "提炼:", "总结：", "总结:"):
+        if value.startswith(prefix):
+            value = value[len(prefix):].strip()
+    value = " ".join(value.split())
+    if len(value) > ENTRY_SUMMARY_MAX_CHARS:
+        value = value[:ENTRY_SUMMARY_MAX_CHARS].rstrip("，,、；;。 ")
+    return value
+
+
+async def _summarize_entry(category: str, title: str, raw_text: str,
+                           timeout: float = ENTRY_SUMMARY_TIMEOUT) -> str:
+    """异步版提炼：调用模型压缩一段备注。"""
+    user = (
+        f"类别：{category or '课程'}\n"
+        f"标题：{title or '（未命名）'}\n"
+        f"原始备注：{raw_text}\n\n"
+        "请输出一句不超过 "
+        f"{ENTRY_SUMMARY_MAX_CHARS} 字的要求说明。"
+    )
+    content = await _chat_once(_SUMMARY_SYSTEM, user, max_tokens=160,
+                               temperature=0, timeout=timeout)
+    return _clean_entry_text(content)
+
+
+def _run_coroutine_sync(factory, timeout: float):
+    """在同步上下文里跑协程，返回（结果, 错误）。
+
+    命令处理链路是同步的，而模型客户端是异步的：当前线程没有事件循环时用
+    ``asyncio.run``；已在事件循环里（如被 async 测试或上层协程直接调用）时
+    退到独立线程执行，避免 ``asyncio.run() cannot be called from a running
+    event loop``。
+    """
+    import asyncio
+    import concurrent.futures
+    import threading
+
+    async def _guarded():
+        return await asyncio.wait_for(factory(), timeout=timeout)
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            return asyncio.run(_guarded()), None
+        except Exception as exc:  # noqa: BLE001 - 提炼失败必须降级而非中断入库
+            return None, exc
+    box: dict[str, object] = {}
+
+    def _worker():
+        try:
+            box["value"] = asyncio.run(_guarded())
+        except Exception as exc:  # noqa: BLE001
+            box["error"] = exc
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    thread.join(timeout + 1.0)
+    if thread.is_alive():
+        return None, concurrent.futures.TimeoutError("提炼超时")
+    if "error" in box:
+        return None, box["error"]
+    return box.get("value"), None
+
+
+def summarize_entry_with_llm(category: str, title: str, raw_text: str, *,
+                             timeout: float = ENTRY_SUMMARY_TIMEOUT) -> tuple[str, bool]:
+    """入库前智能提炼：返回（最终入库文本, 是否真的用模型提炼过）。
+
+    规则（与规格一致）：
+    - 空文本 → ("", False)，不调模型；
+    - 文本长度 ≤ ENTRY_SUMMARY_THRESHOLD → 原样返回，不调模型；
+    - 超过阈值 → 调模型压缩；超时/异常/空结果 → 降级为原文，绝不阻塞入库。
+    """
+    text = (raw_text or "").strip()
+    if not text:
+        return "", False
+    if len(text) <= ENTRY_SUMMARY_THRESHOLD:
+        return text, False
+    result, error = _run_coroutine_sync(
+        lambda: _summarize_entry(category, title, text, timeout), timeout
+    )
+    if error is not None:
+        logger.warning("入库前提炼失败，降级为原文：%s", error)
+        return text, False
+    cleaned = _clean_entry_text(str(result or ""))
+    if not cleaned:
+        logger.warning("入库前提炼返回空内容，降级为原文")
+        return text, False
+    return cleaned, True

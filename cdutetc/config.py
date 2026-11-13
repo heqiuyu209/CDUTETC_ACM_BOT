@@ -367,6 +367,48 @@ def _remind_offset_hours() -> tuple[float, ...]:
 
 REMIND_OFFSET_HOURS = _remind_offset_hours()
 
+
+def _training_extra_offsets() -> tuple[int, ...]:
+    """课程提醒的额外分钟级节点（在 REMIND_OFFSET_HOURS 之外追加）。
+
+    例：``30,15`` 表示课程开始前 30 分钟、15 分钟各提醒一次；
+    非法值（空、负数、非数字）整体回退默认 ``(30, 15)``。
+    """
+    raw = os.getenv("ACM_TRAINING_REMIND_EXTRA_OFFSETS_MINUTES", "30,15")
+    try:
+        values = {int(value.strip()) for value in raw.split(",") if value.strip()}
+    except (TypeError, ValueError):
+        return (30, 15)
+    if not values or any(value <= 0 for value in values):
+        return (30, 15)
+    return tuple(sorted(values, reverse=True))
+
+
+TRAINING_REMIND_EXTRA_OFFSETS_MINUTES = _training_extra_offsets()
+
+# ================= 赛程自动抓取（CF / 牛客） =================
+# 默认关闭：开启后定时任务会在既有来源抓取之后，再抓 CF 官方 API 与牛客赛程页。
+AUTO_CONTEST_CRAWL_ENABLED = os.getenv("ACM_AUTO_CONTEST_CRAWL_ENABLED", "0") != "0"
+
+
+def _auto_contest_window_days() -> int:
+    """抓取窗口天数；非法或小于 1 一律回退 14 天。"""
+    try:
+        value = int(os.getenv("ACM_AUTO_CONTEST_WINDOW_DAYS", "14"))
+    except (TypeError, ValueError):
+        return 14
+    return value if value >= 1 else 14
+
+
+AUTO_CONTEST_WINDOW_DAYS = _auto_contest_window_days()
+# 1=抓到的比赛直接 confirmed 并通知群；0=进草稿待审核。
+AUTO_CONTEST_AUTO_CONFIRM = os.getenv("ACM_AUTO_CONTEST_AUTO_CONFIRM", "0") != "0"
+# 自动发布时的通知群；留空则覆盖所有允许群。
+AUTO_CONTEST_NOTIFY_GROUPS = frozenset(
+    item.strip() for item in os.getenv("ACM_AUTO_CONTEST_NOTIFY_GROUPS", "").split(",")
+    if item.strip()
+)
+
 # ================= 发布确认（超管私聊） =================
 # 老师发布比赛后，整理结果先私聊推送给超管，超管回「同意/拒绝」才入库并通知群。
 PUBLISH_CONFIRM_ENABLED = os.getenv("ACM_PUBLISH_CONFIRM_ENABLED", "1") != "0"
@@ -418,9 +460,27 @@ DAILY_DIGEST_HOUR, DAILY_DIGEST_MINUTE = _digest_clock()
 DAILY_DIGEST_PIGGYBACK_ENABLED = os.getenv("ACM_DAILY_DIGEST_PIGGYBACK_ENABLED", "1") != "0"
 
 # ================= 公共来源低频集中抓取（v2，默认关闭） =================
-# 自动抓取默认关闭：开启后同一来源两次抓取的最小间隔（分钟）由下值控制。
+# 自动抓取默认关闭：开启后每天固定时刻抓一次（时刻见 CONTEST_CRAWL_*），
+# 避免按小时轮询把有限的对外请求与主动额度浪费在无变化的时间段上。
 AUTO_FETCH_ENABLED = os.getenv("ACM_AUTO_FETCH_ENABLED", "0") != "0"
+# 仅保留给「手动 /抓取」等入口的频率下限：两次手动抓取的最小间隔（分钟）。
 FETCH_MIN_INTERVAL_MINUTES = int(os.getenv("ACM_FETCH_MIN_INTERVAL_MINUTES", "60"))
+
+
+def _contest_crawl_clock() -> tuple[int, int]:
+    """解析比赛抓取时刻（HH:MM）；非法值回落到 08:05，不让机器人因配置笔误起不来。"""
+    raw = os.getenv("ACM_CONTEST_CRAWL_TIME", "08:05").strip()
+    try:
+        hour_text, minute_text = raw.split(":", 1)
+        hour, minute = int(hour_text), int(minute_text)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError(raw)
+        return hour, minute
+    except (ValueError, AttributeError):
+        return 8, 5
+
+
+CONTEST_CRAWL_HOUR, CONTEST_CRAWL_MINUTE = _contest_crawl_clock()
 # 自动抓取生成的记录默认不通知全员，由超管确认后处理（/修正 或 /比赛详情 人工核对）。
 
 # ================= 本地数据 =================

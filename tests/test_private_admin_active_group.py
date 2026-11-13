@@ -139,7 +139,9 @@ async def test_digest_preview_renders_private_only(env):
     env.api.post_c2c_message.reset_mock()
 
     text = await env.send_private("/晨报预览")
-    assert text.startswith("【晨报私聊模拟预览】")
+    # 私聊回执现在统一带工作区标牌首行（C5），正文事实另行断言。
+    assert text.splitlines()[0].startswith("📌【当前工作区：")
+    assert "【晨报私聊模拟预览】" in text
     assert "算法训练" in text
     assert "new" in text
     env.api.post_group_message.assert_not_awaited()
@@ -180,8 +182,34 @@ async def test_group_admin_defaults_to_bound_group(env):
 
 def test_resolve_group_arg_supports_index_name_and_id(monkeypatch):
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"a", "b"})
+    monkeypatch.setattr(db, "list_group_aliases", lambda: {})
     monkeypatch.setattr(commands, "_group_label", lambda gid: {"a": "集训队", "b": "新生群"}[gid])
     assert commands.resolve_group_arg("1") == ("a", "")
     assert commands.resolve_group_arg("b") == ("b", "")
     assert commands.resolve_group_arg("新生群") == ("b", "")
     assert commands.resolve_group_arg("不存在")[0] is None
+
+
+async def test_group_config_by_index_auto_binds_and_marks_header(env):
+    """C5：私聊 /群配置 <序号> 解析成功后自动锁定工作区，并回带 📌 标牌。"""
+    assert admin_session.get_active_group("admin") is None
+    target, _ = commands.resolve_group_arg("1")
+    assert target in config.ALLOWED_GROUPS
+
+    text = await env.send_private("/群配置 1")
+    assert admin_session.get_active_group("admin") == target
+    first = text.splitlines()[0]
+    assert first.startswith("📌【当前工作区：")
+    # 标牌优先展示群备注名；未认领真实群号时不拼 openid，避免暴露短哈希。
+    assert db.get_account_label("group", target) in first
+    env.api.post_group_message.assert_not_awaited()
+
+
+async def test_help_without_binding_shows_global_mode_header(env):
+    """C5：未绑定工作区时 /帮助 首行为全局模式标牌。"""
+    assert admin_session.get_active_group("admin") is None
+    text = await env.send_private("/帮助")
+    assert text.splitlines()[0] == "🌐【当前模式：全局模式 (未选群)】"
+    # 标牌不影响正文帮助内容
+    assert "/帮助 课程" in text
+    env.api.post_group_message.assert_not_awaited()

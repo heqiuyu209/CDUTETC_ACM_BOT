@@ -12,11 +12,12 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 
 from cdutetc import config, daily_digest
 from cdutetc import database as db
 from cdutetc.daily_digest import TZ, _clock, _load_fields, _now, _training_weekday
+from cdutetc.utils import normalize_time_expression, split_normalized_time
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,47 @@ def week_sessions(group_id: str, now: datetime | None = None,
     return out[:MAX_SESSION_ITEMS]
 
 
+def weekly_courses(group_id: str, now: datetime | None = None) -> list[dict]:
+    """本周（``now`` 所在周，周一~周日）可上的周常课程，按星期与开始时间排序。
+
+    与 :func:`week_sessions` 的区别：这里不剪掉「本周已过去」的课，而是把每门课
+    落到本周对应的公历日期上，模型据此才能回答「这周四有课吗」而不是回答「未登记」。
+    """
+    current = _now(now)
+    gid = (group_id or "").strip()
+    if not gid:
+        return []
+    try:
+        sessions = db.list_training_sessions(gid, active_only=False)
+    except Exception:  # noqa: BLE001 - 读库异常不应阻断问答
+        logger.warning("问答上下文读取周常课程失败 [group=%s]", gid, exc_info=True)
+        return []
+    monday = current.date() - timedelta(days=current.weekday())
+    out: list[dict] = []
+    for session in sessions:
+        if (session.get("status") or "confirmed") != "confirmed":
+            continue
+        weekday_index = _training_weekday(session.get("weekday"))
+        if weekday_index is None:
+            continue
+        start_clock, end_clock = _normalized_clocks(session.get("start_time"), session.get("end_time"))
+        if start_clock is None:
+            continue
+        day = monday + timedelta(days=weekday_index)
+        out.append({
+            "id": session.get("id"),
+            "title": session.get("title") or "训练安排",
+            "weekday_label": _WEEKDAY_LABELS[weekday_index],
+            "start_text": start_clock.strftime("%H:%M"),
+            "end_text": end_clock.strftime("%H:%M") if end_clock else "",
+            "date_text": day.strftime("%Y-%m-%d"),
+            "location": (session.get("location") or "").strip(),
+            "sort_key": (weekday_index, start_clock),
+        })
+    out.sort(key=lambda item: item["sort_key"])
+    return out[:MAX_SESSION_ITEMS]
+
+
 def open_collections(group_id: str) -> list[dict]:
     """状态为 open 的征集：标题、ID、截止时间、剩余名额、登记字段。"""
     gid = (group_id or "").strip()
@@ -151,6 +193,36 @@ def _session_line(item: dict) -> str:
     return line
 
 
+def _normalized_clocks(start_raw: str, end_raw: str) -> tuple[time | None, time | None]:
+    """把脏时间（如 ``19-21点``）先归一化再解析，归一化失败退回原始写法。"""
+    packed = " ".join(x for x in ((start_raw or "").strip(), (end_raw or "").strip()) if x)
+    _weekday, start_text, end_text = split_normalized_time(normalize_time_expression(packed))
+    start_clock = _clock(start_text) or _clock(start_raw)
+    end_clock = _clock(end_text) or _clock(end_raw)
+    return start_clock, end_clock
+
+
+def _span_text(item: dict) -> str:
+    """课程时间段文本；展示前统一走一遍归一化，保证脏数据显示为 ``HH:MM``。"""
+    span = item["start_text"] if not item["end_text"] else f'{item["start_text"]}-{item["end_text"]}'
+    return normalize_time_expression(span) or span
+
+
+def _week_course_line(item: dict) -> str:
+    """段落 1 行：显式带本周公历日期，避免模型把周常课程判为「未登记」。"""
+    return (f'- {item["title"]}｜{item["weekday_label"]} {_span_text(item)}'
+            f'｜本周具体日期 {item["date_text"]}｜{item["location"] or "地点待定"}')
+
+
+def _repeat_course_line(item: dict) -> str:
+    """段落 4 行：周常重复规则，不含单次日期。"""
+    label = item["weekday_label"]
+    if label.startswith("周"):
+        label = label[1:]
+    return (f'- {item["title"]}｜每周{label} {_span_text(item)}'
+            f'｜{item["location"] or "地点待定"}')
+
+
 def _collection_line(item: dict) -> str:
     line = f'- [ID: {item["id"]}] {item["title"]}'
     details: list[str] = []
@@ -203,15 +275,22 @@ def build_group_qa_context(group_id: str, now: datetime | None = None) -> str:
     if not gid:
         return ""
 
-    sessions = week_sessions(gid, now)
+    current = _now(now)
+    weekly = weekly_courses(gid, now)
     collections = open_collections(gid)
     faqs = faq_pairs(gid)
-    if not (sessions or collections or faqs):
+    if not (weekly or collections or faqs):
         return ""
 
+    monday = current.date() - timedelta(days=current.weekday())
     lines = [CONTEXT_TITLE]
-    lines.append(f"1. 近期课程（未来 {SESSION_WINDOW_DAYS} 天）：")
-    lines.extend([_session_line(item) for item in sessions] or ["- 暂无已登记课程"])
+    # 先钉死本周的日期锚点：模型拿到具体公历日期才不会把「周四」算错一天。
+    lines.append(
+        f"本周周一为 {monday.strftime('%Y-%m-%d')}，"
+        f"今天 {current.date().strftime('%Y-%m-%d')}（{_WEEKDAY_LABELS[current.weekday()]}）。"
+    )
+    lines.append(f"1. 近期课程（本周排期，未来 {SESSION_WINDOW_DAYS} 天）：")
+    lines.extend([_week_course_line(item) for item in weekly] or ["- 暂无已登记课程"])
     lines.append("2. 进行中的征集与报名：")
     lines.extend([_collection_line(item) for item in collections] or ["- 暂无开放中的征集"])
     lines.append("3. 常见问题（FAQ）：")
@@ -219,6 +298,8 @@ def build_group_qa_context(group_id: str, now: datetime | None = None) -> str:
         [f'- Q: {_clip(item["question"], FAQ_QUESTION_CHARS)} A: {_clip(item["answer"], FAQ_ANSWER_CHARS)}'
          for item in faqs] or ["- 暂无已录入 FAQ"]
     )
+    lines.append("4. 每周常规训练/任务（每周重复，无单次日期）：")
+    lines.extend([_repeat_course_line(item) for item in weekly] or ["- 暂无周常课程"])
     return _truncate(
         "\n".join(lines),
         int(getattr(config, "QA_CONTEXT_MAX_CHARS", 3000)),
@@ -230,6 +311,7 @@ __all__ = [
     "COMMAND_GUIDE",
     "build_group_qa_context",
     "week_sessions",
+    "weekly_courses",
     "open_collections",
     "faq_pairs",
 ]

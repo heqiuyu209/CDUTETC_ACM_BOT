@@ -129,6 +129,28 @@ async def test_legacy_group_pause_does_not_consume_attempt(env, monkeypatch):
     sender.assert_not_awaited()
 
 
+@pytest.mark.parametrize("field", ["reg_deadline", "contest_time"])
+async def test_legacy_respects_group_switch_and_resumes(env, field):
+    cid = db.save_contest("g1", {"name": "暂停群比赛", field: TARGET})
+    db.save_contest("g2", {"name": "开启群比赛", field: TARGET})
+    key = db.delivery_dedup_key("g1", "legacy_contest", cid, field, TARGET)
+    db.set_group_switch("g1", "contest_remind_enabled", False, "admin")
+    sender = AsyncMock(return_value=True)
+
+    assert await reminder.check_general_reminders(sender, now=NOW) == 1
+    sender.assert_awaited_once()
+    assert sender.await_args.args[0] == "g2"
+    assert db.get_delivery_by_key(key) is None
+
+    db.init_db()
+    assert await reminder.check_general_reminders(sender, now=NOW) == 0
+    db.set_group_switch("g1", "contest_remind_enabled", True, "admin")
+    assert await reminder.check_general_reminders(sender, now=NOW) == 1
+    assert sender.await_args.args[0] == "g1"
+    assert db.get_delivery_by_key(key)["attempts"] == 1
+    assert await reminder.check_general_reminders(sender, now=NOW) == 0
+
+
 async def test_confirmed_migration_does_not_send_legacy_copy(env):
     cid, key = legacy()
     migrated = db.migrate_contest_to_competition(cid, "g1")
@@ -139,6 +161,55 @@ async def test_confirmed_migration_does_not_send_legacy_copy(env):
     assert {call.args[0] for call in sender.await_args_list} == {"g1", "g2"}
     assert sender.await_count == 2
     assert all(call.args[1].startswith("【报名提醒】") for call in sender.await_args_list)
+
+
+@pytest.mark.parametrize("field", ["reg_deadline", "contest_time"])
+async def test_confirmed_migration_returned_to_draft_keeps_legacy_retired(env, monkeypatch, field):
+    monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
+    cid = db.save_contest("g1", {"name": "待重新审核的比赛", field: TARGET})
+    key = db.delivery_dedup_key("g1", "legacy_contest", cid, field, TARGET)
+    migrated = db.migrate_contest_to_competition(cid, "g1")
+    db.confirm_competition(migrated)
+    db.set_competition_status(migrated, "draft")
+    sender = AsyncMock(return_value=True)
+
+    assert await reminder.check_general_reminders(sender, now=NOW) == 0
+    sender.assert_not_awaited()
+    db.init_db()
+    assert await reminder.check_general_reminders(sender, now=NOW) == 0
+    assert db.get_delivery_by_key(key)["status"] == "cancelled"
+
+    db.confirm_competition(migrated)
+    if field == "reg_deadline":
+        assert await reminder.check_general_reminders(sender, now=NOW) == 1
+    else:
+        assert await reminder.check_contest_start_reminders(sender, now=NOW + timedelta(minutes=30)) == 1
+    sender.assert_awaited_once()
+
+
+def test_confirmed_migration_returned_to_draft_invalidates_unsent_claim(env):
+    cid, key = legacy()
+    token = db.claim_delivery("g1", "legacy_contest", cid, "reg_deadline", TARGET,
+                              now=NOW, allowed_groups={"g1"})
+    assert token
+    migrated = db.migrate_contest_to_competition(cid, "g1")
+    db.confirm_competition(migrated)
+    db.set_competition_status(migrated, "draft")
+
+    assert not db.validate_delivery_claim(key, token, now=NOW, allowed_groups={"g1"})
+    assert db.get_delivery_by_key(key)["status"] == "cancelled"
+
+
+async def test_unconfirmed_migration_preserves_existing_legacy_reminder(env):
+    cid, key = legacy()
+    migrated = db.migrate_contest_to_competition(cid, "g1")
+    assert db.get_competition(migrated)["status"] == "draft"
+    sender = AsyncMock(return_value=True)
+
+    assert await reminder.check_general_reminders(sender, now=NOW) == 1
+    sender.assert_awaited_once()
+    assert sender.await_args.args[0] == "g1"
+    assert db.get_delivery_by_key(key)["status"] == "sent"
 
 
 @pytest.mark.parametrize("field", ["reg_deadline", "contest_time"])

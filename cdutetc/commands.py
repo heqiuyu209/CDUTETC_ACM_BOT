@@ -25,7 +25,14 @@ from cdutetc import llm
 from cdutetc import roles
 from cdutetc.fetcher import fetch_text
 from cdutetc.errors import AppErrorCode, safe_error_hint
-from cdutetc.utils import can_manage_group, is_super_admin, is_valid_account_id, parse_command
+from cdutetc.utils import (
+    can_manage_group,
+    is_super_admin,
+    is_valid_account_id,
+    normalize_time_expression,
+    parse_command,
+    split_normalized_time,
+)
 
 TZ = ZoneInfo("Asia/Shanghai")
 logger = logging.getLogger(__name__)
@@ -99,9 +106,11 @@ _HELP_SECTIONS = (
         (1, "/通知列表", "汇总本群近期的比赛、学校安排、课程和报名中的征集"),
     )),
     ("课程与训练", (
-        (1, "/课程列表", "查看本群课程安排"),
+        (1, "/课程列表", "查看本群课程安排（带序号，可直接用于 /课程修改）"),
         (2, "/课程添加 <标题> [星期几] [开始-结束] [地点]", "添加课程"),
+        (2, "/课程添加 <标题> 时间=周四 19点半-21点 地点=... 电脑=需要", "添加课程（命名参数写法）"),
         (2, "/课程取消 <id>", "取消课程"),
+        (2, "/课程修改 <序号或课程名> [时间=...] [内容=...] [地点=...]", "修改课程（序号取自 /课程列表）"),
     )),
     ("征集登记", (
         (1, "/报名 <征集id> [字段=值 ...]", "报名或更新我的登记"),
@@ -121,7 +130,15 @@ _HELP_SECTIONS = (
         (2, "/FAQ添加 <问题> = <答案>", "添加一条常见问题"),
         (2, "/FAQ删除 <id>", "删除一条常见问题"),
     )),
+    ("群开关", (
+        (2, "/群开关", "查看本群问答/比赛提醒/课程提醒/晨报开关状态"),
+        (2, "/群开关 <名称> 开启|关闭", "调整本群单项主动能力，例如 /群开关 课程提醒 关闭"),
+    )),
     ("提醒与来源", (
+        (2, "/提醒列表 [天数]", "统一查看未来提醒（[比赛]/[课程]/[自定义]）与投递状态"),
+        (2, "/提醒添加 <时间> <内容>", "添加自定义提醒，时间支持 2026-11-20 18:00 或 每周四 19:00"),
+        (2, "/提醒修改 <序号> <新时间或新内容>", "修改自定义提醒，序号取自 /提醒列表"),
+        (2, "/提醒删除 <序号>", "删除自定义提醒，序号取自 /提醒列表"),
         (2, "/提醒状态 [页码]", "查看未来7天的提醒时间和投递状态"),
         (2, "/比赛状态", "诊断本群比赛到点是否真会推送（就绪/阻断分列）"),
         (3, "/通知测试 [群|私聊] [目标标识]", "主动测试；官方群可在末尾加 Markdown 或 文本"),
@@ -575,7 +592,7 @@ def cmd_org_events(group_id: str, sender: str, args: str) -> list[dict]:
     lines = ["学校统一安排："]
     for e in events:
         t = e["contest_time"] or e["reg_deadline"] or ""
-        lines.append(f"#{e['id']} {e['title']}｜{t}｜{e.get('location') or '地点待定'}")
+        lines.append(f"#{e['id']} {e['title']}｜{t}｜{(e.get('location') or '').strip() or '待定'}")
     return [{"group_id": group_id, "text": "\n".join(lines)}]
 
 
@@ -583,12 +600,24 @@ def cmd_training_list(group_id: str, sender: str, args: str) -> list[dict]:
     sessions = db.list_training_sessions(group_id)
     if not sessions:
         return [{"group_id": group_id, "text": "本群暂无课程安排"}]
-    lines = ["本群课程安排："]
-    for s in sessions:
+    lines = ["本群课程安排（用 /课程修改 <序号> 调整）："]
+    for index, s in enumerate(sessions, 1):
         need = "（需带电脑）" if s["needs_laptop"] else ""
-        lines.append(
-            f"#{s['id']} {s['title']}{need}｜{s['weekday']} {s['start_time']}-{s['end_time']}｜{s['location'] or '地点待定'}"
+        # 只展示 1-based 序号：课程 id 与序号常在删课后错位，同时出现会让人改错课；
+        # 内部仍兼容 #id，只是列表里不再渲染。
+        cell = [f"{index}. {s['title']}{need}"]
+        span = _format_course_time(
+            s.get("weekday") or "", s.get("start_time") or "", s.get("end_time") or ""
         )
+        if span:
+            cell.append(span)
+        # 地点统一兜底：None / 空串 / 纯空白都渲染成「待定」，
+        # 且与「要求：」各自独占一段，避免拼接后粘成一行。
+        cell.append(f"地点：{(s.get('location') or '').strip() or '待定'}")
+        requirement = (s.get("requirement") or "").strip()
+        if requirement:
+            cell.append(f"要求：{requirement}")
+        lines.append("｜".join(cell))
     return [{"group_id": group_id, "text": "\n".join(lines)}]
 
 
@@ -663,7 +692,7 @@ def cmd_notice_list(group_id: str, sender: str, args: str) -> list[dict]:
             t = e.get("contest_time") or e.get("reg_deadline") or ""
             if t:
                 extra.append(t)
-            extra.append(e.get("location") or "地点待定")
+            extra.append((e.get("location") or "").strip() or "待定")
             lines.append("· " + (e.get("title") or "未命名安排") + "｜" + "｜".join(extra))
     if sessions:
         lines.append(f"【课程安排】{len(sessions)} 条")
@@ -672,7 +701,7 @@ def cmd_notice_list(group_id: str, sender: str, args: str) -> list[dict]:
             lines.append(
                 "· " + f"{s.get('title') or '课程'}{need}"
                 f"｜{s.get('weekday') or ''} {s.get('start_time') or ''}-{s.get('end_time') or ''}"
-                f"｜{s.get('location') or '地点待定'}"
+                f"｜{(s.get('location') or '').strip() or '待定'}"
             )
     if collections:
         lines.append(f"【报名中的征集】{len(collections)} 条")
@@ -691,27 +720,351 @@ def cmd_notice_list(group_id: str, sender: str, args: str) -> list[dict]:
     return [{"group_id": group_id, "text": "\n".join(lines)}]
 
 
+# 课程参数键：「/课程添加」与「/课程修改」共用同一套解析口径，
+# 用正则按 `键=值` 切分，值内部允许空格（如 `时间=周四 19点半-21点`）。
+_COURSE_FIELD_KEYS = ("标题", "内容", "要求", "时间", "地点", "软件", "设备", "电脑")
+_COURSE_FIELD_RE = re.compile(
+    r"(" + "|".join(_COURSE_FIELD_KEYS) + r")\s*[=＝]\s*(.*?)"
+    r"(?=\s+(?:" + "|".join(_COURSE_FIELD_KEYS) + r")\s*[=＝]|$)",
+    re.S,
+)
+_QUOTE_PAIRS = (('"', '"'), ("'", "'"), ("“", "”"), ("「", "」"))
+
+# 位置参数里的时间表达：`周四 19:00-21:00`、`周四 19-21点`、`19点半-21点`。
+# 只有形如「时:分 / N点(半)」的时分写法才被当成时间，避免把 `3-5人` 之类误抽。
+_COURSE_WEEKDAY_TOKEN = r"(?:周|星期)[一二三四五六日天]"
+_COURSE_CLOCK_TOKEN = r"\d{1,2}(?::\d{2}|点(?:\d{1,2}分?|半)?)?"
+_COURSE_SPAN_TOKEN = rf"{_COURSE_CLOCK_TOKEN}\s*(?:[-~～—－]|到|至)\s*{_COURSE_CLOCK_TOKEN}"
+_COURSE_TIME_SPAN_RE = re.compile(
+    rf"(?:{_COURSE_WEEKDAY_TOKEN}\s*(?:{_COURSE_SPAN_TOKEN}|{_COURSE_CLOCK_TOKEN}))"
+    rf"|{_COURSE_SPAN_TOKEN}"
+)
+
+_TRAINING_ADD_USAGE = (
+    "用法：/课程添加 <标题> [时间=周四 19:00-21:00] [地点=二教B201] [要求=带电脑]"
+    "（标题只写课程名；要求=/内容= 或尾随文本写入「要求」，"
+    "过长时自动智能提炼）"
+)
+_TRAINING_MODIFY_USAGE = (
+    "用法：/课程修改 <序号或课程名> [时间=周四 19:00-21:00] [标题=新标题] [要求=新要求]"
+    "（标题= 只改课程名；要求=/内容=/尾随文本 只改要求，互不覆盖）"
+)
+
+
+def _strip_quotes(value: str) -> str:
+    """去掉值两侧的包裹引号（中文引号也兼容）。"""
+    text = (value or "").strip()
+    for left, right in _QUOTE_PAIRS:
+        if len(text) >= 2 and text.startswith(left) and text.endswith(right):
+            return text[1:-1].strip()
+    return text
+
+
+def _split_course_fields(args: str) -> tuple[dict[str, str], str]:
+    """抽出 `键=值` 参数，返回（字段字典，剩余位置参数文本）。
+
+    剩余文本仍按原有位置参数规则解析，保证老的 `/课程添加 标题 周四 19-21点 地点`
+    写法完全兼容。
+    """
+    text = args or ""
+    fields: dict[str, str] = {}
+    for m in _COURSE_FIELD_RE.finditer(text):
+        key = m.group(1)
+        if key in fields:
+            continue
+        fields[key] = _strip_quotes(m.group(2))
+    rest = _COURSE_FIELD_RE.sub(" ", text).strip() if fields else text.strip()
+    return fields, " ".join(rest.split())
+
+
+def _apply_time_fields(raw: str) -> dict[str, str]:
+    """归一化「周几 + 时间」并拆成 weekday/start_time/end_time（识别不到的键不返回）。"""
+    weekday, start_time, end_time = split_normalized_time(normalize_time_expression(raw or ""))
+    out: dict[str, str] = {}
+    if weekday:
+        out["weekday"] = weekday
+    if start_time:
+        out["start_time"] = start_time
+    if end_time:
+        out["end_time"] = end_time
+    return out
+
+
+def _fallback_time_fields(weekday: str, time_range: str) -> dict[str, str]:
+    """归一化失败时保留用户原文，避免把录入内容吞掉。"""
+    out: dict[str, str] = {}
+    text = (time_range or "").strip()
+    if text:
+        for sep in ("-", "~", "～", "—"):
+            if sep in text:
+                st, et = text.split(sep, 1)
+                out["start_time"], out["end_time"] = st.strip(), et.strip()
+                break
+        else:
+            out["start_time"] = text
+    if weekday:
+        out["weekday"] = weekday.strip()
+    return out
+
+
+def _extract_time_span(text: str) -> tuple[dict[str, str], str]:
+    """从位置参数里抽出时间表达，返回（时间字段，去掉时间后的剩余文本）。
+
+    `/课程修改 1 周四 19:00-21:00`、`/课程修改 1 19点半-21点 加练` 这类写法靠它
+    把「时间」与「标题/要求」拆开；识别不到时间时原样返回，由调用方按标题处理。
+    """
+    raw = " ".join((text or "").split())
+    if not raw:
+        return {}, ""
+    match = _COURSE_TIME_SPAN_RE.search(raw)
+    if match is None:
+        return {}, raw
+    # 没有「:」「点」「周几」的纯数字区间（如 3-5）不当时间，避免吞掉标题。
+    if not re.search(r"[:：点]|周|星期", match.group(0)):
+        return {}, raw
+    time_fields = _apply_time_fields(match.group(0))
+    if not time_fields:
+        return {}, raw
+    leftover = " ".join((raw[: match.start()] + " " + raw[match.end():]).split())
+    return time_fields, leftover
+
+
+def _format_course_time(weekday: str, start_time: str, end_time: str) -> str:
+    """拼「周X HH:MM-HH:MM」展示串，缺失部分自动省略。"""
+    if start_time and end_time:
+        span = f"{start_time}-{end_time}"
+    elif start_time:
+        span = start_time
+    elif end_time:
+        span = f"-{end_time}"
+    else:
+        span = ""
+    return " ".join(x for x in ((weekday or "").strip(), span) if x)
+
+
+def _prepare_requirement(raw_text: str, title: str, category: str = "课程") -> tuple[str, bool]:
+    """把「要求」文本准备成入库值：过长时先做 LLM 智能提炼，失败降级原文。
+
+    返回（入库文本, 是否经过提炼）。提炼不可用时绝不能阻断入库。
+    """
+    text = (raw_text or "").strip()
+    if not text:
+        return "", False
+    try:
+        return llm.summarize_entry_with_llm(category, title, text)
+    except Exception as exc:  # noqa: BLE001 - 提炼是增强项，异常一律降级
+        logger.warning("要求提炼异常，按原文入库：%s", exc)
+        return text, False
+
+
 def cmd_training_add(group_id: str, sender: str, args: str) -> list[dict]:
+    """新增课程：兼容位置参数，也支持 `时间=/地点=/电脑=` 命名参数。"""
     if not can_manage_group(sender):
         return [{"group_id": group_id, "text": "仅老师/超管可添加课程"}]
-    # 格式：/课程添加 标题 [星期几] [开始-结束] [地点]
-    parts = args.strip().split(None, 3)
-    if not parts:
-        return [{"group_id": group_id, "text": "用法：/课程添加 <标题> [星期几] [开始-结束] [地点]"}]
-    title = parts[0]
-    weekday = parts[1] if len(parts) > 1 else ""
-    time_range = parts[2] if len(parts) > 2 else ""
-    location = parts[3] if len(parts) > 3 else ""
-    start_time = end_time = ""
-    if "-" in time_range:
-        st, et = time_range.split("-", 1)
-        start_time, end_time = st.strip(), et.strip()
-    elif time_range:
-        start_time = time_range
-    info = {"title": title, "weekday": weekday, "start_time": start_time,
-            "end_time": end_time, "location": location}
+    fields, rest = _split_course_fields(args)
+    parts = rest.split(None, 3)
+    title = fields.get("标题") or ""
+    if not title and parts:
+        title = parts[0]
+    if not title:
+        return [{"group_id": group_id, "text": _TRAINING_ADD_USAGE}]
+    # 口径：标题只放课程名；内容=/要求= 属于「要求」，与标题互不覆盖。
+    raw_requirement = (fields.get("要求") or fields.get("内容") or "").strip()
+    weekday = "" if fields.get("时间") else (parts[1] if len(parts) > 1 else "")
+    time_range = "" if fields.get("时间") else (parts[2] if len(parts) > 2 else "")
+    location = fields.get("地点", parts[3] if len(parts) > 3 else "")
+    raw_time = fields.get("时间") or " ".join(x for x in (weekday, time_range) if x)
+    time_fields = _apply_time_fields(raw_time) or _fallback_time_fields(weekday, time_range)
+    info: dict[str, object] = {
+        "title": title,
+        "weekday": time_fields.get("weekday", weekday),
+        "start_time": time_fields.get("start_time", ""),
+        "end_time": time_fields.get("end_time", ""),
+        "location": location,
+    }
+    for key, field in (("软件", "software"), ("设备", "device_req")):
+        if fields.get(key):
+            info[field] = fields[key]
+    if "电脑" in fields:
+        laptop = fields["电脑"].strip()
+        if laptop in ("需要", "是", "要", "1"):
+            info["needs_laptop"] = 1
+        elif laptop in ("不需要", "否", "不用", "0"):
+            info["needs_laptop"] = 0
+    requirement, summarized = _prepare_requirement(raw_requirement, title)
+    if requirement:
+        info["requirement"] = requirement
     tid = db.create_training_session(group_id, info, sender)
-    return [{"group_id": group_id, "text": f"已添加课程 #{tid}：{title}"}]
+    span = _format_course_time(info["weekday"], info["start_time"], info["end_time"])
+    tail = f"（{span}）" if (info["start_time"] or info["end_time"]) and span else ""
+    text = f"已添加课程 #{tid}：{title}{tail}"
+    if requirement:
+        text += f"\n要求：{requirement}"
+        if summarized:
+            text += "（已智能提炼）"
+    return [{"group_id": group_id, "text": text}]
+
+
+def _match_course_by_title(sessions: list[dict], text: str) -> tuple[dict | None, str]:
+    """按课程名匹配：先精确（去空格），再退化到包含匹配，多重命中报歧义。"""
+    target = (text or "").strip().replace(" ", "")
+    if not target:
+        return None, ""
+    exact = [s for s in sessions if (s.get("title") or "").replace(" ", "") == target]
+    if len(exact) == 1:
+        return exact[0], ""
+    if len(exact) > 1:
+        return None, f"课程名「{text}」匹配到多门课程，请改用序号"
+    fuzzy = [s for s in sessions if target in (s.get("title") or "").replace(" ", "")]
+    if len(fuzzy) == 1:
+        return fuzzy[0], ""
+    if len(fuzzy) > 1:
+        return None, f"课程名「{text}」匹配到多门课程，请改用序号"
+    return None, ""
+
+
+def _resolve_course_target(group_id: str, target: str) -> tuple[dict | None, str]:
+    """解析课程目标：列表序号 → #id/课程 id → 课程名。"""
+    sessions = db.list_training_sessions(group_id)
+    text = (target or "").strip()
+    if text.isdigit():
+        index = int(text)
+        if 1 <= index <= len(sessions):
+            return sessions[index - 1], ""
+        course = db.get_group_course(group_id, index)
+        return (course, "") if course else (None, "")
+    if text.startswith("#") and text[1:].strip().isdigit():
+        course = db.get_group_course(group_id, int(text[1:].strip()))
+        return (course, "") if course else (None, "")
+    return _match_course_by_title(sessions, text)
+
+
+def _resolve_course_target_with_span(group_id: str, text: str) -> tuple[dict | None, str, int]:
+    """解析课程目标，返回（课程, 歧义提示, 消耗的 token 数）。
+
+    课程名允许带空格（如「算法 特训」），所以先按 1→4 个 token 找精确同名课程，
+    取最长的精确命中；都不精确命中时退回单 token 的序号 / #id / 模糊匹配。
+    """
+    tokens = (text or "").split()
+    if not tokens:
+        return None, "", 0
+    head = tokens[0]
+    if head.isdigit() or (head.startswith("#") and head[1:].strip().isdigit()):
+        course, ambiguous = _resolve_course_target(group_id, head)
+        return course, ambiguous, 1
+    sessions = db.list_training_sessions(group_id)
+    first_ambiguous = ""
+    for size in range(1, min(4, len(tokens)) + 1):
+        candidate = " ".join(tokens[:size])
+        flat = candidate.replace(" ", "")
+        matched = [s for s in sessions if (s.get("title") or "").replace(" ", "") == flat]
+        if len(matched) == 1:
+            return matched[0], "", size
+        if len(matched) > 1:
+            return None, f"课程名「{candidate}」匹配到多门课程，请改用序号", size
+        if not first_ambiguous:
+            _, ambiguous = _match_course_by_title(sessions, candidate)
+            if ambiguous:
+                first_ambiguous = ambiguous
+    course, ambiguous = _resolve_course_target(group_id, head)
+    if course is not None:
+        return course, "", 1
+    return None, ambiguous or first_ambiguous, 1
+
+
+def cmd_training_modify(group_id: str, sender: str, args: str) -> list[dict]:
+    """修改课程：目标支持列表序号 / #id / 课程名；时间与标题可写在位置上。
+
+    两种写法等价：`/课程修改 1 时间=周四 19:00-21:00`（键值对）与
+    `/课程修改 1 周四 19:00-21:00 加练`（位置参数）；同时出现时键值对优先。
+    """
+    if not can_manage_group(sender):
+        return [{"group_id": group_id, "text": "仅老师/超管可修改课程"}]
+    fields, rest = _split_course_fields(args)
+    if not rest.strip():
+        return [{"group_id": group_id, "text": _TRAINING_MODIFY_USAGE}]
+    course, ambiguous, consumed = _resolve_course_target_with_span(group_id, rest)
+    if course is None:
+        target = " ".join(rest.split()[:max(consumed, 1)])
+        return [{"group_id": group_id, "text": ambiguous or f"找不到课程：{target}"}]
+    tail = " ".join(rest.split()[consumed:])
+    positional_time, positional_text = _extract_time_span(tail)
+    updates: dict[str, object] = {}
+    notices: list[str] = []
+    # 口径：标题= 只改课程名；内容=/要求=/位置上的尾随文本都写「要求」，互不覆盖。
+    title_field = (fields.get("标题") or "").strip()
+    requirement_field = (fields.get("要求") or fields.get("内容") or "").strip()
+    if title_field:
+        updates["title"] = title_field
+    if requirement_field:
+        updates["requirement"] = requirement_field
+    elif positional_text:
+        # 位置参数里时间之外的部分（如 `1 周四 19-21点 加练双指针`）是要求补充。
+        updates["requirement"] = positional_text
+    if fields.get("时间"):
+        updates.update(_apply_time_fields(fields["时间"]))
+        if positional_time:
+            notices.append("已忽略位置参数里的时间（键值对 时间= 优先）")
+    elif positional_time:
+        updates.update(positional_time)
+    for key, field in (("地点", "location"), ("软件", "software"), ("设备", "device_req")):
+        if fields.get(key):
+            updates[field] = fields[key]
+    if "电脑" in fields:
+        laptop = fields["电脑"].strip()
+        if laptop in ("需要", "是", "要", "1"):
+            updates["needs_laptop"] = True
+        elif laptop in ("不需要", "否", "不用", "0"):
+            updates["needs_laptop"] = False
+        else:
+            notices.append("电脑= 只支持 需要/不需要")
+    if not updates:
+        return [{"group_id": group_id, "text": _TRAINING_MODIFY_USAGE}]
+    summarized = False
+    if "requirement" in updates:
+        updated_title = str(updates.get("title") or course.get("title") or "")
+        prepared, summarized = _prepare_requirement(str(updates["requirement"]), updated_title)
+        if not prepared:
+            updates.pop("requirement", None)
+        else:
+            updates["requirement"] = prepared
+            if not updates:
+                return [{"group_id": group_id, "text": _TRAINING_MODIFY_USAGE}]
+    ok = db.update_group_course(group_id, course["id"], sender, **updates)
+    if not ok:
+        # 这里目标已解析成功、只是落库失败；用课程自身标识回报。
+        # 不能复用只在「目标解析失败」分支里定义的 target，否则会 UnboundLocalError。
+        failed_label = (course.get("title") or "").strip() or str(course.get("id") or "")
+        return [{"group_id": group_id, "text": f"找不到课程：{failed_label}"}]
+    updated = db.get_group_course(group_id, course["id"]) or course
+    parts: list[str] = []
+    if "title" in updates:
+        parts.append(f"标题={updated['title']}")
+    if {"weekday", "start_time", "end_time"} & set(updates):
+        span = _format_course_time(updated.get("weekday", ""), updated.get("start_time", ""),
+                                   updated.get("end_time", ""))
+        if span:
+            parts.append(f"时间={span}")
+    if "location" in updates:
+        parts.append(f"地点={updated.get('location') or '地点待定'}")
+    if "needs_laptop" in updates:
+        parts.append(f"需带电脑={'需要' if updated.get('needs_laptop') else '不需要'}")
+    if "software" in updates:
+        parts.append(f"软件={updated.get('software') or '无'}")
+    if "device_req" in updates:
+        parts.append(f"设备={updated.get('device_req') or '无'}")
+    if "requirement" in updates:
+        parts.append(f"要求={updated.get('requirement') or '无'}")
+    # 回执用标题定位课程，避免用户输入列表序号 1 却看到数据库 id 造成混淆；
+    # 本次未改标题时 updated 即原记录，展示原标题。
+    display_title = (updated.get("title") or course.get("title") or "").strip()
+    label = f"「{display_title}」" if display_title else ""
+    text = f"已更新课程{label}：" + "｜".join(parts or ["无变更"])
+    if summarized:
+        text += "（要求已智能提炼）"
+    if notices:
+        text += "\n" + "\n".join(notices)
+    return [{"group_id": group_id, "text": text}]
 
 
 def cmd_training_cancel(group_id: str, sender: str, args: str) -> list[dict]:
@@ -1151,13 +1504,20 @@ def resolve_group_arg(arg: str) -> tuple[str | None, str]:
     # 1) 直接命中群号/openid
     if value in config.ALLOWED_GROUPS:
         return value, ""
-    # 2) 序号
+    # 2) 已认领的真实群号，可能被重复绑定，必须唯一匹配。
     if value.isdigit():
+        aliases = db.list_group_aliases()
+        numeric_matches = [gid for gid in groups if value == aliases.get(gid, {}).get("numeric_id")]
+        if len(numeric_matches) == 1:
+            return numeric_matches[0], ""
+        if len(numeric_matches) > 1:
+            return None, f"群号 {value} 对应多个已授权群，请改用序号或群标识。"
+        # 3) 序号
         index = int(value)
         if 1 <= index <= len(groups):
             return groups[index - 1], ""
         return None, f"序号 {index} 超出范围（当前共 {len(groups)} 个已授权群）。"
-    # 3) 群备注名 / 命名（先精确，再包含匹配，唯一命中才采纳）
+    # 4) 群备注名 / 命名（先精确，再包含匹配，唯一命中才采纳）
     exact = [gid for gid in groups if _group_label(gid) == value]
     if len(exact) == 1:
         return exact[0], ""
@@ -1279,12 +1639,32 @@ def cmd_digest_preview(group_id: str, sender: str, args: str, *, private: bool =
 
 
 async def cmd_trigger_fetch(group_id: str, sender: str, args: str) -> list[dict]:
-    """手动触发一次公共来源抓取（老师）。结果汇总后返回，不写入发送日志冒充发送。
+    """手动触发一次抓取（老师）。结果汇总后返回，不写入发送日志冒充发送。
 
+    - 不带参数：抓取已登记的公共来源（原行为）；
+    - 带「比赛」/「contest」：抓 CF / 牛客赛程，汇总新建 / 已存在 / 失败条数。
     异步执行：在现有事件循环中调度，避免嵌套 asyncio.run。
     """
     if not can_manage_group(sender):
         return [{"group_id": group_id, "text": "仅老师/超管可触发抓取"}]
+    keyword = (args or "").strip().lower()
+    if "比赛" in keyword or "contest" in keyword:
+        if not config.AUTO_CONTEST_CRAWL_ENABLED:
+            return [{"group_id": group_id,
+                     "text": "赛程自动抓取未开启（AUTO_CONTEST_CRAWL_ENABLED=False）"}]
+        try:
+            items = await crawler.run_contest_fetch()
+        except Exception as e:  # noqa: BLE001 - 对外只报一句可读原因
+            return [{"group_id": group_id, "text": f"赛程抓取失败：{e}"}]
+        created = [i for i in items if i.get("kind") == "created"]
+        exists = [i for i in items if i.get("kind") == "exists"]
+        failed = [i for i in items if i.get("kind") == "error"]
+        lines = [f"赛程抓取完成：新建 {len(created)} 条 / 已存在 {len(exists)} 条 / 失败 {len(failed)} 条"]
+        for item in created:
+            lines.append(f"+ {item.get('platform')} {item.get('name')}（{item.get('start')}，id={item.get('competition_id')}）")
+        for item in failed:
+            lines.append(f"! {item.get('platform') or '未知'}：{item.get('error')}")
+        return [{"group_id": group_id, "text": "\n".join(lines)}]
     try:
         results = await crawler.run_fetch()
     except Exception as e:
@@ -1314,9 +1694,95 @@ async def cmd_trigger_fetch(group_id: str, sender: str, args: str) -> list[dict]
 # 分发器
 # ---------------------------------------------------------------------
 
+def _group_alias_parts(gid: str) -> tuple[str, str]:
+    """返回群的（备注名, 真实群号）；未认领或库不可用时都返回空串。"""
+    import sqlite3
+
+    try:
+        alias = db.get_entity_alias("group", gid) or {}
+        name = (alias.get("display_name") or "").strip()
+        numeric = (alias.get("numeric_id") or "").strip()
+        if not name:
+            # 兼容只走过 /命名群 的历史数据
+            name = (db.get_account_label("group", gid) or "").strip()
+    except sqlite3.Error:
+        return "", ""
+    return name, numeric
+
+
+def _private_header(origin_sender: str) -> str:
+    """私聊回执首行标牌：已绑定群显示工作区，否则显示全局模式。"""
+    from cdutetc import admin_session
+    gid = admin_session.get_active_group(origin_sender)
+    if gid and gid in config.ALLOWED_GROUPS:
+        alias_name, numeric = _group_alias_parts(gid)
+        label = alias_name or (_group_label(gid) or "").strip()
+        # _group_label 在群无备注时直接回群号，此时不算「有名称」，
+        # 避免拼成「123456789 (123456789)」这类重复。
+        if label in (gid, f"群 {gid}"):
+            label = ""
+        number = numeric or ""
+        if label and number and number not in label:
+            label = f"{label} ({number})"
+        elif not label:
+            # 优先用认领时留下的真实群号，没有才退回 openid。
+            label = f"群 {number or gid}"
+        return f"📌【当前工作区：{label}】"
+    return "🌐【当前模式：全局模式 (未选群)】"
+
+
+def _with_private_header(result: list[dict] | None, origin_sender: str,
+                         was_private: bool) -> list[dict] | None:
+    """给超管私聊的所有回执统一加首行状态标牌；群聊/普通用户原样返回。"""
+    if not result or not was_private or not is_super_admin(origin_sender):
+        return result
+    head = _private_header(origin_sender)
+    decorated: list[dict] = []
+    for item in result:
+        text = (item.get("text") or "").strip()
+        decorated.append({**item, "text": f"{head}\n{text}"} if text else item)
+    return decorated
+
+
+def _bind_active_group(admin_user_id: str, token: str) -> str | None:
+    """私聊发 `/群配置 <序号|群号|备注名>` 时顺手锁定工作区；解析失败静默交由主流程报错。"""
+    from cdutetc import admin_session, group_admin
+    try:
+        gid = group_admin.resolve_group(token)
+    except ValueError:
+        return None
+    admin_session.set_active_group(admin_user_id, gid)
+    return gid
+
+
+def bind_active_group(admin_user_id: str, token: str) -> str | None:
+    """C5 的对外入口：私聊 `/<管理命令> <单个群标识>` 成功后自动绑定工作区。
+
+    main 的私聊链路里，群配置类命令由 `group_admin.handle_command` 直接处理，
+    不经过 `handle_command`，因此需要一个可被外部调用的绑定入口。
+    """
+    return _bind_active_group(admin_user_id, token)
+
+
+def with_private_header(result: list[dict] | None, origin_sender: str,
+                        was_private: bool = True) -> list[dict] | None:
+    """C5 的对外入口：给超管私聊回执统一加工作区标牌（群聊/普通用户原样返回）。"""
+    return _with_private_header(result, origin_sender, was_private)
+
+
 async def handle_command(text: str, group_id: str, sender: str,
                          client=None, *, private: bool = False,
                          active_group: str | None = None) -> list[dict] | None:
+    """处理一条命令消息；超管私聊回执统一带工作区状态标牌（实现见 _handle_command_impl）。"""
+    return _with_private_header(
+        await _handle_command_impl(text, group_id, sender, client,
+                                   private=private, active_group=active_group),
+        sender, private)
+
+
+async def _handle_command_impl(text: str, group_id: str, sender: str,
+                               client=None, *, private: bool = False,
+                               active_group: str | None = None) -> list[dict] | None:
     """处理一条命令消息。
 
     - 非命令消息返回 None（由上层走 FAQ 匹配 / 模型问答 / 未答问题收集）。
@@ -1331,6 +1797,7 @@ async def handle_command(text: str, group_id: str, sender: str,
     """
     if not text.startswith("/"):
         return None
+    was_private = private
     # 私聊绑定目标群时降维成「单群视角」：作用域按该群校验，展示范围也只到该群
     if private and active_group and is_super_admin(sender) and active_group in config.ALLOWED_GROUPS:
         group_id = active_group
@@ -1338,6 +1805,11 @@ async def handle_command(text: str, group_id: str, sender: str,
     cmd, args = parse_command(text)
     if cmd is None:
         return [{"group_id": group_id, "text": "请写上命令名，例如 /帮助。"}]
+    # 超管私聊直接 /群配置 1 时顺手锁定工作区，下一步操作就不用再 /选群
+    if was_private and is_super_admin(sender) and cmd == "群配置":
+        tokens = (args or "").split()
+        if len(tokens) == 1:
+            _bind_active_group(sender, tokens[0])
     if cmd in ("help", "帮助"):
         return [{"group_id": group_id, "text": build_help(sender, args)}]
     scoped_cmd = cmd if cmd in _STATUS_COMMANDS else next(
@@ -1365,6 +1837,12 @@ async def handle_command(text: str, group_id: str, sender: str,
         "课程列表": cmd_training_list,
         "课程添加": cmd_training_add,
         "课程取消": cmd_training_cancel,
+        "课程修改": cmd_training_modify,
+        "群开关": cmd_group_switch,
+        "提醒添加": cmd_reminder_add,
+        "提醒列表": cmd_reminder_list,
+        "提醒修改": cmd_reminder_modify,
+        "提醒删除": cmd_reminder_delete,
         "FAQ列表": cmd_faq_list,
         "FAQ添加": cmd_faq_add,
         "FAQ删除": cmd_faq_delete,
@@ -1603,3 +2081,293 @@ async def _answer_from_context(text: str, group_id: str) -> str | None:
     if not answer or answer.startswith("模型暂时不可用") or llm.UNKNOWN_MARKER in answer:
         return None
     return answer
+
+# ---------------------------------------------------------------------
+# 群级细粒度开关：/群开关（问答 / 比赛提醒 / 课程提醒 / 晨报）
+# ---------------------------------------------------------------------
+
+GROUP_SWITCH_ALIASES = {
+    "问答": "qa_enabled",
+    "问答开关": "qa_enabled",
+    "比赛提醒": "contest_remind_enabled",
+    "比赛": "contest_remind_enabled",
+    "课程提醒": "course_remind_enabled",
+    "课程": "course_remind_enabled",
+    "晨报": "daily_digest_enabled",
+    "每日晨报": "daily_digest_enabled",
+}
+
+GROUP_SWITCH_LABELS = {
+    "qa_enabled": "问答",
+    "contest_remind_enabled": "比赛提醒",
+    "course_remind_enabled": "课程提醒",
+    "daily_digest_enabled": "晨报",
+}
+
+_SWITCH_OFF_HINTS = {
+    "qa_enabled": "关闭后本群不再自动回答提问，仍可发送 /命令 查询。",
+    "contest_remind_enabled": "关闭后本群不再收到比赛报名/开赛提醒。",
+    "course_remind_enabled": "关闭后本群不再收到课程开课提醒。",
+    "daily_digest_enabled": "关闭后本群不再收到每日晨报。",
+}
+
+
+def render_group_switches(group_id: str) -> str:
+    """渲染本群开关面板：未设置过的开关按默认开启展示。"""
+    states = db.get_group_switches(group_id)
+    lines = ["本群主动能力开关："]
+    for key in ("qa_enabled", "contest_remind_enabled", "course_remind_enabled",
+                "daily_digest_enabled"):
+        enabled = states.get(key, True)
+        lines.append(f"- {GROUP_SWITCH_LABELS[key]}：{'开启' if enabled else '关闭'}")
+    lines.append("调整：/群开关 <问答|比赛提醒|课程提醒|晨报> 开启|关闭")
+    return "\n".join(lines)
+
+
+def cmd_group_switch(group_id: str, sender: str, args: str) -> list[dict]:
+    """群内细粒度开关：无参数看面板，带名称与取值则改本群单项设置。"""
+    if admin_scope(sender, group_id) is None:
+        return [{"group_id": group_id, "text": "⚠️ 群开关仅限本群老师或超级管理员调整。"}]
+    import shlex
+
+    parts = shlex.split(args or "")
+    if not parts:
+        return [{"group_id": group_id, "text": render_group_switches(group_id)}]
+    if len(parts) != 2:
+        raise ValueError("用法：/群开关 <问答|比赛提醒|课程提醒|晨报> 开启|关闭")
+    key = GROUP_SWITCH_ALIASES.get(parts[0])
+    if key is None:
+        raise ValueError("开关名称只支持：问答 / 比赛提醒 / 课程提醒 / 晨报")
+    if parts[1] not in ("开启", "关闭"):
+        raise ValueError("取值只支持 开启 或 关闭")
+    enabled = parts[1] == "开启"
+    db.set_group_switch(group_id, key, enabled, sender)
+    text = f"本群{GROUP_SWITCH_LABELS[key]}已{parts[1]}。"
+    if not enabled:
+        text += _SWITCH_OFF_HINTS[key]
+    return [{"group_id": group_id, "text": text}]
+
+
+# ---------------------------------------------------------------------
+# 统一主动提醒中心：/提醒列表 /提醒添加 /提醒修改 /提醒删除
+# 一个入口聚合比赛、课程、自定义三类来源
+# ---------------------------------------------------------------------
+
+_WEEKDAY_INDEX = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+_WEEKLY_PREFIX = re.compile(
+    r"^(?:每周|每星期|每礼拜|周|星期|礼拜)([一二三四五六日天])\s*"
+    r"(\d{1,2})(?:[:：点时](\d{1,2}))?分?"
+)
+_ABSOLUTE_PREFIX = re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2})[:：点时](\d{1,2})")
+
+
+def _now_local() -> datetime:
+    return datetime.now(TZ)
+
+
+def _next_weekly_occurrence(weekday: str, hour: int, minute: int, now: datetime) -> datetime:
+    index = _WEEKDAY_INDEX[weekday]
+    base = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    delta = (index - base.weekday()) % 7
+    target = base + timedelta(days=delta)
+    if target <= now:
+        target += timedelta(days=7)
+    return target
+
+
+def parse_reminder_time(prefix: str, now: datetime) -> tuple[datetime, str, str, str, str]:
+    """解析「每周四 19:00」或「2026-11-20 18:00」式时间前缀。
+
+    返回 (下次触发时间, 循环规则, 周几, 时刻文本, 剩余未消费文本)。
+    """
+    match = _WEEKLY_PREFIX.match(prefix)
+    if match:
+        weekday = match.group(1)
+        hour = int(match.group(2))
+        minute = int(match.group(3) or 0)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError("时间超出范围，小时 0-23、分钟 0-59")
+        target = _next_weekly_occurrence(weekday, hour, minute, now)
+        time_of_day = f"{hour:02d}:{minute:02d}"
+        return (target, "weekly", weekday, time_of_day, prefix[match.end():])
+    match = _ABSOLUTE_PREFIX.match(prefix)
+    if match:
+        year, month, day, hour, minute = (int(value) for value in match.groups())
+        target = datetime(year, month, day, hour, minute, tzinfo=TZ)
+        return (target, "none", "", f"{hour:02d}:{minute:02d}", prefix[match.end():])
+    raise ValueError("时间格式支持：2026-11-20 18:00（单次）或 每周四 19:00（每周循环）")
+
+
+def _require_group_admin(group_id: str, sender: str) -> list[dict] | None:
+    if admin_scope(sender, group_id) is None:
+        return [{"group_id": group_id, "text": "⚠️ 提醒中心仅限本群老师或超级管理员使用。"}]
+    return None
+
+
+def _split_reminder_command(args: str, now: datetime) -> tuple[datetime, str, str, str, str]:
+    """把「时间 + 内容」拆开；时间前缀解析失败时抛出用法错误。"""
+    raw = (args or "").strip()
+    if not raw:
+        raise ValueError("用法：/提醒添加 <时间> <内容>，例如 /提醒添加 每周四 19:00 交作业")
+    target, rule, weekday, time_of_day, rest = parse_reminder_time(raw, now)
+    content = rest.strip(" ，,、:：")
+    return target, rule, weekday, time_of_day, content
+
+
+def _summarize_reminder_content(raw_text: str) -> tuple[str, bool]:
+    """自定义提醒内容复用统一提炼链路，超长时压缩成 <=60 字摘要。"""
+    return _prepare_requirement(raw_text, "提醒", category="提醒")
+
+
+def cmd_reminder_add(group_id: str, sender: str, args: str) -> list[dict]:
+    denied = _require_group_admin(group_id, sender)
+    if denied:
+        return denied
+    now = _now_local()
+    target, rule, weekday, time_of_day, content = _split_reminder_command(args, now)
+    if not content:
+        raise ValueError("用法：/提醒添加 <时间> <内容>，例如 /提醒添加 每周四 19:00 交作业")
+    text, summarized = _summarize_reminder_content(content)
+    reminder_id = db.create_custom_reminder(
+        group_id, text, target.strftime("%Y-%m-%d %H:%M"),
+        repeat_rule=rule, weekday=weekday, time_of_day=time_of_day, operator=sender,
+    )
+    repeat_label = "（每周重复）" if rule == "weekly" else ""
+    reply = (
+        f"已添加提醒 #{reminder_id}{repeat_label}：{text}\n"
+        f"下次提醒：{target.strftime('%Y-%m-%d %H:%M')}"
+    )
+    if summarized:
+        reply += "\n已自动提炼摘要，如需微调可用 /提醒修改。"
+    return [{"group_id": group_id, "text": reply}]
+
+
+def _upcoming_entries(group_id: str, now: datetime, days: int = 7) -> list[dict]:
+    from cdutetc import reminder as reminder_module
+
+    return reminder_module.build_upcoming_reminders(group_id, now, days=days)
+
+
+def render_upcoming_reminders(group_id: str, now: datetime, days: int = 7) -> str:
+    from cdutetc import reminder as reminder_module
+
+    entries = _upcoming_entries(group_id, now, days)
+    if not entries:
+        return f"未来 {days} 天暂无提醒。\n添加：/提醒添加 <时间> <内容>"
+    lines = [f"未来 {days} 天提醒："]
+    for index, entry in enumerate(entries[:20], 1):
+        source = reminder_module.SOURCE_LABELS.get(entry["source"], entry["source"])
+        status = reminder_module.STATUS_LABELS.get(entry["status"], entry["status"])
+        repeat = "（每周）" if entry.get("repeat") == "weekly" else ""
+        lines.append(
+            f"{index}. [{source}]{entry['trigger'].strftime('%m-%d %H:%M')} "
+            f"{entry['text']}{repeat}（{status}）"
+        )
+    if len(entries) > 20:
+        lines.append(f"（共 {len(entries)} 条，仅显示前 20 条）")
+    return "\n".join(lines)
+
+
+def cmd_reminder_list(group_id: str, sender: str, args: str) -> list[dict]:
+    """统一提醒清单：比赛 / 课程 / 自定义全部聚合，只读展示。"""
+    denied = _require_group_admin(group_id, sender)
+    if denied:
+        return denied
+    days = 7
+    raw = (args or "").strip()
+    if raw:
+        try:
+            days = int(raw.split()[0])
+        except (TypeError, ValueError):
+            raise ValueError("用法：/提醒列表 [天数]，默认 7 天") from None
+        if not 1 <= days <= 30:
+            raise ValueError("天数需在 1-30 之间")
+    return [{"group_id": group_id, "text": render_upcoming_reminders(group_id, _now_local(), days)}]
+
+
+def _resolve_custom_reminder(group_id: str, selector: str, now: datetime) -> dict:
+    """把「序号（取自 /提醒列表）」或「#编号」解析成本群的自定义提醒。"""
+    raw = str(selector or "").strip()
+    if not raw:
+        raise ValueError("请提供序号，序号取自 /提醒列表")
+    if raw.startswith("#"):
+        try:
+            reminder_id = int(raw.lstrip("#"))
+        except (TypeError, ValueError):
+            raise ValueError("编号格式应为 #12") from None
+        existing = db.get_custom_reminder(reminder_id)
+        if not existing or existing.get("group_id") != group_id:
+            raise ValueError(f"本群没有编号为 {reminder_id} 的自定义提醒")
+        return existing
+    try:
+        index = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("请提供序号，序号取自 /提醒列表") from None
+    entries = _upcoming_entries(group_id, now, 7)
+    if not 1 <= index <= len(entries):
+        raise ValueError(f"序号超出范围，本群未来 7 天共有 {len(entries)} 条提醒")
+    entry = entries[index - 1]
+    if entry.get("source") != "custom":
+        from cdutetc import reminder as reminder_module
+
+        label = reminder_module.SOURCE_LABELS.get(entry.get("source"), entry.get("source"))
+        raise ValueError(f"第 {index} 条是 [{label}] 提醒，只能修改自定义提醒")
+    existing = db.get_custom_reminder(int(entry["obj_id"]))
+    if not existing:
+        raise ValueError(f"提醒 #{entry['obj_id']} 已不存在")
+    return existing
+
+
+def cmd_reminder_modify(group_id: str, sender: str, args: str) -> list[dict]:
+    """支持改时间（含循环规则）或只改内容；序号与 /提醒列表 一致。"""
+    denied = _require_group_admin(group_id, sender)
+    if denied:
+        return denied
+    parts = (args or "").strip().split(maxsplit=1)
+    if len(parts) < 2:
+        raise ValueError("用法：/提醒修改 <序号> <新时间或新内容>")
+    now = _now_local()
+    existing = _resolve_custom_reminder(group_id, parts[0], now)
+    reminder_id = int(existing["id"])
+    payload = parts[1].strip()
+    try:
+        target, rule, weekday, time_of_day, rest = parse_reminder_time(payload, now)
+    except ValueError:
+        text, summarized = _summarize_reminder_content(payload)
+        db.update_custom_reminder(reminder_id, content=text, status="pending",
+                                  operator=sender)
+        reply = f"已更新提醒 #{reminder_id}：{text}"
+        if summarized:
+            reply += "\n已自动提炼摘要，如需微调可用 /提醒修改。"
+        return [{"group_id": group_id, "text": reply}]
+    raw_content = rest.strip(" ，,、:：")
+    if raw_content:
+        text, summarized = _summarize_reminder_content(raw_content)
+    else:
+        text, summarized = (existing.get("content") or ""), False
+    db.update_custom_reminder(reminder_id, target_time=target.strftime("%Y-%m-%d %H:%M"),
+                              content=text, status="pending", operator=sender)
+    db.set_custom_reminder_repeat(reminder_id, repeat_rule=rule, weekday=weekday,
+                                  time_of_day=time_of_day, operator=sender)
+    repeat_label = "（每周重复）" if rule == "weekly" else ""
+    reply = (
+        f"已更新提醒 #{reminder_id}{repeat_label}：{text}\n"
+        f"下次提醒：{target.strftime('%Y-%m-%d %H:%M')}"
+    )
+    if summarized:
+        reply += "\n已自动提炼摘要，如需微调可用 /提醒修改。"
+    return [{"group_id": group_id, "text": reply}]
+
+
+def cmd_reminder_delete(group_id: str, sender: str, args: str) -> list[dict]:
+    denied = _require_group_admin(group_id, sender)
+    if denied:
+        return denied
+    raw = (args or "").strip()
+    if not raw:
+        raise ValueError("用法：/提醒删除 <序号>，序号取自 /提醒列表")
+    existing = _resolve_custom_reminder(group_id, raw.split()[0], _now_local())
+    reminder_id = int(existing["id"])
+    db.delete_custom_reminder(reminder_id, sender)
+    return [{"group_id": group_id,
+             "text": f"已删除提醒 #{reminder_id}：{existing.get('content') or ''}"}]

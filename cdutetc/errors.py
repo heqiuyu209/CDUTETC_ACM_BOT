@@ -71,7 +71,7 @@ _SAFE_HINTS = {
     DeliveryCode.AUTHENTICATION: "[authentication] 平台鉴权失败，请检查机器人凭证和授权状态。",
     DeliveryCode.FORBIDDEN: "[forbidden] 平台拒绝发送，请检查目标会话权限和机器人主动消息设置。",
     DeliveryCode.ACTIVE_FORBIDDEN: "[active_forbidden] QQ平台拒绝主动消息（40034105）。请检查目标群/会话的“允许主动发送/主动通知”和机器人权限，修复后用 /通知测试 验证。",
-    DeliveryCode.QUOTA_EXHAUSTED: "[quota_exhausted] QQ平台主动消息配额已耗尽（11253/11263），今日已停止重试并熔断该群；明日配额恢复后可用 /通知测试 验证。",
+    DeliveryCode.QUOTA_EXHAUSTED: "[quota_exhausted] QQ平台主动消息配额已耗尽（11253/11263），今日已停止重试并熔断该群；次日自动恢复尝试，也可用 /通知测试 验证。",
     DeliveryCode.NETWORK_ERROR: "[network_error] 发信超时(10s)或网络异常，消息结果未确认；请检查网络与机器人连接后核对目标会话。",
     DeliveryCode.NOT_FOUND: "[not_found] 平台未找到目标会话，请确认机器人仍在目标群或会话有效。",
     DeliveryCode.RATE_LIMITED: "[rate_limited] 平台频率或配额限制了发送，请查看平台配额后再处理。",

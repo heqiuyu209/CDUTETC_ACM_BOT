@@ -16,7 +16,9 @@ TZ = ZoneInfo(config.TZ_NAME)
 
 def _aliases() -> dict[str, set[str]]:
     notes = {item["group_id"]: item["note"] for item in db.list_runtime_groups()}
-    return {gid: {value for value in (gid, db.get_account_label("group", gid), notes.get(gid, "")) if value}
+    numeric = db.list_group_aliases()
+    return {gid: {value for value in (gid, db.get_account_label("group", gid), notes.get(gid, ""),
+                                     numeric.get(gid, {}).get("numeric_id", "")) if value}
             for gid in sorted(config.ALLOWED_GROUPS)}
 
 
@@ -56,12 +58,21 @@ def _resolve_index(selector: str) -> str | None:
 
 
 def resolve_group(selector: str, *, question: bool = False) -> str:
+    if selector in config.ALLOWED_GROUPS:
+        return selector
+    aliases_by_group = _aliases()
+    if selector.isdigit():
+        exact = [gid for gid, aliases in aliases_by_group.items() if selector in aliases]
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            raise ValueError("群号有歧义，请使用群标识。\n" + _choices())
     by_index = _resolve_index(selector)
     if by_index:
         return by_index
     matches = []
     normalized = _normalize(selector)
-    for gid, aliases in _aliases().items():
+    for gid, aliases in aliases_by_group.items():
         if question:
             found = any((re.search(r"(?<![A-Za-z0-9_-])" + re.escape(alias) + r"(?![A-Za-z0-9_-])", selector)
                          if alias == gid else len(_normalize(alias)) >= 2 and _normalize(alias) in normalized)
@@ -106,6 +117,7 @@ def describe(gid: str, *, this_week: bool = False, now: datetime | None = None, 
             lines.append("自动生成周赛已关闭；已有比赛和提醒仍按计划执行。")
     lines.append(f"负责老师：{_teacher_names(gid)}")
     lines.append("主动提醒总开关：" + ("已启用" if config.GROUP_ACTIVE_MESSAGES_ENABLED else "已暂停"))
+    lines.append("课程提醒：" + ("已开启" if db.group_course_remind_enabled(gid) else "已关闭"))
     block = db.get_group_notification_block(active_protocol(), gid)
     if block:
         lines.append(f"本群因平台权限拒绝暂停提醒 [{block['error_code']}/{block['platform_code']}]")
@@ -147,6 +159,24 @@ def _describe_all(*, this_week: bool = False) -> str:
     return "\n".join(lines) if config.ALLOWED_GROUPS else _choices()
 
 
+def _parse_course_remind(parts: list[str], current_group: str) -> tuple[str, bool]:
+    """解析「/群配置 [群名或序号] 课程提醒 开启|关闭」，返回 (群号, 是否开启)。"""
+    if "课程提醒" not in parts:
+        raise ValueError("用法：/群配置 [群名或序号] 课程提醒 开启|关闭")
+    index = parts.index("课程提醒")
+    target = parts[:index]
+    action = parts[index + 1:]
+    if len(target) > 1 or len(action) != 1 or action[0] not in ("开启", "关闭"):
+        raise ValueError("用法：/群配置 [群名或序号] 课程提醒 开启|关闭")
+    if target:
+        gid = resolve_group(target[0])
+    elif current_group:
+        gid = current_group
+    else:
+        raise ValueError("请指定群：/群配置 <序号> 课程提醒 开启|关闭")
+    return gid, action[0] == "开启"
+
+
 def handle_command(command: str, args: str, sender: str, current_group: str = "") -> list[dict] | None:
     if command not in COMMANDS:
         return None
@@ -170,6 +200,12 @@ def handle_command(command: str, args: str, sender: str, current_group: str = ""
             if current_group:
                 return reply("跨群信息请在私聊中查询。")
             return reply(_describe_all())
+        if command == "群配置" and "课程提醒" in parts:
+            remind_gid, enabled = _parse_course_remind(parts, current_group)
+            if current_group and remind_gid != current_group:
+                return reply("跨群信息请在私聊中查询。")
+            db.set_group_course_remind(remind_gid, enabled, sender)
+            return reply(f"{_name(remind_gid)}课程提醒已{'开启' if enabled else '关闭'}。")
         try:
             gid = resolve_group(parts[0])
         except ValueError:

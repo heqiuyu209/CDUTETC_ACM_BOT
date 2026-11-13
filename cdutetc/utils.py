@@ -173,4 +173,111 @@ def admin_group_id() -> str:
         return config.ADMIN_GROUP
     if config.ALLOWED_GROUPS:
         return sorted(config.ALLOWED_GROUPS)[0]
+
+
+# ---------------------------------------------------------------------
+# 时间表达归一化：口语/半结构化输入 → 统一的 周X + HH:MM[-HH:MM]
+# ---------------------------------------------------------------------
+
+_CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3,
+              "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+_WEEKDAY_PREFIXES = (
+    re.compile(r"^\s*每?\s*(?:星期|礼拜|周)\s*([一二三四五六日天])\s*"),
+    re.compile(r"^\s*每\s*([一二三四五六日天])\s*"),
+)
+_CN_HOUR = re.compile(r"([零〇一二两三四五六七八九十]{1,3})(?=\s*(?:点|時|时|[:：]|分|半))")
+_SPAN_SPLIT = re.compile(r"\s*(?:-|－|—|–|~|～|到|至)\s*")
+_POINT = re.compile(
+    r"^(?:(?P<period>凌晨|早上|上午|中午|下午|傍晚|晚上|夜间)\s*)?"
+    r"(?P<hour>\d{1,2})"
+    r"(?:\s*(?:[:：点时時])\s*(?:(?P<minute>\d{1,2})\s*分?|(?P<half>半))?)?$"
+)
+_NORMALIZED_TIME = re.compile(r"^\d{2}:\d{2}$")
+_PM_PERIODS = {"下午", "傍晚", "晚上", "夜间"}
+_NOON_PERIODS = {"中午"}
+
+
+def _cn_to_int(text: str) -> int:
+    """中文数字（1~99）转整数：十 / 十二 / 二十 / 两。"""
+    if "十" in text:
+        tens, _, ones = text.partition("十")
+        base = (_CN_DIGITS.get(tens, 1) if tens else 1) * 10
+        return base + (_CN_DIGITS.get(ones, 0) if ones else 0)
+    value = 0
+    for char in text:
+        value = value * 10 + _CN_DIGITS.get(char, 0)
+    return value
+
+
+def _split_weekday(text: str) -> tuple[str, str]:
+    """剥离开头的星期表达（周四/星期四/礼拜四/每周四/每四），回归为 周X。"""
+    for pattern in _WEEKDAY_PREFIXES:
+        match = pattern.match(text)
+        if match:
+            day = "日" if match.group(1) == "天" else match.group(1)
+            return f"周{day}", text[match.end():]
+    return "", text
+
+
+def _parse_point(text: str, inherited_period: str = "") -> tuple[int, int, str] | None:
+    """解析单个时间点，返回 (时, 分, 生效的时段前缀)；无法解析返回 None。"""
+    match = _POINT.match(text.strip())
+    if not match:
+        return None
+    period = match.group("period") or inherited_period
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute") or (30 if match.group("half") else 0))
+    if period in _PM_PERIODS and hour < 12:
+        hour += 12
+    elif period in _NOON_PERIODS and hour <= 10:
+        hour += 12
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour, minute, period
+
+
+def _normalize_span(text: str) -> str | None:
+    """归一化「起点[-终点]」，失败返回 None（调用方保留原文）。"""
+    chunks = [chunk for chunk in _SPAN_SPLIT.split(text.strip()) if chunk.strip()]
+    if not chunks or len(chunks) > 2:
+        return None
+    points: list[str] = []
+    inherited = ""
+    for chunk in chunks:
+        parsed = _parse_point(chunk, inherited)
+        if parsed is None:
+            return None
+        hour, minute, inherited = parsed
+        points.append(f"{hour:02d}:{minute:02d}")
+    return "-".join(points)
+
+
+def normalize_time_expression(raw: str) -> str:
+    """把「周四 19-21点」这类表达归一为「周四 19:00-21:00」。
+
+    支持：中文数字（两点半/十九点）、时段前缀（下午/晚上/中午/凌晨，可跨段继承）、
+    半/刻钟写法（点半）、区间分隔符（- ~ ～ 到 至）。无法识别时原样返回，绝不猜测。
+    """
+    original = (raw or "").strip()
+    if not original:
+        return original
+    weekday, rest = _split_weekday(original)
+    rest = _CN_HOUR.sub(lambda match: str(_cn_to_int(match.group(1))), rest)
+    span = _normalize_span(rest)
+    if span is None:
+        return original
+    return f"{weekday} {span}" if weekday else span
+
+
+def split_normalized_time(text: str) -> tuple[str, str, str]:
+    """归一化后拆成 (周几, 开始, 结束)；无法识别时三项均为空串。
+
+    用于课程写入：库里统一存 周X + HH:MM/HH:MM，展示侧再加中文格式。
+    """
+    normalized = normalize_time_expression(text)
+    weekday, rest = _split_weekday(normalized)
+    parts = [part.strip() for part in rest.split("-") if part.strip()]
+    if not parts or len(parts) > 2 or not all(_NORMALIZED_TIME.match(part) for part in parts):
+        return "", "", ""
+    return weekday, parts[0], parts[1] if len(parts) == 2 else ""
     return ""
