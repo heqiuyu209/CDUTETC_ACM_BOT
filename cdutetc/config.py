@@ -437,6 +437,23 @@ MEME_ENABLED = os.getenv("ACM_MEME_ENABLED", "1") != "0"
 # 官方协议发图要由平台按 URL 拉取图片，因此必须是公网可访问地址；
 # 留空则整条发图链路自动跳过，不影响其它任何功能。
 MEME_BASE_URL = os.getenv("ACM_MEME_BASE_URL", "").strip()
+
+
+def _positive_int(name: str, default: int) -> int:
+    """读正整数配置：非法或非正数一律回退默认值，避免收图链路因脏配置停摆。"""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# 自动收图：单个分类的素材上限。超出后按 created_at 从旧到新滚动淘汰（FIFO），
+# 只腾容量、不进黑名单——被淘汰的图若再次被发出来，仍然可以重新收录。
+MEME_CATEGORY_CAP = _positive_int("ACM_MEME_CATEGORY_CAP", 100)
 # 拟人化群聊：@机器人 闲聊/接梗走低 Token 拟人对话，群里高潮时低频主动插话，
 # 并启用每日三次生活状态机（12:30/18:30/23:00）。默认开启；关闭后 @ 闲聊回到
 # 纯本地寒暄回复，且不再调度状态机与插话。

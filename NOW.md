@@ -1,6 +1,16 @@
 # 当前迭代
 
-当前目标（2026-11-08）：修复周赛跨群可见，提供可提前查看的本群提醒计划，支持超管私聊按群名查询比赛配置和负责老师。用户确认“老师”指本群负责老师，需要按群登记；保留既有全局老师授权语义。
+当前目标（2026-11-15）：升级表情包自动收集链路——接入本地轻量 OCR 做图内文字归类与截图拦截、增加 dHash 相似图去重（含黑名单联动）、单人收图限流、按分类 FIFO 滚动淘汰，并补齐单测后提交推送。
+
+范围与验收：OCR 必须懒加载单例、未装包时静默返回空串且原测试零依赖通过，且必须走 `asyncio.to_thread` 不阻塞事件循环；截图拦截放在「尺寸准入之后、落盘之前」，图内有效字符 >35 或命中代码/题面特征（`#include`/`int main`/`std::`/`public static`/`Traceback`/`Time Limit`/`Memory Limit`，或 `; { }` 合计 ≥3）一律拒收；dHash 仅用 Pillow 实现（9x8 灰度、16 位十六进制），命中库内任一记录汉明距离 ≤4 即跳过，遍历范围含 `deleted=1` 黑名单；同一 (群, 用户) 60 秒内最多收录 2 张，超出静默跳过；新增 `ACM_MEME_CATEGORY_CAP`（默认 100），每次成功落盘后检查该分类现存数，超出则删最早图文件并标记清理、不进黑名单。
+
+执行结果：`cdutetc/memes.py` 新增 `extract_image_text`（`_ocr_engine` 懒加载单例 + 置信度过滤）、`ocr_text_length`、`looks_like_code_shot`、`inspect_ocr_text`、`compute_dhash`、`dhash_distance`、`find_similar_meme`、`enforce_category_cap`、`_collect_quota_left`/`_record_collect`/`reset_collect_limits`，`collect_one_image` 重写为「限流 → 下载 → MD5 去重 → 尺寸准入 → OCR 截图拦截 → dHash 相似去重 → 归类（OCR 文本排首位）→ 瘦身落盘 → 记账 → 分类 FIFO 淘汰」，`collect_from_message` 自动从 `message.user_id` 取成员标识并向下传递。`cdutetc/database.py` 给 `meme_hashes` 增补 `dhash`/`cleaned` 两列（`init_db` 内幂等 `ALTER TABLE` 迁移老库），新增 `mark_meme_hash_cleaned`、`list_meme_dhashes`、`oldest_meme_hashes`，`save_meme_hash` 支持 `dhash` 参数；被上限腾掉的记录（`cleaned=1`）不算黑名单，整行重建复活以排到队尾，否则刚复活就被当「最旧」再淘汰一次。`cdutetc/config.py` 新增 `_positive_int` 与 `MEME_CATEGORY_CAP`（脏配置/非正数回退 100）。依赖声明补齐：`requirements.txt` 增加 Pillow（收图尺寸/压缩/dHash 硬依赖），新增 `requirements-ocr.txt` 承载可选 `rapidocr-onnxruntime`。
+
+验证证据：新增 `tests/test_meme_collect_upgrade.py` 29 项（mock OCR 覆盖纯图文字归类、长文本/代码题面截图拦截、dHash 汉明距离阈值与黑名单联动、单人 60 秒限流、超分类上限淘汰最旧图、老库迁移与淘汰复活），`python -m pytest tests\test_meme_collect_upgrade.py -q` **29 项通过**（1.37 秒）；收图相关四文件 112 项通过；全量 `python -m pytest -q` **1630 项通过、1 项跳过**（77.33 秒）。`ruff check --select F` 与 `git diff --check` 通过。本轮未启动真实机器人、未发送 QQ 消息、未调用付费模型，OCR 未在本机实测（未装 `rapidocr-onnxruntime`，按规格静默降级，拦截逻辑全部走 mock 用例验证）。
+
+剩余与下一步：云端如需截图拦截，装 `requirements-ocr.txt` 后重启机器人，再在群里发一张大段聊天截图验收「图内文字过多，疑似截图」；`ACM_MEME_CATEGORY_CAP` 可按需在 `.env` 调整（越大素材越多、仓库越重）。`assets/persona.txt` 有一处既有未提交改动（新增「内容由AI生成，仅供参考」），与本轮无关，未纳入提交。
+
+## 上一轮：周赛跨群可见与提醒预览（2026-11-08）
 
 范围与验收：自动周赛只有显式目标群能查到或收到提醒，新增群不能自动继承；旧错误队列发送前失效。提醒详情显示对象名称和实际节点，区分未排队计划、队列状态和平台暂停。超管可在私聊按唯一群名/OpenID选择群，查询自然语言同时包含比赛与老师时返回两者；群名歧义需选择，普通私聊不能跨群读取或修改。工作区原有未提交 `/通知列表` 及其测试须保留并排除本轮提交。
 

@@ -1,0 +1,6 @@
+# 可选依赖：自动收图的本地轻量 OCR（rapidocr-onnxruntime）。
+# 装了就启用「图内文字归类 + 截图拦截」，没装则 extract_image_text 静默返回空串，
+# 收图链路自动退化为只按群聊上下文归类的旧行为，其它功能与测试均不受影响。
+# 安装：pip install -r requirements-ocr.txt
+# 说明：onnxruntime 会额外带上百 MB 运行时，只在确实需要截图拦截的部署里装。
+rapidocr-onnxruntime>=1.3.0,<2.0.0

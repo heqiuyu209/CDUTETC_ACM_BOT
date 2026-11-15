@@ -14,11 +14,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import logging
 import random
 import re
+import threading
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
@@ -100,6 +102,30 @@ COLLECT_DEFAULT_CATEGORY = CATEGORY_SLACKING
 # 收图上下文窗口：当前消息 + 紧邻的前 1~2 条文本。
 COLLECT_CONTEXT_LINES = 2
 
+# ---------------- OCR 文字体检（拦截截图） ----------------
+# 图内「有效字符」超过这个数，基本是聊天截屏 / 网页截图而不是表情包。
+OCR_MAX_CHARS = 35
+# 代码、题面截图的特征串：命中任一即视为「不是表情包」。
+OCR_CODE_HINTS = ("#include", "int main", "std::", "public static",
+                  "Traceback", "Time Limit", "Memory Limit")
+# 符号密度兜底：代码/题面即使不命中特征串，也躲不过这堆符号的堆叠。
+_OCR_CODE_SYMBOLS = (";", "{", "}")
+OCR_CODE_SYMBOL_MIN = 3
+# OCR 置信度下限：低于它的碎片多是背景噪声，不该影响归类与拦截。
+_OCR_MIN_SCORE = 0.5
+
+# ---------------- 相似图去重（dHash） ----------------
+# 感知哈希按 9x8 灰度比较相邻像素，得到 64 位（16 位十六进制）。
+DHASH_SIZE = 8
+# 汉明距离阈值：<=4 视为同一张图的不同压缩/缩放版本。
+DHASH_MAX_DISTANCE = 4
+
+# ---------------- 单人收图限流 ----------------
+# 同一 (群, 用户) 在窗口内最多成功收录几张，超出静默跳过，避免单人刷屏灌图。
+COLLECT_USER_WINDOW_SECONDS = 60.0
+COLLECT_USER_MAX_IMAGES = 2
+_recent_collects: dict[tuple[str, str], deque] = {}
+
 # ---------------- 场景化主动发图 ----------------
 # 场景触发（连续问号 / 饭点 / 深夜）比关键词触发更主动，冷却拉长到 8 分钟。
 SCENE_COOLDOWN_SECONDS = 480.0
@@ -180,6 +206,232 @@ def file_suffix(*candidates) -> str:
 def image_md5(data: bytes) -> str:
     """图片内容 MD5：同图不管文件名怎么变都能去重。"""
     return hashlib.md5(data, usedforsecurity=False).hexdigest()
+
+
+# ---------------- 本地轻量 OCR（懒加载单例） ----------------
+# rapidocr_onnxruntime 只是可选依赖：没装时整条 OCR 判定静默降级为「无文本」，
+# 收图链路照常工作，单元测试也因此零外部依赖。
+_ocr_engine = None
+_ocr_unavailable = False
+_ocr_lock = threading.Lock()
+
+
+def _get_ocr_engine():
+    """懒加载 RapidOCR 单例；依赖缺失或初始化失败时返回 None（只尝试一次）。"""
+    global _ocr_engine, _ocr_unavailable
+    if _ocr_engine is not None or _ocr_unavailable:
+        return _ocr_engine
+    with _ocr_lock:
+        if _ocr_engine is not None or _ocr_unavailable:
+            return _ocr_engine
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+        except Exception as exc:  # noqa: BLE001 - 没装/装坏都按不可用处理
+            _ocr_unavailable = True
+            logger.info("OCR 不可用，收图不做文字判定：%s", exc)
+            return None
+        try:
+            _ocr_engine = RapidOCR()
+        except Exception as exc:  # noqa: BLE001 - 模型文件缺失等
+            _ocr_unavailable = True
+            logger.info("OCR 初始化失败，收图不做文字判定：%s", exc)
+            return None
+    return _ocr_engine
+
+
+def extract_image_text(data: bytes) -> str:
+    """识别图片里的文字，返回按行拼接的纯文本；不可用或失败时返回空串。
+
+    这是阻塞调用（CPU 推理），在异步链路里必须走 :func:`asyncio.to_thread`。
+    """
+    if not data:
+        return ""
+    engine = _get_ocr_engine()
+    if engine is None:
+        return ""
+    try:
+        result, _ = engine(data)
+    except Exception as exc:  # noqa: BLE001 - 坏图/模型异常都当无文字
+        logger.info("OCR 识别失败，按无文字处理：%s", exc)
+        return ""
+    if not result:
+        return ""
+    lines: list[str] = []
+    for item in result:
+        # RapidOCR 每项形如 [box, text, score]，个别版本会少字段。
+        try:
+            text = str(item[1] or "").strip()
+        except (IndexError, TypeError):
+            continue
+        try:
+            score = float(item[2])
+        except (IndexError, TypeError, ValueError):
+            score = 1.0
+        if text and score >= _OCR_MIN_SCORE:
+            lines.append(text)
+    return "\n".join(lines)
+
+
+def ocr_text_length(text: str) -> int:
+    """图内有效字符数：不计空白，避免整篇排版空白被误当成「字多」。"""
+    return len(re.sub(r"\s+", "", str(text or "")))
+
+
+def looks_like_code_shot(text: str) -> bool:
+    """像代码/题面截图吗：命中特征串，或 ; { } 这类符号堆了 3 个以上。"""
+    raw = str(text or "")
+    lowered = raw.lower()
+    for hint in OCR_CODE_HINTS:
+        if hint.lower() in lowered:
+            return True
+    symbols = sum(raw.count(symbol) for symbol in _OCR_CODE_SYMBOLS)
+    return symbols >= OCR_CODE_SYMBOL_MIN
+
+
+def inspect_ocr_text(text: str) -> tuple[bool, str]:
+    """图内文字体检，返回（是否收录, 原因）。空文本一律放行。
+
+    先看字数（长截图的典型特征），再看代码/题面特征，命中任一即拒收。
+    """
+    if ocr_text_length(text) == 0:
+        return True, ""
+    if ocr_text_length(text) > OCR_MAX_CHARS:
+        return False, "图内文字过多，疑似截图"
+    if looks_like_code_shot(text):
+        return False, "疑似代码或题面截图"
+    return True, ""
+
+
+def compute_dhash(data: bytes) -> str:
+    """算 64 位感知哈希（dHash），返回 16 位十六进制小写串；算不出返回空串。
+
+    做法：灰度化 + 缩到 9x8，逐行比较相邻像素大小，得到 8x8=64 个比特。
+    这样「同一张图被重新压缩 / 缩放」也能落到很近的距离上。
+    """
+    if not data:
+        return ""
+    try:
+        from PIL import Image
+    except ImportError:  # 部署环境没装 Pillow：不做相似图去重，只按 MD5 查重
+        return ""
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            # GIF 只取首帧：动图表情包的主体通常就在第一帧。
+            gray = image.convert("L").resize((DHASH_SIZE + 1, DHASH_SIZE), Image.LANCZOS)
+            pixels = list(gray.getdata())
+    except Exception:  # noqa: BLE001 - 损坏图/伪装图无哈希
+        return ""
+    if len(pixels) < (DHASH_SIZE + 1) * DHASH_SIZE:
+        return ""
+    bits = 0
+    for row in range(DHASH_SIZE):
+        base = row * (DHASH_SIZE + 1)
+        for col in range(DHASH_SIZE):
+            bits = (bits << 1) | (1 if pixels[base + col] > pixels[base + col + 1] else 0)
+    return f"{bits:016x}"
+
+
+def dhash_distance(left: str, right: str) -> int:
+    """两个 dHash 的汉明距离；任一为空或格式不合时返回「最远」以判不等。"""
+    left_text = str(left or "").strip().lower()
+    right_text = str(right or "").strip().lower()
+    if not left_text or not right_text or len(left_text) != len(right_text):
+        return DHASH_SIZE * DHASH_SIZE
+    try:
+        return bin(int(left_text, 16) ^ int(right_text, 16)).count("1")
+    except ValueError:
+        return DHASH_SIZE * DHASH_SIZE
+
+
+def find_similar_meme(dhash: str, *, include_deleted: bool = True) -> str:
+    """在收图台账里找与 ``dhash`` 足够像的记录，返回命中记录的 MD5（无命中空串）。
+
+    默认连 deleted=1 的黑名单一起比：删掉的图被重新压缩再发一次，也不该收回来。
+    """
+    target = str(dhash or "").strip()
+    if not target:
+        return ""
+    try:
+        records = database.list_meme_dhashes(include_deleted=include_deleted)
+    except Exception as exc:  # noqa: BLE001 - 台账读不到时不猜，交给调用方决定
+        logger.info("相似图去重查询失败：%s", exc)
+        raise
+    for record in records:
+        if dhash_distance(target, record.get("dhash") or "") <= DHASH_MAX_DISTANCE:
+            return str(record.get("md5") or "")
+    return ""
+
+
+def _category_cap() -> int:
+    """当前生效的单分类上限：读 config 动态值，便于测试与热调整。"""
+    raw = getattr(config, "MEME_CATEGORY_CAP", 100)
+    try:
+        cap = int(raw)
+    except (TypeError, ValueError):
+        return 100
+    return cap if cap > 0 else 0
+
+
+def enforce_category_cap(category: str, *, root: Path | None = None,
+                         cap: int | None = None) -> list[str]:
+    """把分类内素材压到上限内：从最旧的开始删文件并标记 cleaned，返回被淘汰的路径。
+
+    淘汰只腾容量、不进黑名单（cleaned=1 而非 deleted=1），同图再次出现仍可收录。
+    任何异常都不上抛——收图主流程不能因为整理失败而丢图。
+    """
+    limit = _category_cap() if cap is None else int(cap)
+    if limit <= 0 or not category:
+        return []
+    removed: list[str] = []
+    try:
+        while database.count_meme_hashes(category=category) > limit:
+            oldest = database.oldest_meme_hashes(category, limit=1)
+            if not oldest:
+                break
+            record = oldest[0]
+            relative = str(record.get("file_path") or "")
+            if relative:
+                delete_meme_file(relative, root=root)
+            database.mark_meme_hash_cleaned(record.get("md5") or "")
+            removed.append(relative)
+            logger.info("分类 %s 超限 %d，淘汰最旧素材：%s", category, limit, relative)
+    except Exception as exc:  # noqa: BLE001 - 淘汰失败不影响本次收图
+        logger.warning("分类 %s 超限淘汰失败：%s", category, exc)
+    return removed
+
+
+def _collect_quota_left(group_id: str, user_id: str, *, now: float | None = None) -> int:
+    """该 (群, 用户) 在当前窗口内还能收几张；无用户身份时不做限流（返回极大值）。"""
+    user = str(user_id or "").strip()
+    if not user:
+        return COLLECT_USER_MAX_IMAGES
+    moment = time.monotonic() if now is None else now
+    bucket = _recent_collects.get((str(group_id or ""), user))
+    if not bucket:
+        return COLLECT_USER_MAX_IMAGES
+    cutoff = moment - COLLECT_USER_WINDOW_SECONDS
+    while bucket and bucket[0] <= cutoff:
+        bucket.popleft()
+    return max(0, COLLECT_USER_MAX_IMAGES - len(bucket))
+
+
+def _record_collect(group_id: str, user_id: str, *, now: float | None = None) -> None:
+    """记一次「成功收录」，只统计真正落盘的图，被拦下的不占额度。"""
+    user = str(user_id or "").strip()
+    if not user:
+        return
+    moment = time.monotonic() if now is None else now
+    key = (str(group_id or ""), user)
+    bucket = _recent_collects.setdefault(key, deque())
+    cutoff = moment - COLLECT_USER_WINDOW_SECONDS
+    while bucket and bucket[0] <= cutoff:
+        bucket.popleft()
+    bucket.append(moment)
+
+
+def reset_collect_limits() -> None:
+    """清空单人限流台账（重启/测试用）。"""
+    _recent_collects.clear()
 
 
 def inspect_static_image(data: bytes) -> tuple[bool, str]:
@@ -724,14 +976,21 @@ def reset_engine() -> None:
 async def collect_one_image(ref: dict, *, group_id: str, text: str = "",
                             context: Iterable[str] = (), root: Path | None = None,
                             downloader: Callable[[str], Awaitable[bytes]] | None = None,
+                            user_id: str = "",
                             ) -> dict | None:
     """处理单张图：任何一步不合格就返回 None，绝不让异常冒到主流程。
 
+    链路：配额 → 下载 → MD5 去重 → 尺寸/体积准入 → OCR 截图拦截 → 相似图去重
+          → 归类 → 瘦身落盘 → 记账 → 分类 FIFO 淘汰。
     返回 ``{"md5", "category", "tag", "relative_path"}`` 供日志/回执使用。
     """
     url = str((ref or {}).get("url") or "")
     name = str((ref or {}).get("file") or "")
     fetch = downloader or fetch_image_bytes
+    # 单人限流放最前面：额度用完连下载都省了，刷屏的人拿不到任何额外开销。
+    if _collect_quota_left(group_id, user_id) <= 0:
+        logger.info("收图跳过（单人限流）：%s/%s", group_id, user_id)
+        return None
     data = b""
     if url:
         try:
@@ -754,7 +1013,29 @@ async def collect_one_image(ref: dict, *, group_id: str, text: str = "",
     if not accepted:
         logger.info("收图跳过（%s）：%s", reason, (name or url)[:80])
         return None
-    lines = [text, *[str(item) for item in context][:COLLECT_CONTEXT_LINES]]
+    # OCR 是 CPU 阻塞活儿，必须丢线程池：事件循环还要收消息、发回复。
+    ocr_text = ""
+    try:
+        ocr_text = await asyncio.to_thread(extract_image_text, data)
+    except Exception as exc:  # noqa: BLE001 - OCR 崩了按「无文字」继续
+        logger.info("收图 OCR 异常，按无文字处理：%s", exc)
+        ocr_text = ""
+    accepted, reason = inspect_ocr_text(ocr_text)
+    if not accepted:
+        logger.info("收图跳过（%s）：%s", reason, (name or url)[:80])
+        return None
+    # 相似图去重：同一张图被二次压缩/缩放后 MD5 会变，靠 dHash 兜住。
+    dhash = compute_dhash(data)
+    if dhash:
+        try:
+            if find_similar_meme(dhash):
+                logger.info("收图跳过（相似图已收录）：%s", (name or url)[:80])
+                return None
+        except Exception as exc:  # noqa: BLE001 - 相似查询失败按「宁可不收」处理
+            logger.info("收图相似去重失败：%s", exc)
+            return None
+    # 图内文字比群聊上下文更能说明图的用途，排在最前面参与归类。
+    lines = [ocr_text, text, *[str(item) for item in context][:COLLECT_CONTEXT_LINES]]
     category, tag = classify_collect(*lines)
     # 落盘前瘦身：静态图压成 500px 宽 JPEG，GIF 原样；MD5 仍用原始字节算。
     payload, store_suffix = store_meme_bytes(data, suffix=suffix)
@@ -763,11 +1044,14 @@ async def collect_one_image(ref: dict, *, group_id: str, text: str = "",
     if not relative:
         return None
     try:
-        database.save_meme_hash(md5, category, tag or category, relative)
+        database.save_meme_hash(md5, category, tag or category, relative, dhash)
     except Exception as exc:  # noqa: BLE001 - 记账失败就当没收，避免重复落盘
         logger.warning("收图记账失败：%s", exc)
         delete_meme_file(relative, root=root)
         return None
+    _record_collect(group_id, user_id)
+    # 分类超限滚动淘汰：只在本张真正落盘成功后执行，避免白折腾。
+    enforce_category_cap(category, root=root)
     logger.info("收到表情包：%s（%s）", relative, group_id)
     return {"md5": md5, "category": category, "tag": tag, "relative_path": relative}
 
@@ -797,11 +1081,18 @@ async def collect_from_message(message, *, group_id: str, text: str = "",
     # 文本与上下文统一去 CQ 码：图片消息的正文就是 CQ 串，不能拿它当聊天内容。
     clean_text = strip_cq_codes(text)
     clean_context = [item for item in map(strip_cq_codes, context) if item]
+    # 单人限流的键：官方协议下是 member_openid，onebot 下是 QQ 号，取到哪个用哪个。
+    user = ""
+    for field in ("user_id", "member_openid", "user_openid", "author_id"):
+        candidate = str(_read_field(message, field, "") or "").strip()
+        if candidate:
+            user = candidate
+            break
     collected: list[dict] = []
     for ref in refs:
         outcome = await collect_one_image(
             ref, group_id=group, text=clean_text, context=clean_context,
-            root=root, downloader=downloader,
+            root=root, downloader=downloader, user_id=user,
         )
         if outcome:
             collected.append(outcome)
