@@ -9,8 +9,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import crawler
-from cdutetc import database
+from cdutetc import crawler, database
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -68,7 +67,7 @@ def test_detect_change_hash_same_no_change(db):
 
 def test_detect_change_hash_differs(db):
     import hashlib
-    old = hashlib.sha256("旧内容".encode("utf-8")).hexdigest()
+    old = hashlib.sha256("旧内容".encode()).hexdigest()
     assert crawler.detect_change({"body_hash": old}, "新内容", "", "") is True
 
 
@@ -100,7 +99,7 @@ def test_run_fetch_missing_competition_is_skipped(db, monkeypatch):
 
 def test_run_fetch_updates_existing_draft(db):
     """兼容旧草稿：来源对应比赛仍为 draft 时，抓取结果直接更新草稿（不生成新比赛）。"""
-    cid, sid = _new_competition_source(db)
+    cid, _sid = _new_competition_source(db)
     results = asyncio.run(crawler.run_fetch(
         now=_now(), fetch=_fetch_text, extract=_extract_ok))
     r = results[0]
@@ -114,7 +113,7 @@ def test_run_fetch_updates_existing_draft(db):
 
 
 def test_run_fetch_nochange_does_not_call_model(db):
-    cid, sid = _new_competition_source(db)
+    _cid, _sid = _new_competition_source(db)
     asyncio.run(crawler.run_fetch(now=_now(), fetch=_fetch_text, extract=_extract_ok))
     extract_calls = []
 
@@ -129,7 +128,7 @@ def test_run_fetch_nochange_does_not_call_model(db):
 
 
 def test_run_fetch_skip_within_interval(db):
-    cid, sid = _new_competition_source(db)
+    _cid, _sid = _new_competition_source(db)
     fetch_calls = []
 
     async def fetch_spy(url):
@@ -144,7 +143,7 @@ def test_run_fetch_skip_within_interval(db):
 
 
 def test_run_fetch_fetch_error_no_notify(db):
-    cid, sid = _new_competition_source(db)
+    cid, _sid = _new_competition_source(db)
 
     async def fetch_fail(url):
         raise ConnectionError("网络不可达")
@@ -158,7 +157,7 @@ def test_run_fetch_fetch_error_no_notify(db):
 
 
 def test_run_fetch_extract_failure_no_write(db):
-    cid, sid = _new_competition_source(db)
+    cid, _sid = _new_competition_source(db)
 
     async def extract_fail(text):
         return None, "提取结果未通过 schema 校验"
@@ -174,7 +173,7 @@ def test_run_fetch_extract_failure_no_write(db):
 
 
 def test_run_fetch_schema_invalid_mapped_no_write(db):
-    cid, sid = _new_competition_source(db)
+    cid, _sid = _new_competition_source(db)
 
     async def extract_bad_schema(text):
         # 返回缺 name 等必填字段 → 映射后 create_competition 抛 ValueError
@@ -189,7 +188,7 @@ def test_run_fetch_schema_invalid_mapped_no_write(db):
 
 def test_run_fetch_confirmed_changes_go_to_pending_review(db):
     """v2：已确认比赛出现实质变化时，正式版本保持不变，新内容存待审，超管确认后替换。"""
-    cid, sid = _new_competition_source(
+    cid, _sid = _new_competition_source(
         db, confirmed=True, extra={"official_reg_deadline": "2026-11-10 23:59"})
 
     async def fetch_new(url):
@@ -222,7 +221,7 @@ def test_run_fetch_confirmed_changes_go_to_pending_review(db):
 
 
 def test_run_fetch_orphan_source_has_no_group_notification(db, monkeypatch):
-    cid, sid = _new_competition_source(db)
+    _cid, _sid = _new_competition_source(db)
     monkeypatch.setattr(database, "get_competition", lambda _cid: None)
     sent = []
 
@@ -237,7 +236,7 @@ def test_run_fetch_orphan_source_has_no_group_notification(db, monkeypatch):
 
 
 def test_run_fetch_second_round_all_skip_within_interval(db):
-    cid, sid = _new_competition_source(db)
+    _cid, _sid = _new_competition_source(db)
     asyncio.run(crawler.run_fetch(now=_now(), fetch=_fetch_text, extract=_extract_ok))
     results = asyncio.run(crawler.run_fetch(now=_now(hour=8, minute=10), fetch=_fetch_text, extract=_extract_ok))
     assert all(r["kind"] == "skip" for r in results)

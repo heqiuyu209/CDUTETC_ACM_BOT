@@ -1,16 +1,13 @@
 """未补零旧日期的截止判断、真实提醒去重及成功事实迁移回归。"""
 
-from datetime import datetime
 import sqlite3
+from datetime import datetime
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import commands
-from cdutetc import config
-from cdutetc import database
-from cdutetc import reminder
+from cdutetc import commands, config, database, reminder
 
 RAW = "2026-11-01 9:00"
 TARGET = "2026-11-01 09:00"
@@ -145,16 +142,7 @@ async def test_legacy_success_marks_merge_and_padding_does_not_resend(db, monkey
     assert not database.mark_reminded("g1", cid, "contest_time", "2026-11-1 9:0")
     with database._connect() as conn:
         assert conn.execute("SELECT target_time, sent_at FROM reminders").fetchall() == [(TARGET, "2026-11-01 07:30:00")]
-
-    class Clock(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return NOW
-
-    monkeypatch.setattr(reminder, "datetime", Clock)
-    sender = AsyncMock(return_value=True)
-    assert await reminder.check_reminders(sender) == 0
-    sender.assert_not_awaited()
+    # legacy 调度器 check_reminders 已下线（P1），旧表只保留迁移期规范化语义
 
 
 def test_normalization_preserves_nonzero_legacy_seconds(db):

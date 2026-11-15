@@ -128,7 +128,8 @@ def _drop_empty_env(environ=None) -> list[str]:
     return removed
 
 
-ENV_DROPPED_EMPTY = _drop_empty_env()
+# 启动时清掉值为空的 ACM_* 环境变量（必须保留该副作用，返回值无人使用）。
+_drop_empty_env()
 
 # ================= QQ 机器人接入（OneBot/NapCat，必填） =================
 # NapCatQQ 正向 WebSocket 地址，例如 ws://127.0.0.1:3001
@@ -298,6 +299,17 @@ QA_KB_MATCH_MIN_SCORE = float(os.getenv("ACM_QA_KB_MATCH_MIN_SCORE", "0.34"))
 # 仅本地无法确定 FAQ 时让模型选择候选编号；默认关闭，保持零模型成本。
 QA_FAQ_LLM_ENABLED = os.getenv("ACM_QA_FAQ_LLM_ENABLED", "0") == "1"
 
+# --- 8) 动态群上下文注入（问答链路重构） ---
+# 开启后每次 @机器人 提问都会把「未来 7 天课程 + 开放征集 + 本群 FAQ」拼成
+# 事实块注入 system prompt，模型只按事实作答，操作引导仅限白名单命令。
+# 置 0 可关闭，关闭后退回「只按存档比赛数据作答」的旧行为。
+QA_CONTEXT_ENABLED = os.getenv("ACM_QA_CONTEXT_ENABLED", "1") != "0"
+# 普通成员 FAQ / 已录入资料都没命中时，是否先用上下文模型作答，
+# 模型仍判定「未收录」才转人工工单。默认关闭以保持普通成员零 token 成本。
+QA_MEMBER_CONTEXT_ANSWER = os.getenv("ACM_QA_MEMBER_CONTEXT_ANSWER", "0") == "1"
+# 上下文长度上限（字符），超出按行截断，避免撑爆输入预算。
+QA_CONTEXT_MAX_CHARS = int(os.getenv("ACM_QA_CONTEXT_MAX_CHARS", "3000"))
+
 # ================= 链接抓取（SSRF 与资源限制） =================
 # 域名白名单（逗号分隔，小写）。配置后仅白名单域名可抓取（重定向目标同样校验）
 FETCH_ALLOWED_DOMAINS = {
@@ -319,10 +331,13 @@ LLM_CONCURRENCY = int(os.getenv("ACM_LLM_CONCURRENCY", "2"))              # 模�
 TZ_NAME = "Asia/Shanghai"
 REMIND_CHECK_INTERVAL_MINUTES = int(os.getenv("ACM_REMIND_CHECK_INTERVAL_MINUTES", "30"))
 # 开赛计划独立于旧版提前小时数，批准时即持久化；扫描间隔不会被旧30分钟配置拖慢。
+# 开赛前 15 分钟是硬性节点：环境变量只能追加其它节点，不能把它剔除，
+# 否则运维一旦只写 "30" 就会静默丢失「开赛前 15 分钟提醒」。
+CONTEST_REMIND_REQUIRED_MINUTES = 15
 CONTEST_REMIND_OFFSETS_MINUTES = tuple(sorted({
     int(x.strip()) for x in os.getenv("ACM_CONTEST_REMIND_OFFSETS_MINUTES", "30,15").split(",")
     if x.strip()
-}, reverse=True))
+} | {CONTEST_REMIND_REQUIRED_MINUTES}, reverse=True))
 CONTEST_REMIND_CHECK_SECONDS = int(os.getenv("ACM_CONTEST_REMIND_CHECK_SECONDS", "30"))
 CONTEST_REMIND_GRACE_SECONDS = int(os.getenv("ACM_CONTEST_REMIND_GRACE_SECONDS", "120"))
 if (not CONTEST_REMIND_OFFSETS_MINUTES or any(x <= 0 for x in CONTEST_REMIND_OFFSETS_MINUTES)
@@ -332,7 +347,6 @@ if (not CONTEST_REMIND_OFFSETS_MINUTES or any(x <= 0 for x in CONTEST_REMIND_OFF
 REMIND_BEFORE_HOURS = int(os.getenv("ACM_REMIND_BEFORE_HOURS", "24"))
 if REMIND_CHECK_INTERVAL_MINUTES < 1 or REMIND_BEFORE_HOURS <= 0:
     raise RuntimeError("提醒扫描间隔和提前小时数必须大于零")
-REMIND_TYPES = ("reg_deadline", "contest_time")
 # 多节点提前提醒（小时，逗号分隔，支持小数）。例：24,1,0.167 表示
 # 提前 24 小时、1 小时、10 分钟各提醒一次。每场活动不建独立定时器，
 # 仍由周期扫描按「已进入哪个节点窗口」判定，资源占用与比赛数量无关。
@@ -356,6 +370,48 @@ def _remind_offset_hours() -> tuple[float, ...]:
 
 REMIND_OFFSET_HOURS = _remind_offset_hours()
 
+
+def _training_extra_offsets() -> tuple[int, ...]:
+    """课程提醒的额外分钟级节点（在 REMIND_OFFSET_HOURS 之外追加）。
+
+    例：``30,15`` 表示课程开始前 30 分钟、15 分钟各提醒一次；
+    非法值（空、负数、非数字）整体回退默认 ``(30, 15)``。
+    """
+    raw = os.getenv("ACM_TRAINING_REMIND_EXTRA_OFFSETS_MINUTES", "30,15")
+    try:
+        values = {int(value.strip()) for value in raw.split(",") if value.strip()}
+    except (TypeError, ValueError):
+        return (30, 15)
+    if not values or any(value <= 0 for value in values):
+        return (30, 15)
+    return tuple(sorted(values, reverse=True))
+
+
+TRAINING_REMIND_EXTRA_OFFSETS_MINUTES = _training_extra_offsets()
+
+# ================= 赛程自动抓取（CF / 牛客） =================
+# 默认关闭：开启后定时任务会在既有来源抓取之后，再抓 CF 官方 API 与牛客赛程页。
+AUTO_CONTEST_CRAWL_ENABLED = os.getenv("ACM_AUTO_CONTEST_CRAWL_ENABLED", "0") != "0"
+
+
+def _auto_contest_window_days() -> int:
+    """抓取窗口天数；非法或小于 1 一律回退 14 天。"""
+    try:
+        value = int(os.getenv("ACM_AUTO_CONTEST_WINDOW_DAYS", "14"))
+    except (TypeError, ValueError):
+        return 14
+    return value if value >= 1 else 14
+
+
+AUTO_CONTEST_WINDOW_DAYS = _auto_contest_window_days()
+# 1=抓到的比赛直接 confirmed 并通知群；0=进草稿待审核。
+AUTO_CONTEST_AUTO_CONFIRM = os.getenv("ACM_AUTO_CONTEST_AUTO_CONFIRM", "0") != "0"
+# 自动发布时的通知群；留空则覆盖所有允许群。
+AUTO_CONTEST_NOTIFY_GROUPS = frozenset(
+    item.strip() for item in os.getenv("ACM_AUTO_CONTEST_NOTIFY_GROUPS", "").split(",")
+    if item.strip()
+)
+
 # ================= 发布确认（超管私聊） =================
 # 老师发布比赛后，整理结果先私聊推送给超管，超管回「同意/拒绝」才入库并通知群。
 PUBLISH_CONFIRM_ENABLED = os.getenv("ACM_PUBLISH_CONFIRM_ENABLED", "1") != "0"
@@ -365,6 +421,10 @@ PUBLISH_SCOPE_TO_SOURCE = os.getenv("ACM_PUBLISH_SCOPE_TO_SOURCE", "1") != "0"
 # 老师用自然语言描述比赛（没带「发布」命令）时，是否让模型先判断意图，
 # 判为「在发布比赛」就自动转入发布流程。关闭则只认显式命令。
 NL_INTENT_ENABLED = os.getenv("ACM_NL_INTENT_ENABLED", "1") != "0"
+# 老师在群里用自然语言说安排（「周三晚七点讲图论」「下周找个晚上补题」）时，
+# 是否自动识别意图并登记课程/比赛。关闭后只认 / 开头的显式命令，
+# 群内普通消息一律不进意图管线（不做预过滤、不调模型）。
+TEACHER_AUTO_INTENT_ENABLED = os.getenv("ACM_TEACHER_AUTO_INTENT_ENABLED", "1") != "0"
 
 # ================= 自动周赛（v2） =================
 # 在提前提醒窗口前按模板生成周赛，启动时补最近未来场次；默认不通知全员，
@@ -383,10 +443,58 @@ WEEKLY_CONTEST_GROUPS = {
     g.strip() for g in os.getenv("ACM_WEEKLY_CONTEST_GROUPS", "").split(",") if g.strip()
 }
 
+# ================= 每日聚合晨报（主动额度节流） =================
+# 官方协议每群每天主动消息额度只有 1~4 条，因此把「当日课程 + 临近截止征集 +
+# 临近赛事」合并为每天一条晨报，代替过去多次主动推送。
+DAILY_DIGEST_ENABLED = os.getenv("ACM_DAILY_DIGEST_ENABLED", "1") != "0"
+
+
+def _digest_clock() -> tuple[int, int]:
+    """解析晨报时刻（HH:MM）；非法值回落到 08:30，不让机器人因配置笔误起不来。"""
+    raw = os.getenv("ACM_DAILY_DIGEST_TIME", "08:30").strip()
+    try:
+        hour_text, minute_text = raw.split(":", 1)
+        hour, minute = int(hour_text), int(minute_text)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError(raw)
+        return hour, minute
+    except (ValueError, AttributeError):
+        return 8, 30
+
+
+DAILY_DIGEST_HOUR, DAILY_DIGEST_MINUTE = _digest_clock()
+# 群员只读查询的被动回复尾部是否搭便车附带最紧急待办（零主动额度消耗）。
+DAILY_DIGEST_PIGGYBACK_ENABLED = os.getenv("ACM_DAILY_DIGEST_PIGGYBACK_ENABLED", "1") != "0"
+
 # ================= 公共来源低频集中抓取（v2，默认关闭） =================
-# 自动抓取默认关闭：开启后同一来源两次抓取的最小间隔（分钟）由下值控制。
+# 自动抓取默认关闭：开启后每天固定时刻抓一次（时刻见 CONTEST_CRAWL_*），
+# 避免按小时轮询把有限的对外请求与主动额度浪费在无变化的时间段上。
 AUTO_FETCH_ENABLED = os.getenv("ACM_AUTO_FETCH_ENABLED", "0") != "0"
+# 仅保留给「手动 /抓取」等入口的频率下限：两次手动抓取的最小间隔（分钟）。
 FETCH_MIN_INTERVAL_MINUTES = int(os.getenv("ACM_FETCH_MIN_INTERVAL_MINUTES", "60"))
+
+
+def _contest_crawl_clock() -> tuple[int, int]:
+    """解析比赛抓取时刻（HH:MM）；非法值回落到 08:05，不让机器人因配置笔误起不来。"""
+    raw = os.getenv("ACM_CONTEST_CRAWL_TIME", "08:05").strip()
+    try:
+        hour_text, minute_text = raw.split(":", 1)
+        hour, minute = int(hour_text), int(minute_text)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError(raw)
+        return hour, minute
+    except (ValueError, AttributeError):
+        return 8, 5
+
+
+CONTEST_CRAWL_HOUR, CONTEST_CRAWL_MINUTE = _contest_crawl_clock()
+
+# 晨报必须晚于当日赛程抓取：否则会把「今天刚抓到的新比赛」漏在晨报之外。
+# 配置写早（含相等）时不报错，而是自动顺延到抓取完成后的 10 分钟，
+# 保证任何环境变量组合下晨报都能读到当天最新赛程。
+if (DAILY_DIGEST_HOUR * 60 + DAILY_DIGEST_MINUTE) <= (CONTEST_CRAWL_HOUR * 60 + CONTEST_CRAWL_MINUTE):
+    _digest_minutes = min(CONTEST_CRAWL_HOUR * 60 + CONTEST_CRAWL_MINUTE + 10, 23 * 60 + 59)
+    DAILY_DIGEST_HOUR, DAILY_DIGEST_MINUTE = divmod(_digest_minutes, 60)
 # 自动抓取生成的记录默认不通知全员，由超管确认后处理（/修正 或 /比赛详情 人工核对）。
 
 # ================= 本地数据 =================

@@ -9,9 +9,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import commands, config, database as db, main, notifications, reminder, roles
+from cdutetc import admin_session, commands, config, database as db, main, notifications, reminder, roles
 from cdutetc.clients.qqbot import QQBotClient, QQBotMessage
-from cdutetc.errors import DeliveryCode
+from cdutetc.errors import DeliveryCode, DeliveryResult
 
 
 NOW = datetime(2026, 11, 10, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -20,6 +20,7 @@ GROUPS = [letter * 32 for letter in "ABCD"]
 
 @pytest.fixture
 def store(monkeypatch):
+    monkeypatch.setattr(admin_session, "_ACTIVE_GROUPS", {})
     conn = sqlite3.connect(":memory:")
     clock = SimpleNamespace(now=NOW)
     monkeypatch.setattr(db, "_connect", lambda: conn)
@@ -389,3 +390,83 @@ def test_old_permission_schema_migrates_and_keeps_initial_cooldown(store):
     assert not db.group_notification_paused("qqbot", GROUPS[0])
     assert db.claim_group_notification_retry("qqbot", GROUPS[0])
     assert not db.claim_group_notification_retry("qqbot", GROUPS[0])
+
+
+async def test_quota_keeps_daily_pause_instead_of_permission_cooldown(store):
+    gid = GROUPS[0]
+    db.block_group_notifications("qqbot", gid, "quota_exhausted", 11253)
+    app, api = bot()
+    store.clock.now += timedelta(minutes=5)
+    assert db.group_notification_paused("qqbot", gid)
+    assert not db.claim_group_notification_retry("qqbot", gid)
+    assert not await app._send_group_result(gid, "still today")
+    api.post_group_message.assert_not_awaited()
+
+    store.clock.now = (NOW + timedelta(days=1)).replace(hour=0)
+    db.init_db()
+    assert not db.group_notification_paused("qqbot", gid)
+    assert db.claim_group_notification_retry("qqbot", gid)
+    assert (await app._send_group_result(gid, "next Beijing date")).ok
+    api.post_group_message.assert_awaited_once()
+
+
+async def test_permission_recovery_can_change_to_daily_quota_pause(store, monkeypatch):
+    gid = GROUPS[0]
+    db.block_group_notifications("qqbot", gid, "active_forbidden", 40034105)
+    store.clock.now += timedelta(days=1)
+    app, _ = bot()
+    send = AsyncMock(return_value=DeliveryResult(False, DeliveryCode.QUOTA_EXHAUSTED, "qqbot", platform_code=11253))
+    monkeypatch.setattr(notifications, "send_group", send)
+
+    assert (await app._send_group_result(gid, "permission recovered but quota empty")).code == DeliveryCode.QUOTA_EXHAUSTED
+    block = db.get_group_notification_block("qqbot", gid)
+    assert block["error_code"] == "quota_exhausted"
+    assert block["blocked_at"] == db.now_str()
+    store.clock.now += timedelta(minutes=5)
+    assert db.group_notification_paused("qqbot", gid)
+    assert not await app._send_group_result(gid, "do not retry quota")
+    send.assert_awaited_once()
+
+
+async def test_paused_quota_does_not_consume_reminder_attempts(store):
+    cid = competition()
+    db.set_competition_notify_groups(cid, {GROUPS[0]})
+    db.block_group_notifications("qqbot", GROUPS[0], "quota_exhausted", 11253)
+    store.clock.now += timedelta(minutes=90)
+    sender = AsyncMock(return_value=True)
+    assert await reminder.check_contest_start_reminders(sender) == 0
+    sender.assert_not_awaited()
+    assert all(p[2:] == ("pending", 0) for p in plans(store, cid) if p[0] == GROUPS[0])
+
+
+async def test_concurrent_reminders_keep_per_group_switches(store):
+    cid = competition()
+    db.set_competition_notify_groups(cid, {GROUPS[0], GROUPS[1]})
+    db.set_group_switch(GROUPS[0], "contest_remind_enabled", False, "admin")
+    store.clock.now += timedelta(minutes=90)
+    sender = AsyncMock(return_value=True)
+    assert await reminder.check_contest_start_reminders(sender) == 1
+    sender.assert_awaited_once()
+    assert sender.await_args.args[0] == GROUPS[1]
+    assert all(p[2:] == ("pending", 0) for p in plans(store, cid) if p[0] == GROUPS[0])
+
+    for gid in GROUPS[:2]:
+        db.create_collection(gid, "报名", deadline="2026-11-10 12:00")
+    sender.reset_mock()
+    assert await reminder.check_general_reminders(sender) == 1
+    sender.assert_awaited_once()
+    assert sender.await_args.args[0] == GROUPS[1]
+
+
+@pytest.mark.parametrize("command", ["修正", "改"])
+async def test_private_amend_with_workspace_notifies_workspace_without_private_header(store, command):
+    cid = competition()
+    admin_session.set_active_group("admin", GROUPS[0])
+    app, api = bot()
+    await app.on_private_message_create(QQBotMessage(
+        None, message_type="private", user_id="admin", msg_id="incoming",
+        content=f"/{command} {cid} summary=updated",
+    ))
+    assert {c.kwargs["group_openid"] for c in api.post_group_message.await_args_list} == set(GROUPS)
+    assert all(c.kwargs["content"].startswith("比赛「") for c in api.post_group_message.await_args_list)
+    assert db.get_competition(cid)["summary"] == "updated"

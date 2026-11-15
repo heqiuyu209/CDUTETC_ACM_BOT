@@ -119,6 +119,15 @@ Push 前复核（2026-11-07）：
 - 最终全量 **824 项通过**（22.66 秒）：`python -m pytest -q --tb=short --basetemp=.pytest-tmp/push-review`。Ruff F 类检查与 `git diff --check` 通过；已移除旧接口无残留调用，Git 未跟踪 `.env` 或实际数据库。本轮未发现其他阻止 push 的问题。
 - 上次测试因自动审批服务额度不足而未执行；恢复后相关 108 项及最终全量均已实际运行通过。此次同样没有启动真实机器人、发送 QQ 消息或调用付费模型。
 
+## 自然语言问答重构（2026-11-11）
+
+- 新增 `cdutetc/qa_context.py`：`build_group_qa_context(group_id)` 只读聚合「未来 7 天课程 + 开放征集（标题/ID/截止/剩余名额/字段）+ 本群 FAQ」，拼为 `【当前集训队最新教务事实】` 事实块；三路全空或 `ACM_QA_CONTEXT_ENABLED=0` 时返回空串，不白花 token；超 `ACM_QA_CONTEXT_MAX_CHARS`（默认 3000）按行截断留省略标记。课程复用 `daily_digest` 的星期/时钟解析与 `db.training_occurrence_valid`（已取消或生效期外的实例不计入）。
+- `llm.answer_question` 新增 `group_context` 参数：事实块与「原样引用时间/地点/名额/ID、只引导白名单命令、覆盖不到只输出 `[未收录]`」规则一起进 system prompt；不传上下文时提示词与旧行为一致。
+- `commands.handle_non_command_message`：老师/超管路径改为带上下文提问，模型不可用与「未收录」分别给出不同话术并都转未答工单（记录问题编号，提示补 FAQ/课程/征集）；普通成员默认仍 0 token 转工单，`ACM_QA_MEMBER_CONTEXT_ANSWER=1` 时先用上下文模型作答，仍判未收录才转工单。
+- 新增 21 项回归（`tests/test_qa_context.py`）：课程 7 天窗口与生效期、征集 open 与名额、FAQ 删除与长答案裁剪、上下文开关与截断、prompt 注入与白名单、老师/成员各分支及模型异常降级。
+
+上一轮验证：`python -m pytest -q --tb=short --basetemp=.pytest-tmp/verified` 全量 **1068 项通过**（38.31 秒，含本轮新增 21 项）；本轮未启动真实机器人、未发送 QQ 消息、未调用付费模型。
+
 剩余与下一步：
 - 代码范围内没有未完成项。新增开关默认 `ACM_QA_FAQ_LLM_ENABLED=0`、`ACM_QA_SOCIAL_CHAT_USE_LLM=0`；如需模型 FAQ 消歧再显式开启。现有 `.env` 中自定义话术继续优先，不会覆盖。
 - 更新后需重启机器人；在部署环境用 `/提醒状态` 对照计划，再按 README 的 `/通知测试` 检查真实群/私聊收信。此次没有启动机器人或发送真实消息。

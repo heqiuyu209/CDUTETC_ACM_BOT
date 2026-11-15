@@ -1,21 +1,18 @@
 """周期课程的真实 SQLite 实例投递、失效校验、群隔离与重启去重。"""
 
 import asyncio
-from datetime import datetime, timedelta, timezone
 import json
-from pathlib import Path
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
+
 import pytest
 
-from cdutetc import commands
-from cdutetc import config
-from cdutetc import database
-from cdutetc import main
-from cdutetc import reminder
+from cdutetc import commands, config, database, main, reminder
 from cdutetc.errors import DeliveryMode, DeliveryResult
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -39,7 +36,10 @@ def training(group="123456", **values):
     info = {"title": "算法训练", "weekday": "周日", "start_time": "19:00", "end_time": "21:00",
             "location": "B201", "needs_laptop": True, "software": "IDE", "device_req": "充电器", **values}
     tid = database.create_training_session(group, info, operator="654321")
-    return tid, database.delivery_dedup_key(group, "training_session", tid, "start_time", TARGET, 1)
+    # NOW 距开课仅 1 分钟：命中「最紧」的节点，即训练节点集里的最小值
+    # （默认 15 分钟 = 0.25 小时，由 TRAINING_REMIND_EXTRA_OFFSETS_MINUTES 提供）。
+    offset = min(reminder.training_offset_hours())
+    return tid, database.delivery_dedup_key(group, "training_session", tid, "start_time", TARGET, offset)
 
 
 async def test_course_command_enters_actual_main_reminder_job(db, monkeypatch):
@@ -54,16 +54,16 @@ async def test_course_command_enters_actual_main_reminder_job(db, monkeypatch):
         return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
     ))
     bot = main.ACMBot(client)
-    await bot._remind_job()
+    await bot._general_remind_job()
     client.send_group_msg_result.assert_awaited_once()
     group, text = client.send_group_msg_result.await_args.args
     assert group == "123456" and TARGET in text and "B201" in text
-    await bot._remind_job()
+    await bot._general_remind_job()
     assert client.send_group_msg_result.await_count == 1
 
 
 async def test_next_week_has_new_identity_but_same_week_and_restart_are_deduplicated(db):
-    tid, key = training()
+    tid, _key = training()
     sender = AsyncMock(return_value=True)
     assert await reminder.check_general_reminders(sender, now=NOW) == 1
     assert await reminder.check_general_reminders(sender, now=NOW) == 0
@@ -189,7 +189,7 @@ async def test_effective_range_uses_occurrence_and_invalid_fields_are_not_guesse
 async def test_utc_clock_and_unpadded_time_produce_same_beijing_identity(db):
     tid, key = training(start_time="19:0", weekday="每星期天")
     sender = AsyncMock(return_value=True)
-    assert await reminder.check_general_reminders(sender, now=datetime(2026, 11, 1, 10, 59, tzinfo=timezone.utc)) == 1
+    assert await reminder.check_general_reminders(sender, now=datetime(2026, 11, 1, 10, 59, tzinfo=UTC)) == 1
     assert database.get_delivery_by_key(key)["status"] == "sent"
     with database._connect() as conn:
         conn.execute("UPDATE training_sessions SET start_time='19:00' WHERE id=?", (tid,))

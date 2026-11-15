@@ -5,19 +5,22 @@
 """
 
 import argparse
-from contextlib import closing
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import os
-from pathlib import Path
 import sqlite3
 import sys
 import uuid
-
+from contextlib import closing
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 
 # 子表、队列先清；不重置 sqlite_sequence，防止旧审批编号指向新记录。
 BUSINESS_TABLES = (
     "reminder_success_receipts", "reminder_deliveries", "reminders",
+    # 统一提醒中心的自定义提醒：属业务数据，正式启用前随重置一并清空。
+    "custom_reminders",
+    # 老师隐式意图的待补全队列：未确认的候选安排，属业务数据。
+    "teacher_intent_pending",
     "collection_responses", "collections", "unanswered_questions", "group_faq",
     "training_sessions", "org_events", "competition_pending_updates",
     "competition_versions", "competition_sources", "competition_notify_groups",
@@ -25,9 +28,13 @@ BUSINESS_TABLES = (
     "competitions", "contests", "audit_log",
 )
 CONFIG_TABLES = (
-    "runtime_allowed_groups", "runtime_teachers", "account_labels",
+    "runtime_allowed_groups", "runtime_teachers", "account_labels", "entity_aliases",
     "group_notification_settings", "group_notification_blocks",
     "group_weekly_settings", "group_teacher_assignments",
+    # 群级键值开关（课程提醒开/关等）：属配置，重置业务数据时一并保留。
+    "group_settings",
+    # 超管私聊工作区（user_openid → 目标群 openid）：属运行态偏好，保留可免重置后重选群。
+    "admin_workspaces",
 )
 
 
@@ -57,7 +64,7 @@ def _inventory(conn: sqlite3.Connection) -> tuple[dict[str, int], dict[str, int]
 
 def _backup(path: Path, directory: Path) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     destination = directory / f"{path.stem}-before-reset-{stamp}-{uuid.uuid4().hex[:8]}.sqlite3"
     # 备份含完整业务数据；新文件独占创建，Linux 上仅当前用户可读写。
     fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

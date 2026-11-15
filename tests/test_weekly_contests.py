@@ -3,18 +3,15 @@
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import config
-from cdutetc import database
-from cdutetc import main
+from cdutetc import config, database, main
 from cdutetc.errors import DeliveryMode, DeliveryResult
-
 
 BEIJING = ZoneInfo("Asia/Shanghai")
 
@@ -38,7 +35,10 @@ async def bot(memory_db, monkeypatch):
     client = main.ACMBot(SimpleNamespace(send_group_msg_result=AsyncMock(
         return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
     )))
-    monkeypatch.setattr(client, "_send_group", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        client, "_send_group_result",
+        AsyncMock(return_value=SimpleNamespace(ok=False)),
+    )
     return client
 
 
@@ -68,7 +68,7 @@ async def test_weekly_generation_stores_concrete_beijing_window(bot, memory_db):
     assert memory_db.execute(
         "SELECT week_start, competition_id FROM weekly_contest_runs"
     ).fetchall() == [("2026-10-26", competition["id"])]
-    bot._send_group.assert_not_awaited()
+    bot._send_group_result.assert_not_awaited()
 
 
 async def test_same_week_remains_idempotent_after_restart_and_amendment(bot, memory_db, monkeypatch):
@@ -117,7 +117,7 @@ async def test_utc_clock_crosses_into_beijing_week_and_honors_weekday(bot, memor
     monkeypatch.setattr(config, "WEEKLY_CONTEST_START", "18:30")
     monkeypatch.setattr(config, "WEEKLY_CONTEST_END", "20:30")
     # UTC 周日 16:30 已是北京时间周一 00:30，应使用新一周的周三。
-    await bot._weekly_contest_job(now=datetime(2026, 11, 1, 16, 30, tzinfo=timezone.utc))
+    await bot._weekly_contest_job(now=datetime(2026, 11, 1, 16, 30, tzinfo=UTC))
 
     competition = database.list_competitions()[0]
     assert competition["official_time"] == "2026-11-04 18:30"

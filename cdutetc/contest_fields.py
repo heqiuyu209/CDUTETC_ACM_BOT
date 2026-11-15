@@ -14,17 +14,24 @@ _ALIASES = {
 }
 
 
+def _as_text(value):
+    """模型把文本字段输出成数组时先归一化，避免整条映射被拒。"""
+    if isinstance(value, (list, tuple)):
+        return "、".join(str(x).strip() for x in value if str(x).strip())
+    return value
+
+
 def map_competition_info(info: dict) -> dict:
     """优先使用非空官方字段，其次兼容旧提取字段；保留所有支持资料。"""
     if not isinstance(info, dict):
         raise ValueError("比赛信息必须是对象")
-    name = info.get("name")
+    name = _as_text(info.get("name"))
     if not isinstance(name, str) or not name.strip():
         raise ValueError("比赛名称不能为空")
     mapped = {}
     for field, aliases in _ALIASES.items():
         for alias in aliases:
-            value = info.get(alias)
+            value = _as_text(info.get(alias))
             if value is None:
                 continue
             if not isinstance(value, str):

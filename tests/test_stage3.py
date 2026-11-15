@@ -8,9 +8,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import config
-from cdutetc import database
-from cdutetc import reminder
+from cdutetc import config, database, reminder
 
 TZ = ZoneInfo("Asia/Shanghai")
 

@@ -15,11 +15,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import commands
-from cdutetc import config
-from cdutetc import database
-from cdutetc import main
-from cdutetc import reminder
+from cdutetc import commands, config, database, main, reminder
 
 NOW = datetime(2026, 11, 1, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
 TARGET = "2026-11-01 23:59"
@@ -212,94 +208,17 @@ async def test_sender_timeout_releases_claim_for_retry(file_db, monkeypatch):
     assert await reminder.check_general_reminders(AsyncMock(return_value=True), now=NOW) == 1
 
 
-@pytest.mark.parametrize("legacy_result", ["timeout", "exception", "no_receipt"])
-async def test_main_job_continues_after_legacy_send_failure(file_db, monkeypatch, legacy_result, onebot_client):
-    _, key = collection(24)
-    legacy_id = database.save_contest("g1", {"name": "旧比赛", "reg_deadline": TARGET})
-    monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
-    monkeypatch.setattr(reminder, "_DELIVERY_SEND_TIMEOUT_SECONDS", 0.01)
-
-    class Clock(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return NOW
-
-    monkeypatch.setattr(reminder, "datetime", Clock)
-    legacy_calls = []
-
-    async def api_send(action, **kwargs):
-        if "旧比赛" in kwargs["message"]:
-            legacy_calls.append(kwargs["group_id"])
-            if legacy_result == "timeout":
-                await asyncio.Event().wait()
-            if legacy_result == "exception":
-                raise RuntimeError("legacy SDK rejected")
-            return None
-        return {"status": "ok", "retcode": 0, "data": {"message_id": 12345}}
-
-    client = main.ACMBot(onebot_client)
-    onebot_client.call_api.side_effect = api_send
-    await asyncio.wait_for(client._remind_job(), timeout=2)
-    row = database.get_delivery_by_key(key)
-    assert (row["status"], row["attempts"]) == ("sent", 1)
-    assert legacy_calls == ["g1"]
-    assert not database.has_reminded("g1", legacy_id, "reg_deadline", TARGET)
-    await asyncio.wait_for(client._remind_job(), timeout=2)
-    assert legacy_calls == ["g1", "g1"]
-    assert database.get_delivery_by_key(key)["attempts"] == 1
-
-
-async def test_main_job_isolates_legacy_scan_failure(file_db, monkeypatch):
-    general = AsyncMock(return_value=1)
-    monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
-
-    async def broken_legacy(_sender):
-        raise sqlite3.OperationalError("legacy table unavailable")
-
-    monkeypatch.setattr(main, "check_reminders", broken_legacy)
-    monkeypatch.setattr(main, "check_general_reminders", general)
-    client = main.ACMBot(AsyncMock())
-
-    await client._remind_job()
-
-    general.assert_awaited_once()
-
-
 async def test_main_job_isolates_general_scan_failure(file_db, monkeypatch):
-    legacy = AsyncMock(return_value=1)
     monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
 
     async def broken_general(_sender):
         raise sqlite3.OperationalError("delivery table unavailable")
 
-    monkeypatch.setattr(main, "check_reminders", legacy)
     monkeypatch.setattr(main, "check_general_reminders", broken_general)
     client = main.ACMBot(AsyncMock())
 
-    await client._remind_job()
-
-    legacy.assert_awaited_once()
-
-
-async def test_legacy_callback_exception_does_not_skip_later_legacy_item(file_db, monkeypatch):
-    first = database.save_contest("g1", {"name": "发送失败比赛", "reg_deadline": TARGET})
-    second = database.save_contest("g1", {"name": "后续比赛", "reg_deadline": TARGET})
-
-    class Clock(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return NOW
-
-    monkeypatch.setattr(reminder, "datetime", Clock)
-
-    async def sender(gid, text):
-        if "发送失败比赛" in text:
-            raise RuntimeError("sender raised")
-        return True
-
-    assert await reminder.check_reminders(sender) == 1
-    assert not database.has_reminded("g1", first, "reg_deadline", TARGET)
-    assert database.has_reminded("g1", second, "reg_deadline", TARGET)
+    # 扫描失败由 job 内部隔离，不向调度器抛出
+    await client._general_remind_job()
 
 
 async def test_concurrent_scans_do_not_send_the_same_claim(file_db):
@@ -444,11 +363,11 @@ def test_reminder_status_filters_group_before_limiting_and_shows_terminal_counts
     text = commands.cmd_reminder_status("g1", "teacher", "")[0]["text"]
     assert "重试耗尽 1" in text
     assert "已取消 0" in text and "已过期 0" in text
-    assert "本群当前无待发送提醒" in text
+    assert "7天后暂无已排期提醒" in text
     pending_id, _ = collection()
     database.ensure_delivery("g1", "collection", pending_id, "deadline", TARGET)
     text = commands.cmd_reminder_status("g1", "teacher", "")[0]["text"]
-    assert f"collection#{pending_id}" in text and "待发送 1" in text
+    assert f"(#{pending_id})" in text and "待发送 1" in text
     assert "重试耗尽 1" in text
 
 

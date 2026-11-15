@@ -4,18 +4,12 @@
 _safe_reply 收集；限流器可单独注入以控制窗口参数。
 """
 
-from unittest.mock import AsyncMock
-
 import sqlite3
+from unittest.mock import AsyncMock
 
 import pytest
 
-from cdutetc import commands
-from cdutetc import config
-from cdutetc import content_filter
-from cdutetc import database
-from cdutetc import llm
-from cdutetc import main
+from cdutetc import commands, config, content_filter, database, llm, main
 from cdutetc.clients.onebot import OneBotMessage
 
 
@@ -450,9 +444,10 @@ def _new_competition(name: str, hours_from_now: int) -> int:
 
 
 def test_competition_without_scope_notifies_all_groups(monkeypatch):
-    from cdutetc import reminder
     from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
+
+    from cdutetc import reminder
 
     now = datetime(2026, 11, 1, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
     target = (now + timedelta(hours=5)).strftime("%Y-%m-%d %H:%M")
@@ -469,9 +464,10 @@ def test_competition_without_scope_notifies_all_groups(monkeypatch):
 
 def test_competition_scope_limits_reminder_groups(monkeypatch):
     """报名截止只发指定群；纯构造测试不读取共享数据库。"""
-    from cdutetc import reminder
     from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
+
+    from cdutetc import reminder
 
     now = datetime(2026, 11, 1, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
     target = (now + timedelta(hours=5)).strftime("%Y-%m-%d %H:%M")
@@ -497,9 +493,10 @@ def test_scoped_competition_hidden_from_other_group_qa(memory_db, monkeypatch):
 
 def test_scope_pointing_to_unknown_group_sends_nothing(monkeypatch):
     """到期报名提醒范围全未授权时绝不退回全群广播。"""
-    from cdutetc import reminder
     from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
+
+    from cdutetc import reminder
 
     now = datetime(2026, 11, 1, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
     target = (now + timedelta(hours=5)).strftime("%Y-%m-%d %H:%M")
@@ -552,9 +549,10 @@ def test_extend_scope_adds_second_group(memory_db, monkeypatch):
 
 def test_training_reminder_stays_in_its_group(monkeypatch):
     """课程提醒只发所属群，不跨群。"""
-    from cdutetc import reminder
     from datetime import datetime
     from zoneinfo import ZoneInfo
+
+    from cdutetc import reminder
 
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"TRAIN", "FRESH"})
     # 2026-11-01 是周日；课程安排在当天 19:00，落在 24h 提醒窗口内

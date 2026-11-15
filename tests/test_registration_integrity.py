@@ -5,8 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from cdutetc import commands
-from cdutetc import database
+from cdutetc import commands, database
 
 
 @pytest.fixture
