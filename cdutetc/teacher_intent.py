@@ -108,7 +108,7 @@ def is_teacher_speaker(group_id: str, sender_id: str) -> bool:
         return False
     try:
         return speaker in set(db.get_group_teachers(group_id))
-    except Exception:  # noqa: BLE001
+    except Exception:
         # 库异常时按「不是老师」处理：宁可漏识别，也不能让普通成员的通知落库。
         logger.warning("读取群负责老师失败，按非老师处理: %s", group_id)
         return False
@@ -187,7 +187,7 @@ def _contest_index(now: datetime) -> list[dict]:
     items: list[dict] = []
     try:
         contests = db.list_competitions(status="confirmed")
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("读取比赛列表失败，上下文不含比赛索引")
         return items
     for item in contests:
@@ -212,7 +212,7 @@ def _course_index(group_id: str) -> list[dict]:
     items: list[dict] = []
     try:
         sessions = db.list_training_sessions(group_id)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("读取课程列表失败，上下文不含课程索引: %s", group_id)
         return items
     for session in sessions:
@@ -306,7 +306,7 @@ async def _fetch_url_summary(url: str) -> str:
         return ""
     try:
         body = await asyncio.wait_for(fetcher.fetch_text(url), timeout=FETCH_TIMEOUT)
-    except Exception as error:  # noqa: BLE001
+    except Exception as error:
         logger.info("老师意图链接抓取失败: %s", type(error).__name__)
         return ""
     return " ".join(str(body or "").split())[:600]
@@ -332,7 +332,7 @@ async def classify(text: str, *, group_id: str, now: datetime | None = None) -> 
             ),
             timeout=LLM_TIMEOUT,
         )
-    except Exception as error:  # noqa: BLE001
+    except Exception as error:
         logger.warning("老师意图分类调用失败: %s", type(error).__name__)
         return None
     return parse_result(raw)
@@ -468,7 +468,7 @@ def _save_contest(group_id: str, slots: dict, now: datetime, operator: str) -> d
         return None
     try:
         db.set_competition_notify_groups(cid, {group_id}, operator)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("比赛提醒范围绑定失败: %s", cid)
     return db.get_competition(cid)
 
@@ -546,7 +546,7 @@ def _private_targets(group_id: str, sender_id: str) -> list[str]:
         for uid in sorted(db.get_group_teachers(group_id)):
             if uid and uid not in targets:
                 targets.append(uid)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("读取群负责老师失败，待补全通知只发本人与超管")
     return targets
 

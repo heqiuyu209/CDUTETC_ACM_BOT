@@ -604,7 +604,7 @@ async def _fetch_nowcoder_contests(current: datetime, window: int, nc_fetcher) -
     for url in _nowcoder_calendar_urls(current, window):
         try:
             text = await nc_fetcher(url)
-        except Exception as error:  # noqa: BLE001 - 单月失败要能继续试其它月份
+        except Exception as error:
             logger.warning("牛客日历接口请求失败（%s）：%s", url, error)
             continue
         if not isinstance(text, str):
@@ -641,13 +641,13 @@ async def fetch_contests(now: datetime | None = None, *,
         if isinstance(payload, str):
             payload = json.loads(payload)
         result["codeforces"] = parse_codeforces(payload, current, window)
-    except Exception as error:  # noqa: BLE001 - 单源失败必须隔离
+    except Exception as error:
         logger.warning("Codeforces 赛程抓取失败：%s", error)
         result["errors"].append({"platform": "Codeforces", "error": str(error)})
 
     try:
         result["nowcoder"] = await _fetch_nowcoder_contests(current, window, nc_fetcher)
-    except Exception as error:  # noqa: BLE001 - 单源失败必须隔离
+    except Exception as error:
         logger.warning("牛客赛程抓取失败：%s", error)
         result["errors"].append({"platform": "牛客", "error": str(error)})
     return result
@@ -688,7 +688,7 @@ async def run_contest_fetch(now: datetime | None = None, *, fetchers=None) -> li
 
     try:
         fetched = await fetch_contests(current, **fetchers)
-    except Exception as error:  # noqa: BLE001 - 定时任务不得因抓取崩掉
+    except Exception as error:
         return [{"kind": "error", "error": str(error)}]
 
     for problem in fetched.get("errors", []):
@@ -714,7 +714,7 @@ async def run_contest_fetch(now: datetime | None = None, *, fetchers=None) -> li
         status = "confirmed" if config.AUTO_CONTEST_AUTO_CONFIRM else "draft"
         try:
             cid = db.create_competition(info, status=status, operator="auto-fetch")
-        except Exception as error:  # noqa: BLE001 - 单条失败不影响整批
+        except Exception as error:
             out.append({**entry, "kind": "error", "error": str(error)})
             continue
         if status == "confirmed":

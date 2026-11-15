@@ -453,6 +453,28 @@ CREATE TABLE IF NOT EXISTS meme_file_cache (
 )
 """
 
+# 三层持久化记忆之一：个人特征标签。每 (群, 成员) 只保留最近若干条短标签，
+# 由 0 Token 规则从群聊原话里截取，绝不调模型；超限由写入方自动淘汰最旧。
+_BOT_MEMORY_FACTS_DDL = """
+CREATE TABLE IF NOT EXISTS bot_memory_facts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_openid TEXT NOT NULL,
+    user_openid  TEXT NOT NULL,
+    fact         TEXT NOT NULL DEFAULT '',
+    updated_at   TEXT NOT NULL DEFAULT ''
+)
+"""
+
+# 三层持久化记忆之二：机器人当前生活状态（单行）。仅一行，主键固定为 1，
+# 由每日三次定时状态机换文案，供拟人聊天 Prompt 注入一句话当前状态。
+_BOT_DAILY_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS bot_daily_state (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    status_text TEXT NOT NULL DEFAULT '',
+    updated_at  TEXT NOT NULL DEFAULT ''
+)
+"""
+
 _INDEX_DDL = (
     "CREATE INDEX IF NOT EXISTS idx_contests_group ON contests(group_id)",
     "CREATE INDEX IF NOT EXISTS idx_reminders_group ON reminders(group_id)",
@@ -494,6 +516,8 @@ _ALL_DDL = (
     _GROUP_SETTINGS_DDL, _CUSTOM_REMINDERS_DDL, _AUDIT_LOG_DDL,
     _ADMIN_WORKSPACES_DDL, _TEACHER_INTENT_PENDING_DDL,
     _MEME_FILE_CACHE_DDL,
+    # 机器人记忆两张表：属长期记忆，重置业务数据时保留（见 reset_business_data）。
+    _BOT_MEMORY_FACTS_DDL, _BOT_DAILY_STATE_DDL,
 )
 
 
@@ -4442,3 +4466,132 @@ def drop_pending_deliveries(obj_type: str, obj_id: int, *, group_id: str = "") -
         cur = conn.execute(sql, args)
         return cur.rowcount
 
+
+
+# ================= 拟人化聊天的三层持久化记忆 =================
+# 单个成员在单个群最多保留的记忆标签条数：超限自动淘汰最旧，防止越记越长。
+MEMORY_FACTS_KEEP = 5
+# 记忆标签的最大字数（中文按字计），超出直接丢弃而不是截断出半句话。
+MEMORY_FACT_MAX_CHARS = 15
+# 库里还没状态时使用的默认台词：先给一句「在场」的状态，聊天才不显得尴尬。
+DEFAULT_DAILY_STATUS = "在机房吹空调摸鱼中"
+
+
+def add_memory_fact(group_openid: str, user_openid: str, fact: str, *,
+                    keep: int = MEMORY_FACTS_KEEP,
+                    now: datetime | None = None) -> bool:
+    """写一条个人特征标签；同一条标签只留最新时刻，超量淘汰最旧。
+
+    标签由 0 Token 规则从群聊原话里截取，因此这里只接受短文本：
+    空标签、超长标签一律拒收（返回 False），不做静默截断。
+    """
+    group = _as_str(group_openid)
+    user = _as_str(user_openid)
+    text = _as_str(fact)
+    if not group or not user or not text:
+        return False
+    if len(text) > MEMORY_FACT_MAX_CHARS:
+        return False
+    limit = _as_int(keep)
+    if not limit or limit <= 0:
+        limit = MEMORY_FACTS_KEEP
+    moment = now or datetime.now(TZ)
+    stamp = moment.strftime("%Y-%m-%d %H:%M:%S")
+    with _connect() as conn:
+        # 同一条标签重复出现只刷新时间，避免「我叫小明」刷十次占满 5 个槽位。
+        existing = conn.execute(
+            "SELECT id FROM bot_memory_facts"
+            " WHERE group_openid = ? AND user_openid = ? AND fact = ?",
+            (group, user, text),
+        ).fetchone()
+        if existing:
+            conn.execute("UPDATE bot_memory_facts SET updated_at = ? WHERE id = ?",
+                         (stamp, existing[0]))
+        else:
+            conn.execute(
+                "INSERT INTO bot_memory_facts (group_openid, user_openid, fact, updated_at)"
+                " VALUES (?, ?, ?, ?)",
+                (group, user, text, stamp),
+            )
+        # 淘汰超出保留条数的最旧记录（多余的历史标签没有价值，只占 Prompt 预算）。
+        conn.execute(
+            "DELETE FROM bot_memory_facts WHERE id IN ("
+            " SELECT id FROM bot_memory_facts WHERE group_openid = ? AND user_openid = ?"
+            " ORDER BY updated_at DESC, id DESC LIMIT -1 OFFSET ?)",
+            (group, user, limit),
+        )
+    return True
+
+
+def list_memory_facts(group_openid: str, user_openid: str, *,
+                      limit: int = 3) -> list[str]:
+    """按最近更新倒序取个人标签；limit 非正数时返回空列表（调用方明确不要记忆）。"""
+    group = _as_str(group_openid)
+    user = _as_str(user_openid)
+    count = _as_int(limit)
+    if not group or not user or not count or count <= 0:
+        return []
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT fact FROM bot_memory_facts"
+            " WHERE group_openid = ? AND user_openid = ?"
+            " ORDER BY updated_at DESC, id DESC LIMIT ?",
+            (group, user, count),
+        ).fetchall()
+    return [str(row[0]) for row in rows if row and row[0]]
+
+
+def clear_memory_facts(*, group_openid: str = "", user_openid: str = "") -> int:
+    """清空记忆标签（运维/测试用）；不传条件即清空全表，返回删除条数。"""
+    sql = "DELETE FROM bot_memory_facts WHERE 1 = 1"
+    args: list = []
+    group = _as_str(group_openid)
+    user = _as_str(user_openid)
+    if group:
+        sql += " AND group_openid = ?"
+        args.append(group)
+    if user:
+        sql += " AND user_openid = ?"
+        args.append(user)
+    with _connect() as conn:
+        return conn.execute(sql, args).rowcount
+
+
+def get_daily_state(*, default_text: str = DEFAULT_DAILY_STATUS,
+                    now: datetime | None = None) -> dict:
+    """读机器人当前生活状态；库里还没有记录时就地初始化一条默认状态。
+
+    Returns:
+        {"status_text": str, "updated_at": str}，永不为 None。
+    """
+    fallback = _as_str(default_text) or DEFAULT_DAILY_STATUS
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT status_text, updated_at FROM bot_daily_state WHERE id = 1"
+        ).fetchone()
+        if row:
+            return {"status_text": str(row[0] or "") or fallback,
+                    "updated_at": str(row[1] or "")}
+        stamp = (now or datetime.now(TZ)).strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute(
+            "INSERT INTO bot_daily_state (id, status_text, updated_at) VALUES (1, ?, ?)"
+            " ON CONFLICT(id) DO NOTHING",
+            (fallback, stamp),
+        )
+        return {"status_text": fallback, "updated_at": stamp}
+
+
+def set_daily_state(status_text: str, *, now: datetime | None = None) -> bool:
+    """覆盖机器人当前生活状态（单行 upsert）；空文案视为无效写入。"""
+    text = _as_str(status_text)
+    if not text:
+        return False
+    stamp = (now or datetime.now(TZ)).strftime("%Y-%m-%d %H:%M:%S")
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO bot_daily_state (id, status_text, updated_at) VALUES (1, ?, ?)"
+            " ON CONFLICT(id) DO UPDATE SET status_text = excluded.status_text,"
+            " updated_at = excluded.updated_at",
+            (text, stamp),
+        )
+    return True

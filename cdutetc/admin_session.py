@@ -44,7 +44,7 @@ def set_active_group(admin_user_id: str, group_id: str | None) -> None:
     _ACTIVE_GROUPS[uid] = gid
     try:
         _store().set_admin_workspace(uid, gid)
-    except Exception:  # noqa: BLE001 - 持久化失败不应打断命令链路
+    except Exception:
         logger.warning("工作区持久化失败，已降级为内存绑定 [admin_session]")
 
 
@@ -61,7 +61,7 @@ def get_active_group(admin_user_id: str) -> str | None:
         return cached
     try:
         stored = _store().get_admin_workspace(uid)
-    except Exception:  # noqa: BLE001 - 库未初始化等场景按未绑定处理
+    except Exception:
         return None
     if stored:
         _ACTIVE_GROUPS[uid] = stored
@@ -77,7 +77,7 @@ def clear_active_group(admin_user_id: str) -> None:
     _ACTIVE_GROUPS.pop(uid, None)
     try:
         _store().clear_admin_workspace(uid)
-    except Exception:  # noqa: BLE001 - 同上
+    except Exception:
         logger.warning("工作区清空未落库，仅内存生效 [admin_session]")
 
 

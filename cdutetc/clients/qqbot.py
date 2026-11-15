@@ -45,7 +45,7 @@ class GroupActivePermission:
 def _import_botpy():
     """延迟导入 botpy，未安装时给出明确安装指引。"""
     try:
-        import botpy  # noqa: F401
+        import botpy
     except ImportError as error:  # pragma: no cover - 取决于运行环境
         raise RuntimeError(
             "使用官方机器人需要安装 botpy：pip install -r requirements-qqbot.txt"
@@ -244,7 +244,7 @@ class QQBotClient(BaseBotClient):
             return
         try:
             await self.group_msg_handler(wrapped)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("群消息处理失败")
 
     # ---------- 生命周期 ----------
@@ -284,7 +284,7 @@ class QQBotClient(BaseBotClient):
                 if adapter.private_msg_handler is not None:
                     try:
                         await adapter.private_msg_handler(wrapped)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.exception("私聊消息处理失败")
 
         intents = build_group_intents(botpy)
@@ -326,7 +326,7 @@ class QQBotClient(BaseBotClient):
                                   detail="sdk_method_missing")
         try:
             response = await func(**params)
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             result = result_from_exception(error, protocol=protocol, mode=mode)
             logger.warning("%s send failed (%s, platform_code=%s)", action, result.code.value, result.platform_code)
             return result
@@ -359,7 +359,7 @@ class QQBotClient(BaseBotClient):
         try:
             route = Route("GET", "/v2/groups/{group_openid}/bot_state", group_openid=group_id)
             response = await asyncio.wait_for(http.request(route), timeout=5.0)
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             failure = result_from_exception(error, protocol="qqbot", mode=DeliveryMode.ACTIVE)
             return GroupActivePermission(code=failure.code.value, platform_code=failure.platform_code)
         if isinstance(response, dict):
@@ -398,7 +398,7 @@ class QQBotClient(BaseBotClient):
         payload = {"file_type": int(file_type), "url": address, "sdkfileid": ""}
         try:
             response = await asyncio.wait_for(http.request(route, json=payload), timeout=10.0)
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             logger.warning("表情包上传失败，跳过本次发图: %s", error)
             return None
         if not isinstance(response, dict):

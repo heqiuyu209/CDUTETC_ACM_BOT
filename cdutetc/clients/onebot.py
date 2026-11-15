@@ -171,7 +171,7 @@ class OneBotClient(BaseBotClient):
         """连接后取一次登录账号；失败只降级为取不到自身标识，不影响收发。"""
         try:
             resp = await self.call_api("get_login_info")
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.debug("获取 OneBot 登录账号失败", exc_info=True)
             return
         data = (resp or {}).get("data")
@@ -195,7 +195,7 @@ class OneBotClient(BaseBotClient):
                 )
                 try:
                     await ws.close()
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.debug("关闭静默连接时出错", exc_info=True)
                 return
 

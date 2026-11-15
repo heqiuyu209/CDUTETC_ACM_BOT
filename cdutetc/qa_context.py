@@ -53,7 +53,7 @@ def week_sessions(group_id: str, now: datetime | None = None,
         return []
     try:
         sessions = db.list_training_sessions(gid, active_only=False)
-    except Exception:  # noqa: BLE001 - 读库异常不应阻断问答
+    except Exception:
         logger.warning("问答上下文读取课程失败，按无课程处理 [group=%s]", gid, exc_info=True)
         return []
 
@@ -76,7 +76,7 @@ def week_sessions(group_id: str, now: datetime | None = None,
             try:
                 if not db.training_occurrence_valid(session, start):
                     continue
-            except Exception:  # noqa: BLE001 - 生效期校验失败按无效处理
+            except Exception:
                 logger.warning("课程生效期校验失败 [session=%s]", session.get("id"), exc_info=True)
                 continue
             out.append({
@@ -105,7 +105,7 @@ def weekly_courses(group_id: str, now: datetime | None = None) -> list[dict]:
         return []
     try:
         sessions = db.list_training_sessions(gid, active_only=False)
-    except Exception:  # noqa: BLE001 - 读库异常不应阻断问答
+    except Exception:
         logger.warning("问答上下文读取周常课程失败 [group=%s]", gid, exc_info=True)
         return []
     monday = current.date() - timedelta(days=current.weekday())
@@ -141,7 +141,7 @@ def open_collections(group_id: str) -> list[dict]:
         return []
     try:
         collections = db.list_collections(gid, status="open")
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("问答上下文读取征集失败，按无征集处理 [group=%s]", gid, exc_info=True)
         return []
     out: list[dict] = []
@@ -149,7 +149,7 @@ def open_collections(group_id: str) -> list[dict]:
         remaining = None
         try:
             remaining = db.summarize_collection(item["id"]).get("remaining")
-        except Exception:  # noqa: BLE001 - 名额统计失败不影响列出征集
+        except Exception:
             logger.warning("问答上下文统计名额失败 [collection=%s]", item.get("id"), exc_info=True)
         out.append({
             "id": item.get("id"),
@@ -168,7 +168,7 @@ def faq_pairs(group_id: str, limit: int = MAX_FAQ_ITEMS) -> list[dict]:
         return []
     try:
         items = db.list_faq(gid)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("问答上下文读取 FAQ 失败，按无 FAQ 处理 [group=%s]", gid, exc_info=True)
         return []
     out: list[dict] = []

@@ -168,7 +168,7 @@ async def classify_intent(text: str) -> str:
         raw = await asyncio.wait_for(_chat_once(
             system, text[:min(1200, config.LLM_MAX_INPUT_CHARS)], json_mode=True, max_tokens=32,
         ), timeout=3)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("意图分类调用失败: %s", type(e).__name__)
         return "other"
     data = _load_json_object(raw)
@@ -523,14 +523,14 @@ def _run_coroutine_sync(factory, timeout: float):
     except RuntimeError:
         try:
             return asyncio.run(_guarded()), None
-        except Exception as exc:  # noqa: BLE001 - 提炼失败必须降级而非中断入库
+        except Exception as exc:
             return None, exc
     box: dict[str, object] = {}
 
     def _worker():
         try:
             box["value"] = asyncio.run(_guarded())
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             box["error"] = exc
 
     thread = threading.Thread(target=_worker, daemon=True)

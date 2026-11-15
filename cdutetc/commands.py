@@ -983,7 +983,7 @@ def _prepare_requirement(raw_text: str, title: str, category: str = "课程") ->
         return "", False
     try:
         return llm.summarize_entry_with_llm(category, title, text)
-    except Exception as exc:  # noqa: BLE001 - 提炼是增强项，异常一律降级
+    except Exception as exc:
         logger.warning("要求提炼异常，按原文入库：%s", exc)
         return text, False
 
@@ -1921,7 +1921,7 @@ async def cmd_trigger_fetch(group_id: str, sender: str, args: str) -> list[dict]
                      "text": "赛程自动抓取未开启（AUTO_CONTEST_CRAWL_ENABLED=False）"}]
         try:
             items = await crawler.run_contest_fetch()
-        except Exception as e:  # noqa: BLE001 - 对外只报一句可读原因
+        except Exception as e:
             return [{"group_id": group_id, "text": f"赛程抓取失败：{e}"}]
         created = [i for i in items if i.get("kind") == "created"]
         exists = [i for i in items if i.get("kind") == "exists"]
@@ -1987,7 +1987,7 @@ def _private_header(origin_sender: str) -> str:
     from cdutetc import group_admin
     try:
         gid = group_admin.active_workspace(origin_sender)
-    except Exception:  # noqa: BLE001 - 标牌渲染失败不应打断命令链路
+    except Exception:
         gid = ""
     if gid and gid in config.ALLOWED_GROUPS:
         alias_name, numeric = _group_alias_parts(gid)
@@ -2288,8 +2288,21 @@ CAPABILITY_TEXT = """【我能做的事】
 - 自动提醒：比赛报名截止、开赛，征集截止，课程开课，按管理员设置提醒群里
 - 报名：群里发起的征集，可以直接用 /报名 参加
 - 发布：老师把比赛信息发给我，我整理后由超管确认，再按设置通知群里
+- 闲聊：@我 随便聊两句也行，接梗、吐槽 WA 都可以
 
 有问题直接 @我 就行。"""
+
+
+# 非问句、FAQ 未命中时的本地寒暄兜底。拟人聊天开启后由 persona_chat 接管改写，
+# 这里提成常量，既避免字面量散落，也让上层能识别「这只是兜底而非真答」。
+SOCIAL_FALLBACK_TEXT = "我在呢～有想问的直接说就好。"
+
+
+def is_social_fallback(replies: list[dict] | None) -> bool:
+    """判断回复是否只是寒暄兜底（空回复或仅兜底一句），可被拟人聊天接管。"""
+    texts = [str(reply.get("text") or "").strip() for reply in (replies or [])
+             if reply.get("text")]
+    return not texts or all(text == SOCIAL_FALLBACK_TEXT for text in texts)
 
 
 async def handle_non_command_message(text: str, group_id: str, sender: str,
@@ -2318,7 +2331,7 @@ async def handle_non_command_message(text: str, group_id: str, sender: str,
     if faq is not None:
         return [{"group_id": group_id, "text": faq['answer']}]
     if not is_request:
-        return ([{"group_id": group_id, "text": "我在呢～有想问的直接说就好。"}]
+        return ([{"group_id": group_id, "text": SOCIAL_FALLBACK_TEXT}]
                 if config.QA_SOCIAL_CHAT_ENABLED else [])
     # 能力类提问用固定话术，避免模型臆造「我不能自动提醒」这类错误结论
     if content_filter.is_capability_query(text):
@@ -2363,7 +2376,7 @@ async def _answer_question_with_context(text: str, group_id: str) -> str:
         return await llm.answer_question(
             text, db.list_question_contests(group_id), group_context=group_context,
         )
-    except Exception:  # noqa: BLE001 - 模型异常统一降级，不打断群聊
+    except Exception:
         return "模型暂时不可用，请稍后再试~"
 
 

@@ -44,6 +44,7 @@ from cdutetc import (
     llm,
     memes,
     notifications,
+    persona_chat,
     roles,
     teacher_intent,
 )
@@ -507,6 +508,19 @@ class ACMBot:
                 coalesce=True,
             )
             await self._weekly_contest_job(now=now)
+        if config.PERSONA_CHAT_ENABLED:
+            # 每日三次生活状态机：12:30 / 18:30 / 23:00（Asia/Shanghai）各切一句，
+            # 零 Token（内置语料），打断/重启后 coalesce 只补一次，不重复刷库。
+            for hour, minute in persona_chat.DAILY_STATE_SLOTS:
+                sched.add_job(
+                    self._persona_state_job,
+                    "cron",
+                    hour=hour,
+                    minute=minute,
+                    id=f"persona-daily-state-{hour:02d}{minute:02d}",
+                    max_instances=1,
+                    coalesce=True,
+                )
         sched.start()
         self.sched = sched
         logger.info(
@@ -793,6 +807,13 @@ class ACMBot:
                     and await self._handle_chat_fun(
                         message, text, group_id, self._extract_member_id(message))):
                 return
+            # 拟人化插话：普通队员的闲聊在「高潮」时才可能被接一句（2 分钟 ≥12 条、
+            # 距上次插话 ≥60 分钟、5% 概率）；不满足就完全安静，照旧被忽略。
+            if (not addressed
+                    and not text.startswith("/")
+                    and match_publish_command(text, config.PUBLISH_CMD) is None
+                    and await self._maybe_persona_interject(message, text, group_id)):
+                return
             # 群内默认必须 @ 本机器人 才响应（含命令），避免抢答他人命令；
             # ACM_GROUP_REQUIRE_AT=0 时回退为“无 @ 也受理显式命令”。
             if config.GROUP_REQUIRE_AT:
@@ -846,9 +867,25 @@ class ACMBot:
                 if not db.group_switch_enabled(group_id, "qa_enabled"):
                     logger.info("本群问答开关已关闭，跳过自动回答")
                     return
+                # 寒暄先交给 persona：比固定话术更像人，也避免为一句「在吗」调两遍模型；
+                # QA_SOCIAL_CHAT_ENABLED 关闭表示运维不想闲聊，此时不进 persona。
+                if (config.PERSONA_CHAT_ENABLED and config.QA_SOCIAL_CHAT_ENABLED
+                        and content_filter.is_social_chat(text)
+                        and await self._handle_persona_chat(
+                            message, text, group_id, member_id)):
+                    return
                 replies = await commands.handle_non_command_message(
                     text, group_id, member_id, staff=can_manage_group(member_id)
                 )
+                # 拟人化闲聊兜底：非问句、FAQ 未命中时 commands 只会回一句「我在呢」，
+                # 这类接梗更适合走 persona（更省 token 也更像人）。模型不可用时
+                # _handle_persona_chat 返回 False，原兜底回复照常发出，功能不退化。
+                if (config.PERSONA_CHAT_ENABLED
+                        and commands.is_social_fallback(replies)
+                        and not content_filter.is_information_request(text)
+                        and await self._handle_persona_chat(
+                            message, text, group_id, member_id)):
+                    return
                 # 五层防护-5：输出过滤（FAQ/模型回答统一二次敏感检查、长度截断、禁超长链接）
                 if replies:
                     replies = [
@@ -1123,7 +1160,7 @@ class ACMBot:
                 try:
                     db.save_meme_file_cache(group_id, trigger.relative_path, file_info,
                                             ttl_seconds=ttl_seconds)
-                except Exception:  # noqa: BLE001 - 缓存写失败绝不影响本次发送
+                except Exception:
                     logger.warning("表情包 file_info 缓存写入失败，本次仍继续发送")
             seq = _clamp_reply_seq(_reply_sequence.get() + 1)
             _reply_sequence.set(seq)
@@ -1134,6 +1171,120 @@ class ACMBot:
         except Exception:
             logger.exception("表情包发送失败，跳过")
             return False
+
+    async def _persona_state_job(self) -> None:
+        """每日生活状态切换：从内置语料随机取一句写入 bot_daily_state。"""
+        try:
+            status = await persona_chat.daily_state_job()
+            logger.info("机器人生活状态已切换：%s", status)
+        except Exception:
+            # 状态机失败只是聊天少一句当下状态，不能影响其它定时任务。
+            logger.exception("生活状态切换失败，保留原状态")
+
+    def _nickname_of(self, message: OneBotMessage, member_id: str) -> str:
+        """取发言人群昵称（OneBot sender.card/nickname、官方 author.username）。
+
+        取不到就退化成「群友+尾号」：拟人聊天需要称呼，但绝不能因此丢消息。
+        """
+        raw = getattr(message, "raw", None)
+        if isinstance(raw, dict):
+            sender = raw.get("sender")
+            if isinstance(sender, dict):
+                for key in ("card", "nickname"):
+                    name = sender.get(key)
+                    if isinstance(name, str) and name.strip():
+                        return name.strip()[:16]
+            author = raw.get("author")
+            if isinstance(author, dict):
+                for key in ("username", "nickname"):
+                    name = author.get(key)
+                    if isinstance(name, str) and name.strip():
+                        return name.strip()[:16]
+        tail = str(member_id or "")[-4:]
+        return f"群友{tail}" if tail else "群友"
+
+    async def _handle_persona_chat(self, message: OneBotMessage, text: str,
+                                   group_id: str, member_id: str,
+                                   *, remember: bool = True) -> bool:
+        """@机器人 的日常闲聊/接梗：低 Token 拟人回复 + 记忆积累 + 表情包顺风车。
+
+        Returns:
+            True  → 已回应（纯文本、或仅一张表情包），调用方直接返回；
+            False → 没发出任何东西（未配模型 / 模型失败 / 回复被过滤），
+                    调用方继续原有兜底逻辑，关掉开关或没配 Key 时功能不退化。
+        """
+        if not config.PERSONA_CHAT_ENABLED:
+            return False
+        body = (text or "").strip()
+        if not body or body.startswith("/"):
+            return False
+        memory = persona_chat.get_memory()
+        nickname = self._nickname_of(message, member_id)
+        # 上下文要在记录本条之前取，否则「要回的那句话」会在上下文里出现两次。
+        context = memory.recent(group_id)
+        if remember:
+            memory.observe(group_id, nickname, body)
+        # 0 Token 个人记忆：命中口语模板就用确定性规则截一句标签，绝不额外调模型。
+        fact = persona_chat.extract_memory_fact(body)
+        if fact:
+            try:
+                db.add_memory_fact(group_id, member_id, fact)
+            except sqlite3.Error:
+                logger.warning("个人记忆写入失败，已跳过本条记忆", exc_info=True)
+        facts: list[str] = []
+        try:
+            facts = db.list_memory_facts(group_id, member_id,
+                                         limit=persona_chat.MEMORY_FACTS_INJECT)
+        except sqlite3.Error:
+            logger.warning("个人记忆读取失败，本次不注入记忆", exc_info=True)
+        try:
+            status_text = db.get_daily_state()["status_text"]
+        except sqlite3.Error:
+            status_text = db.DEFAULT_DAILY_STATUS
+            logger.warning("生活状态读取失败，本次用默认状态", exc_info=True)
+        system, user = persona_chat.build_conversation(
+            nickname=nickname, text=body, status_text=status_text,
+            facts=facts, context=context,
+        )
+        try:
+            raw_reply = await persona_chat.chat(system, user)
+        except Exception:
+            # 闲聊失败一律回退原有回复链路：不能因为模型抖一下就整条消息无人应。
+            logger.exception("拟人聊天调用失败，回退原有回复链路")
+            return False
+        reply, category = persona_chat.split_meme_tag(raw_reply)
+        if not reply and not category:
+            return False
+        if reply:
+            await self._safe_reply(message, reply)
+            # 机器人自己那句也进滑窗，后续几轮才不会答非所问。
+            memory.observe(group_id, "学姐", reply)
+        # 表情包顺风车：分类由本条回复明确指定，直接复用阶段二链路，
+        # 不走关键词判定（因此天然跳过关键词冷却），任一前置条件缺失即安静不发。
+        if reply and category and config.MEME_ENABLED:
+            await self._send_meme(message, group_id, category)
+        return bool(reply)
+
+    async def _maybe_persona_interject(self, message: OneBotMessage, text: str,
+                                       group_id: str) -> bool:
+        """群聊高潮时的低频主动插话：条数、冷却、概率三重闸门全过才说话。
+
+        普通群消息先入滑窗（作为后续上下文），再交给闸门判定；闸门不通过就
+        完全安静，绝不让机器人变成刷屏源头。
+        """
+        if not config.PERSONA_CHAT_ENABLED:
+            return False
+        member_id = self._extract_member_id(message)
+        try:
+            persona_chat.get_memory().observe(
+                group_id, self._nickname_of(message, member_id), text)
+            if not persona_chat.get_gate().observe(group_id):
+                return False
+        except Exception:
+            logger.exception("插话闸门判定失败，保持安静")
+            return False
+        return await self._handle_persona_chat(message, text, group_id, member_id,
+                                              remember=False)
 
     async def _handle_publish(self, message: OneBotMessage, text: str,
                               group_id: str, member_id: str):
@@ -1340,7 +1491,7 @@ class ACMBot:
             query = getattr(self.client, "get_group_active_permission", None)
             try:
                 state = await asyncio.wait_for(query(target), timeout=6.0) if callable(query) else None
-            except Exception:  # noqa: BLE001 - 状态读取失败不能抹掉真实发送回执
+            except Exception:
                 state = None
             if state is not None and state.allowed is not None:
                 answer += f"\n平台群设置：allow_proactive_msg={'true' if state.allowed else 'false'}"
@@ -1416,7 +1567,7 @@ class ACMBot:
                 f"请超管私聊机器人发送：/加群 {group_id}",
                 reply_to=str(getattr(message, "id", "") or ""), reply_seq=seq,
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("未授权群提示发送失败: %s", group_id)
 
     # ---------- 定时任务回调 ----------
@@ -1481,7 +1632,7 @@ class ACMBot:
         try:
             await check_general_reminders(self._send_group_result)
             await check_custom_reminders(self._send_group_result)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("通用提醒扫描失败，等待下一轮重试")
 
     async def _daily_digest_job(self, now: datetime | None = None) -> int:
@@ -1522,7 +1673,7 @@ class ACMBot:
                         skipped += 1
                         continue
                     result = await self._send_group_result(group_id, text)
-                except Exception:  # noqa: BLE001 - 单群异常不得中断其余群
+                except Exception:
                     logger.exception("[晨报] 群 %s 生成或发送异常，继续下一个群", group_id)
                     continue
                 if result.ok:
@@ -1536,7 +1687,7 @@ class ACMBot:
                 else:
                     logger.warning("[晨报] 群 %s 未发送 [%s]",
                                    group_id, getattr(result.code, "value", result.code))
-        except Exception:  # noqa: BLE001 - 循环外的兜底，异常不得逸出调度器
+        except Exception:
             logger.exception("[晨报] 本次调度执行异常，跳过本轮等待下次触发")
         if sent:
             logger.info("[晨报] 本次成功推送 %d 个群的事务总览", sent)
@@ -1554,7 +1705,7 @@ class ACMBot:
             return
         try:
             await self._create_weekly_contest(now=now)
-        except Exception:  # noqa: BLE001 - DB 锁/时区等意外异常统一兜底，不向上抛出
+        except Exception:
             logger.exception("[周赛] 本轮调度执行异常，跳过本轮等待下次触发")
 
     async def _create_weekly_contest(self, now: datetime | None = None) -> None:
@@ -1602,7 +1753,7 @@ class ACMBot:
         """
         try:
             await crawler.run_fetch(send_group=self._send_group_result)
-        except Exception:  # noqa: BLE001 - 网络/解析/DB 异常统一兜底，不逸出调度器
+        except Exception:
             logger.exception("[抓取] 本轮调度执行异常，跳过本轮等待下次触发")
 
     async def _contest_crawl_job(self):
@@ -1616,7 +1767,7 @@ class ACMBot:
             results = await crawler.run_contest_fetch()
             created = sum(1 for item in results if item.get("kind") == "created")
             logger.info("[赛程抓取] 本轮处理 %s 条，新建 %s 条", len(results), created)
-        except Exception:  # noqa: BLE001 - 赛程抓取失败同样不逸出调度器
+        except Exception:
             logger.exception("[赛程抓取] 本轮执行异常，跳过本轮等待下次触发")
 
 

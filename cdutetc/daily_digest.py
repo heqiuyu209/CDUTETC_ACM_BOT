@@ -111,7 +111,7 @@ def today_sessions(group_id: str, now: datetime | None = None) -> list[dict]:
     out: list[dict] = []
     try:
         sessions = db.list_training_sessions(gid, active_only=False)
-    except Exception:  # noqa: BLE001 - 读库异常不应让整份日报失败
+    except Exception:
         logger.warning("晨报读取课程失败，按无课程处理 [group=%s]", gid, exc_info=True)
         return []
     for session in sessions:
@@ -152,7 +152,7 @@ def soon_collections(group_id: str, now: datetime | None = None,
         return []
     try:
         collections = db.list_collections(gid, status="open")
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("晨报读取征集失败，按无征集处理 [group=%s]", gid, exc_info=True)
         return []
     out: list[dict] = []
@@ -167,7 +167,7 @@ def soon_collections(group_id: str, now: datetime | None = None,
         try:
             summary = db.summarize_collection(item["id"])
             remaining = summary.get("remaining")
-        except Exception:  # noqa: BLE001 - 名额统计失败不影响列出征集
+        except Exception:
             logger.warning("征集名额统计失败 [collection=%s]", item.get("id"), exc_info=True)
         out.append({
             "id": item.get("id"),
@@ -194,7 +194,7 @@ def soon_competitions(group_id: str, now: datetime | None = None,
         return []
     try:
         competitions = db.list_group_competitions(gid)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("晨报读取比赛失败，按无赛事处理 [group=%s]", gid, exc_info=True)
         return []
     from cdutetc import reminder_preflight
@@ -217,7 +217,7 @@ def soon_competitions(group_id: str, now: datetime | None = None,
                     continue
                 if config.WEEKLY_CONTEST_GROUPS and gid not in config.WEEKLY_CONTEST_GROUPS:
                     continue
-        except Exception:  # noqa: BLE001 - 无法确认可见性或投递状态时跳过
+        except Exception:
             logger.warning("比赛状态检查异常，跳过 [contest=%s]", contest.get("id"), exc_info=True)
             continue
         out.append({
@@ -253,7 +253,7 @@ def today_competitions(group_id: str, now: datetime | None = None) -> list[dict]
         return []
     try:
         competitions = db.list_group_competitions(gid)
-    except Exception:  # noqa: BLE001 - 读库异常按无赛事处理
+    except Exception:
         logger.warning("晨报读取比赛失败，按无比赛处理 [group=%s]", gid, exc_info=True)
         return []
     from cdutetc import reminder_preflight
@@ -276,7 +276,7 @@ def today_competitions(group_id: str, now: datetime | None = None) -> list[dict]
                 )
                 if not ready:
                     continue
-        except Exception:  # noqa: BLE001 - 无法确认可见性时跳过
+        except Exception:
             logger.warning("比赛状态检查异常，跳过 [contest=%s]", contest.get("id"), exc_info=True)
             continue
         out.append({
@@ -307,7 +307,7 @@ def today_reminders(group_id: str, now: datetime | None = None) -> list[dict]:
     try:
         # 只看待办：已发送（done）或取消（cancelled）的不该再出现在今日总览里。
         reminders = db.list_custom_reminders(gid, statuses=("pending",))
-    except Exception:  # noqa: BLE001 - 读库异常按无安排处理
+    except Exception:
         logger.warning("晨报读取自定义提醒失败，按无安排处理 [group=%s]", gid, exc_info=True)
         return []
     out: list[dict] = []

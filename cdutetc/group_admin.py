@@ -55,7 +55,7 @@ _TEST_GROUP_HINTS = ("测试", "test", "demo", "调试", "沙盒", "sandbox", "�
 def _safe_name(gid: str) -> str:
     try:
         return _name(gid) or ""
-    except Exception:  # noqa: BLE001 - 群名只是择优参考，取不到就退回群号
+    except Exception:
         return ""
 
 
@@ -91,7 +91,7 @@ def active_workspace(sender: str = "", *, fallback: bool = True) -> str:
     try:
         if db.has_admin_workspace(sender):
             return ""
-    except Exception:  # noqa: BLE001 - 库不可用时按未选定处理
+    except Exception:
         return ""
     return default_workspace()
 

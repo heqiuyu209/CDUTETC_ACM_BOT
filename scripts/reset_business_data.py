@@ -37,6 +37,9 @@ CONFIG_TABLES = (
     "group_settings",
     # 超管私聊工作区（user_openid → 目标群 openid）：属运行态偏好，保留可免重置后重选群。
     "admin_workspaces",
+    # 机器人长期记忆（个人特征标签 + 当前生活状态）：属机器人人格数据，
+    # 重置业务数据时一律保留，否则重置一次就「失忆」一次。
+    "bot_memory_facts", "bot_daily_state",
 )
 
 
