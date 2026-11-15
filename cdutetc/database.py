@@ -463,7 +463,9 @@ CREATE TABLE IF NOT EXISTS meme_hashes (
     tags       TEXT NOT NULL DEFAULT '',
     file_path  TEXT NOT NULL DEFAULT '',
     deleted    INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT ''
+    created_at TEXT NOT NULL DEFAULT '',
+    dhash      TEXT NOT NULL DEFAULT '',
+    cleaned    INTEGER NOT NULL DEFAULT 0
 )
 """
 
@@ -706,6 +708,21 @@ def _migrate_group_switches(conn: sqlite3.Connection) -> None:
         logger.warning("group_settings 表结构不完整，分群开关使用默认值")
 
 
+def _migrate_meme_hash_columns(conn: sqlite3.Connection) -> None:
+    """为旧库的 meme_hashes 补 dhash / cleaned 列（幂等）。
+
+    dhash 支撑「相似图去重」（汉明距离），cleaned 标记「因分类超限被腾容量的图」：
+    这类记录只表示文件已删，不算黑名单，同图再次出现仍可收录。
+    """
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(meme_hashes)")}
+    if "dhash" not in columns:
+        conn.execute("ALTER TABLE meme_hashes ADD COLUMN dhash TEXT NOT NULL DEFAULT ''")
+    if "cleaned" not in columns:
+        conn.execute("ALTER TABLE meme_hashes ADD COLUMN cleaned INTEGER NOT NULL DEFAULT 0")
+
+
 def init_db() -> None:
     """初始化数据库：建表 + 旧库迁移 + 索引。程序启动时调用一次。"""
     conn = _connect()
@@ -729,6 +746,7 @@ def init_db() -> None:
             _migrate_reminder_deliveries(conn)
             _migrate_training_requirement(conn)
             _migrate_group_switches(conn)
+            _migrate_meme_hash_columns(conn)
             for ddl in _INDEX_DDL:
                 conn.execute(ddl)
             _migrate_source_activity(conn)
@@ -4542,6 +4560,20 @@ def meme_collect_enabled(group_id: str) -> bool:
     return value.strip().lower() == _MEME_COLLECT_ON
 
 
+_MEME_HASH_COLUMNS = "md5, category, tags, file_path, deleted, created_at, dhash, cleaned"
+
+
+def _meme_hash_row(row) -> dict | None:
+    """把小表行转成字典；列顺序按 _MEME_HASH_COLUMNS，尾部兼容老查询。"""
+    if row is None:
+        return None
+    record = {"md5": row[0], "category": row[1], "tags": row[2], "file_path": row[3],
+              "deleted": bool(row[4]), "created_at": row[5]}
+    record["dhash"] = (row[6] or "") if len(row) > 6 else ""
+    record["cleaned"] = bool(row[7]) if len(row) > 7 else False
+    return record
+
+
 def get_meme_hash(md5: str) -> dict | None:
     """按 MD5 取一条收图台账；不存在返回 None。"""
     value = _as_str(md5)
@@ -4549,33 +4581,59 @@ def get_meme_hash(md5: str) -> dict | None:
         return None
     with _connect() as conn:
         row = conn.execute(
-            "SELECT md5, category, tags, file_path, deleted, created_at"
-            " FROM meme_hashes WHERE md5 = ?",
+            f"SELECT {_MEME_HASH_COLUMNS} FROM meme_hashes WHERE md5 = ?",
             (value,),
         ).fetchone()
-    if row is None:
-        return None
-    return {"md5": row[0], "category": row[1], "tags": row[2], "file_path": row[3],
-            "deleted": bool(row[4]), "created_at": row[5]}
+    return _meme_hash_row(row)
 
 
 def meme_hash_exists(md5: str) -> bool:
-    """该 MD5 是否已收过（含 deleted=1 的黑名单图，一律视为重复）。"""
-    return get_meme_hash(md5) is not None
+    """该 MD5 是否已收过（含 deleted=1 的黑名单图，一律视为重复）。
+
+    因分类超限被腾掉（cleaned=1）的记录不算：文件已经删了，同图再出现应当能重新收录。
+    """
+    record = get_meme_hash(md5)
+    if record is None:
+        return False
+    return not record.get("cleaned", False)
 
 
-def save_meme_hash(md5: str, category: str, tags: str, file_path: str) -> bool:
-    """登记一张新收的表情包；MD5 已存在（含黑名单）时不覆盖，返回 False。"""
+def save_meme_hash(md5: str, category: str, tags: str, file_path: str,
+                   dhash: str = "") -> bool:
+    """登记一张新收的表情包；MD5 已存在（含黑名单）时不覆盖，返回 False。
+
+    ``dhash`` 是相似图去重用的感知哈希，缺省空串表示「没算出来」，此时只按 MD5 查重。
+    唯一例外：该 MD5 之前因分类超限被腾掉（cleaned=1）时复活这条记录，
+    因为它的文件早已删除，重新收录并不算重复。
+    """
     value = _as_str(md5)
     if not value:
         raise ValueError("收图台账需要 MD5")
     with _connect() as conn:
+        params = (value, _as_str(category), _as_str(tags), _as_str(file_path),
+                  now_str(), _as_str(dhash))
         cur = conn.execute(
-            "INSERT INTO meme_hashes (md5, category, tags, file_path, deleted, created_at)"
-            " VALUES (?, ?, ?, ?, 0, ?) ON CONFLICT(md5) DO NOTHING",
-            (value, _as_str(category), _as_str(tags), _as_str(file_path), now_str()),
+            "INSERT INTO meme_hashes"
+            " (md5, category, tags, file_path, deleted, created_at, dhash)"
+            " VALUES (?, ?, ?, ?, 0, ?, ?) ON CONFLICT(md5) DO NOTHING",
+            params,
         )
-        return cur.rowcount > 0
+        if cur.rowcount > 0:
+            return True
+        row = conn.execute("SELECT cleaned FROM meme_hashes WHERE md5 = ?",
+                           (value,)).fetchone()
+        if not row or not row[0]:
+            return False  # 真的重复（或已进黑名单）：保持原记录不动
+        # 之前被分类上限腾掉的记录：整行重建而不是就地更新，让 created_at/rowid
+        # 一起排到队尾，否则复活的老记录会立刻又被当成「最旧」淘汰掉。
+        conn.execute("DELETE FROM meme_hashes WHERE md5 = ?", (value,))
+        conn.execute(
+            "INSERT INTO meme_hashes"
+            " (md5, category, tags, file_path, deleted, created_at, dhash)"
+            " VALUES (?, ?, ?, ?, 0, ?, ?)",
+            params,
+        )
+        return True
 
 
 def mark_meme_hash_deleted(md5: str, *, file_path: str = "") -> bool:
@@ -4592,6 +4650,23 @@ def mark_meme_hash_deleted(md5: str, *, file_path: str = "") -> bool:
         return cur.rowcount > 0
 
 
+def mark_meme_hash_cleaned(md5: str) -> bool:
+    """标记一条记录「因分类超限已腾出容量」。
+
+    与 :func:`mark_meme_hash_deleted` 的区别：不进黑名单，同 MD5/相似图再次出现仍可收录；
+    仅让 count_meme_hashes 与相似图去重不再把它算作现存素材。
+    """
+    value = _as_str(md5)
+    if not value:
+        return False
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE meme_hashes SET cleaned = 1 WHERE md5 = ?",
+            (value,),
+        )
+        return cur.rowcount > 0
+
+
 def find_meme_hash_by_path(file_path: str) -> dict | None:
     """按本地相对路径反查台账（/删图 用路径找到 MD5 再拉黑）。"""
     relative = _as_str(file_path)
@@ -4599,22 +4674,51 @@ def find_meme_hash_by_path(file_path: str) -> dict | None:
         return None
     with _connect() as conn:
         row = conn.execute(
-            "SELECT md5, category, tags, file_path, deleted, created_at"
-            " FROM meme_hashes WHERE file_path = ? ORDER BY created_at DESC LIMIT 1",
+            f"SELECT {_MEME_HASH_COLUMNS} FROM meme_hashes"
+            " WHERE file_path = ? ORDER BY created_at DESC LIMIT 1",
             (relative,),
         ).fetchone()
-    if row is None:
-        return None
-    return {"md5": row[0], "category": row[1], "tags": row[2], "file_path": row[3],
-            "deleted": bool(row[4]), "created_at": row[5]}
+    return _meme_hash_row(row)
+
+
+def list_meme_dhashes(*, include_deleted: bool = True) -> list[dict]:
+    """列出可用于相似图去重的感知哈希（``[{"md5", "dhash"}]``）。
+
+    默认包含 deleted=1 的黑名单图——删过的图换个压缩再发一次也不该被回收；
+    但已因分类超限腾掉（cleaned=1）的记录不参与，否则同一张图再也收不回来。
+    空 dhash（老库/算不出）不返回，避免误判。
+    """
+    sql = ("SELECT md5, dhash FROM meme_hashes"
+           " WHERE dhash != '' AND cleaned = 0")
+    if not include_deleted:
+        sql += " AND deleted = 0"
+    with _connect() as conn:
+        rows = conn.execute(sql).fetchall()
+    return [{"md5": row[0], "dhash": row[1]} for row in rows]
+
+
+def oldest_meme_hashes(category: str, *, limit: int = 1) -> list[dict]:
+    """取某分类最旧的若干条现存记录（FIFO 淘汰用），按 created_at 正序。"""
+    clean = _as_str(category)
+    if not clean:
+        return []
+    count = max(1, int(limit or 1))
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT md5, file_path, created_at FROM meme_hashes"
+            " WHERE category = ? AND deleted = 0 AND cleaned = 0"
+            " ORDER BY created_at ASC, rowid ASC LIMIT ?",
+            (clean, count),
+        ).fetchall()
+    return [{"md5": row[0], "file_path": row[1], "created_at": row[2]} for row in rows]
 
 
 def count_meme_hashes(*, category: str = "", include_deleted: bool = False) -> int:
-    """统计已收图数量（可按分类过滤），供 /管理 与 /偷图 回执展示。"""
+    """统计现有素材数量（可按分类过滤），供 /管理、/偷图 回执与 FIFO 淘汰判定。"""
     sql = "SELECT COUNT(*) FROM meme_hashes WHERE 1 = 1"
     params: list = []
     if not include_deleted:
-        sql += " AND deleted = 0"
+        sql += " AND deleted = 0 AND cleaned = 0"
     clean = _as_str(category)
     if clean:
         sql += " AND category = ?"

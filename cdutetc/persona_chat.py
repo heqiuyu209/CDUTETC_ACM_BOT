@@ -5,6 +5,8 @@
     bot_daily_state（一句当前生活状态）；前两层按群/按人隔离，第三层全局单行。
   - 省 Token 优先：Prompt 静态人设 + 一句状态 + 最近 6 条上下文 + 最近 2~3 条标签，
     总输入按 PROMPT_TOKEN_BUDGET 硬约束，超预算就按阶梯先砍上下文再砍记忆。
+  - 人设外置：静态人设文本放在 assets/persona.txt，每次生成对话热读取（改了即生效，
+    不用重启），文件缺失或为空时自动写入默认吉祥物学姐人设；人设过长仍受 Token 预算保护。
   - 0 Token 规则记忆：命中「我叫/我是/我擅长/…」等正则时用确定性规则截取短语写库，
     绝不为记一句话再调一次模型。
   - 表情包顺风车：模型可在回复尾部附带 [MEME:目录]，代码剥离后复用阶段二的表情包链路，
@@ -15,14 +17,52 @@
 
 from __future__ import annotations
 
+import logging
 import random
 import re
 import time
 from collections import deque
 from collections.abc import Callable
+from pathlib import Path
 
 from cdutetc import config, llm, memes
 from cdutetc import database as db
+
+logger = logging.getLogger(__name__)
+
+# ---------------- 外部人设文件 ----------------
+
+# 静态人设放在仓库 assets 下，方便不改代码直接调语气：
+# 改完保存即生效（按 mtime/size 热读取），不用重启服务。
+PERSONA_FILE = Path(__file__).resolve().parent.parent / "assets" / "persona.txt"
+
+# 文件顶部说明：{status} 是当前生活状态的占位符。
+_PERSONA_FILE_HEADER = (
+    "# 学姐人设提示词（热更新：改完保存即生效，无需重启服务）\n"
+    "# 占位符 {status} 会被替换成当前生活状态；整份文件不写这个占位符时，\n"
+    "# 状态行会自动追加到人设末尾。以 # 开头的行只是注释，不会进 Prompt。\n"
+    "\n"
+)
+
+# 默认人设（集训队吉祥物学姐）：文件缺失或为空时用这份兜底，并写回文件。
+DEFAULT_PERSONA = (
+    "你是成理工程 ACM 集训队的吉祥物学姐，群里都喊你学姐。\n"
+    "说话像划水的老队员：短、口语、带自嘲，每次只回 1~2 句。\n"
+    "黑话：WA、TLE、AK、大模拟、DP、线段树、补题、红温。\n"
+    "禁止客服腔：不说「作为AI助手」「有什么可以帮您」「很高兴为您服务」。\n"
+    "你现在的生活状态：{status}\n"
+    "若适合配图，分类只能从 ac、wa_tle、question、slacking、interrupt 里选一个，"
+    "在回复末尾附标签，例如 [MEME:ac]，最多一个。\n"
+    "如果用表情包回应最合适、不需要文字，就只输出所选分类的标签，不要写别的字。"
+)
+
+# 人设 + 状态最多占的 Token：剩下的留给上下文与原话，保证总预算守得住。
+SYSTEM_TOKEN_LIMIT = 400
+
+# 人设文件读取缓存：key 是绝对路径，value 是（(mtime_ns, size), 文本）。
+# 只有文件真的变了才重新读盘，避免每句话都做一次 IO。
+_persona_cache: dict[str, tuple[tuple[int, int], str]] = {}
+
 
 # ---------------- 每日生活状态机 ----------------
 
@@ -166,18 +206,110 @@ def clean_reply(text: str) -> str:
     return line[:REPLY_MAX_CHARS]
 
 
+def persona_path(path: Path | str | None = None) -> Path:
+    """当前生效的人设文件路径；测试可传自定义路径。"""
+    return Path(path) if path is not None else Path(PERSONA_FILE)
+
+
+def strip_persona_comments(text: str) -> str:
+    """去掉以 # 开头的注释行与首尾空行：注释只给人看，不进 Prompt。"""
+    lines = [line for line in str(text or "").splitlines() if not line.lstrip().startswith("#")]
+    return "\n".join(lines).strip()
+
+
+def write_default_persona(path: Path | str | None = None) -> bool:
+    """把人设模板写到磁盘（附注释头）；目录不存在时自动创建。"""
+    target = persona_path(path)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_PERSONA_FILE_HEADER + DEFAULT_PERSONA + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning("写入默认人设文件失败：%s", exc)
+        return False
+    return True
+
+
+def reset_persona_cache() -> None:
+    """清空人设读取缓存（测试用；正常运行靠 mtime 自动失效）。"""
+    _persona_cache.clear()
+
+
+def load_persona(path: Path | str | None = None) -> str:
+    """热读取人设文本：文件变了立刻生效，读不到就用默认人设并落盘。
+
+    缓存键用 (mtime_ns, size)：文件一被编辑签名就变，下次调用重新读盘，
+    因此改完 assets/persona.txt 不需要重启服务。
+    """
+    target = persona_path(path)
+    key = str(target)
+    try:
+        stamp = target.stat()
+        signature: tuple[int, int] | None = (stamp.st_mtime_ns, stamp.st_size)
+    except OSError:
+        signature = None
+    cached = _persona_cache.get(key)
+    if signature is not None and cached and cached[0] == signature:
+        return cached[1]
+    text = ""
+    if signature is not None:
+        try:
+            text = strip_persona_comments(target.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning("读取人设文件失败，改用默认人设：%s", exc)
+    if not text:
+        # 文件不存在 / 为空 / 读不出：写回默认人设，下次就有基线可改了
+        text = DEFAULT_PERSONA
+        if write_default_persona(target):
+            try:
+                stamp = target.stat()
+                signature = (stamp.st_mtime_ns, stamp.st_size)
+            except OSError:
+                signature = (0, 0)
+    _persona_cache[key] = (signature or (0, 0), text)
+    return text
+
+
+def render_persona(persona: str, status_text: str) -> str:
+    """把人设里的 {status} 换成当前生活状态；没有占位符就补一行在末尾。"""
+    body = strip_persona_comments(persona) or DEFAULT_PERSONA
+    status = str(status_text or "").strip() or db.DEFAULT_DAILY_STATUS
+    if "{status}" in body:
+        return body.replace("{status}", status)
+    return f"{body}\n你现在的生活状态：{status}"
+
+
+def fit_persona(persona: str, status_text: str, *, limit: int = SYSTEM_TOKEN_LIMIT) -> str:
+    """把（人设 + 状态）压进 limit Token 内：先删尾部附加说明，保住状态行。
+
+    人设文件可以写很长，但 Prompt 预算不能让一句话把整轮单价顶飞；
+    真超预算时从后往前删非状态行，最后仍超就按字符硬截。
+    """
+    rendered = render_persona(persona, status_text)
+    if estimate_tokens(rendered) <= limit:
+        return rendered
+    status = str(status_text or "").strip() or db.DEFAULT_DAILY_STATUS
+    lines = rendered.splitlines()
+    status_index = next(
+        (index for index, line in enumerate(lines) if status and status in line), None)
+    while len(lines) > 1 and estimate_tokens("\n".join(lines)) > limit:
+        for index in range(len(lines) - 1, -1, -1):
+            if index != status_index:
+                lines.pop(index)
+                break
+        else:  # 只剩状态行也还超预算：停手，交给下面的字符硬截
+            break
+    fitted = "\n".join(lines)
+    while fitted and estimate_tokens(fitted) > limit:
+        fitted = fitted[:-20]
+    logger.warning("人设过长已截断到 %s Token 内（原 %s）", limit,
+                   estimate_tokens(rendered))
+    return fitted
+
+
 def _system_prompt(status_text: str) -> str:
-    """静态人设 + 一句当前状态：这部分几乎不变，是最省的写法。"""
-    return (
-        "你是成理工程 ACM 集训队的吉祥物学姐，群里都喊你学姐。\n"
-        "说话像划水的老队员：短、口语、带自嘲，每次只回 1~2 句。\n"
-        "黑话：WA、TLE、AK、大模拟、DP、线段树、补题、红温。\n"
-        "禁止客服腔：不说「作为AI助手」「有什么可以帮您」「很高兴为您服务」。\n"
-        f"你现在的生活状态：{status_text}\n"
-        "若适合配图，分类只能从 ac、wa_tle、question、slacking、interrupt 里选一个，"
-        "在回复末尾附标签，例如 [MEME:ac]，最多一个。\n"
-        "如果用表情包回应最合适、不需要文字，就只输出所选分类的标签，不要写别的字。"
-    )
+    """外部人设（热读取）+ 一句当前状态；超预算时先砍人设尾巴保状态。"""
+    status = str(status_text or "").strip() or db.DEFAULT_DAILY_STATUS
+    return fit_persona(load_persona(), status)
 
 
 def _user_prompt(*, nickname: str, text: str, facts: list[str],
@@ -392,7 +524,8 @@ def get_gate() -> InterjectionGate:
 
 
 def reset_engine() -> None:
-    """丢弃单例（测试隔离用）。"""
+    """丢弃单例（测试隔离用）。人设文件缓存一并清掉，避免跨用例串味。"""
     global _default_memory, _default_gate
     _default_memory = None
     _default_gate = None
+    reset_persona_cache()

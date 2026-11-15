@@ -33,6 +33,88 @@ def memory_db(tmp_path, monkeypatch):
         pass
 
 
+@pytest.fixture(autouse=True)
+def isolated_persona(tmp_path, monkeypatch):
+    """人设文件指向临时目录：用例绝不碰仓库里的 assets/persona.txt。"""
+    path = tmp_path / "persona.txt"
+    monkeypatch.setattr(persona_chat, "PERSONA_FILE", path)
+    persona_chat.reset_persona_cache()
+    yield path
+    persona_chat.reset_persona_cache()
+
+
+# ---------------- 外部人设文件 ----------------
+
+def test_persona_file_generated_with_default_when_missing(isolated_persona):
+    """文件不存在时：自动创建并写入默认吉祥物学姐人设。"""
+    assert not isolated_persona.exists()
+    system = persona_chat._system_prompt("刚点完外卖")
+    assert isolated_persona.is_file()
+    saved = isolated_persona.read_text(encoding="utf-8")
+    assert "{status}" in saved and "学姐" in saved
+    assert "刚点完外卖" in system
+    assert "学姐" in system
+    # 文件里的 # 说明行只给人看，不进 Prompt
+    assert "热更新：改完保存即生效" not in system
+
+
+def test_persona_file_hot_reload_without_restart(isolated_persona):
+    """改完文件立刻生效：不动进程、不调二次初始化。"""
+    isolated_persona.parent.mkdir(parents=True, exist_ok=True)
+    isolated_persona.write_text("第一版人设：你是学姐。\n状态：{status}\n", encoding="utf-8")
+    assert "第一版人设" in persona_chat._system_prompt("在机房")
+
+    isolated_persona.write_text("第二版人设：你是暴躁老哥，短句输出。\n状态：{status}\n",
+                                encoding="utf-8")
+    second = persona_chat._system_prompt("在机房")
+    assert "暴躁老哥" in second
+    assert "第一版人设" not in second
+    assert "在机房" in second
+
+
+def test_persona_without_status_placeholder_appends_status_line(isolated_persona):
+    isolated_persona.write_text("你是学姐，说话很短。", encoding="utf-8")
+    system = persona_chat._system_prompt("正在补题")
+    assert "你现在的生活状态：正在补题" in system
+
+
+def test_empty_persona_file_regenerated_with_default(isolated_persona):
+    """只写了注释 / 全空白的文件按「没配置」处理：回退默认并重写。"""
+    isolated_persona.write_text("  \n# 只有注释\n", encoding="utf-8")
+    system = persona_chat._system_prompt("摸鱼中")
+    assert "学姐" in system
+    assert "{status}" in isolated_persona.read_text(encoding="utf-8")
+
+
+def test_unreadable_persona_file_falls_back_to_default(tmp_path):
+    """路径读不出来（这里是目录）也不该炸：用默认人设继续聊天。"""
+    broken = tmp_path / "persona_dir.txt"
+    broken.mkdir()
+    assert "学姐" in persona_chat.load_persona(broken)
+
+
+def test_huge_persona_still_respects_token_budget(isolated_persona):
+    """人设写成长篇大论也不许顶爆预算：状态行优先保留，其余按需砍掉。"""
+    isolated_persona.write_text("人设废话。" * 500 + "\n状态：{status}\n", encoding="utf-8")
+    system = persona_chat._system_prompt("在机房摸鱼")
+    assert persona_chat.estimate_tokens(system) <= persona_chat.SYSTEM_TOKEN_LIMIT
+    assert "在机房摸鱼" in system
+    full_system, user = persona_chat.build_conversation(
+        nickname="小明", text="学姐这题怎么写" * 20,
+        status_text="在机房摸鱼", context=["[群友]: 又TLE了"] * 20,
+    )
+    total = persona_chat.estimate_tokens(full_system) + persona_chat.estimate_tokens(user)
+    assert total <= persona_chat.PROMPT_TOKEN_BUDGET
+
+
+def test_service_tone_filter_still_applies_with_custom_persona(isolated_persona):
+    """换人设不影响客服腔过滤：这类回复照旧整条丢弃。"""
+    isolated_persona.write_text("你是学姐，禁止客服腔。\n状态：{status}\n", encoding="utf-8")
+    persona_chat._system_prompt("在机房")
+    assert persona_chat.clean_reply("作为AI助手，很高兴为您服务") == ""
+    assert persona_chat.clean_reply("有什么可以帮您的吗") == ""
+
+
 # ---------------- Prompt 预算 ----------------
 
 

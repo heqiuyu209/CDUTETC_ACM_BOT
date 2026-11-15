@@ -19,6 +19,8 @@ def isolated(monkeypatch, tmp_path):
     conn = sqlite3.connect(":memory:")
     monkeypatch.setattr(db, "_connect", lambda: conn)
     db.init_db()
+    memes.reset_collect_limits()
+    monkeypatch.setattr(memes, "extract_image_text", lambda data: "")
     values = {
         "ALLOWED_GROUPS": {"10001"}, "BOT_QQ": "30001",
         "GROUP_REQUIRE_AT": True, "TEACHER_AUTO_INTENT_ENABLED": False,
@@ -41,6 +43,7 @@ def isolated(monkeypatch, tmp_path):
     persona_chat.reset_engine()
     yield
     conn.close()
+    memes.reset_collect_limits()
     memes.reset_engine()
     persona_chat.reset_engine()
 
@@ -313,13 +316,34 @@ async def test_official_active_media_recovers_once_after_403_cooldown(monkeypatc
     assert client.send_group_media_result.await_count == 1
     assert memes.get_engine().recent_sent("10001") == []
     clock.now += timedelta(minutes=5)
-    client.send_group_media_result.return_value = DeliveryResult(True, DeliveryCode.SENT, "qqbot")
-    results = await asyncio.gather(*[
-        bot._send_meme(message(), "10001", "question", proactive=True) for _ in range(3)])
-    assert results.count(True) == 1
+    # Python 3.12 的 wait_for 不保证额外让出事件循环。显式挂住平台回执，
+    # 才能验证「恢复尚未确认时只有一个请求在途」，而不是依赖 gather 的调度顺序。
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def pending_receipt(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return DeliveryResult(True, DeliveryCode.SENT, "qqbot")
+
+    client.send_group_media_result.side_effect = pending_receipt
+    probe = asyncio.create_task(bot._send_meme(message(), "10001", "question", proactive=True))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert db.get_group_notification_block("qqbot", "10001") is not None
+        results = await asyncio.gather(*[
+            bot._send_meme(message(), "10001", "question", proactive=True) for _ in range(2)])
+        assert results == [False, False]
+        assert client.send_group_media_result.await_count == 2
+    finally:
+        release.set()
+        recovered = await asyncio.wait_for(probe, timeout=1)
+    assert recovered
     assert client.send_group_media_result.await_count == 2
     assert db.get_group_notification_block("qqbot", "10001") is None
     assert db.get_group_notification_format("qqbot", "10001") == "markdown"
+    # 成功回执解除暂停，后续消息必须恢复正常发送，不能把整批误当成只准发一条。
+    assert await bot._send_meme(message(), "10001", "question", proactive=True)
+    assert client.send_group_media_result.await_count == 3
 
 
 async def test_official_active_media_respects_daily_quota(monkeypatch):
