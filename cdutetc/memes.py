@@ -339,6 +339,54 @@ def strip_cq_codes(text: str) -> str:
     return " ".join(_CQ_RE.sub(" ", str(text or "")).split())
 
 
+_URL_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
+
+
+def _read_field(item, name: str, default=None):
+    """兼容原始事件字典与 botpy SDK 对象两种取值方式。"""
+    if isinstance(item, dict):
+        return item.get(name, default)
+    return getattr(item, name, default)
+
+
+def normalize_image_url(url: str) -> str:
+    """补齐图片地址协议：官方附件常给 ``//host/...`` 或缺协议的裸域名。
+
+    没有协议头的地址 httpx 无法请求，这里统一补成 https；纯文件名原样返回。
+    """
+    target = str(url or "").strip()
+    if not target:
+        return ""
+    if target.startswith("//"):
+        return "https:" + target
+    if _URL_SCHEME_RE.match(target):
+        return target
+    head = target.split("/", 1)[0]
+    # 形如 multimedia.nt.qq.com.cn/xxx：第一段是域名且后面带路径，才补协议，
+    # 避免把本地文件名（a.jpg）误当域名。
+    if "/" in target and "." in head:
+        return "https://" + target
+    return target
+
+
+def _attachment_refs(items) -> list[dict]:
+    """把附件列表转成 ``[{"url", "file"}]``；非图片附件（content_type 非 image/*）跳过。"""
+    refs: list[dict] = []
+    if not isinstance(items, (list, tuple)):
+        return refs
+    for item in items:
+        content_type = str(_read_field(item, "content_type", "") or "")
+        if content_type and not content_type.startswith("image/"):
+            continue
+        url = normalize_image_url(_read_field(item, "url", "") or "")
+        name = str(
+            _read_field(item, "filename", "") or _read_field(item, "file", "") or ""
+        )
+        if url or name:
+            refs.append({"url": url, "file": name})
+    return refs
+
+
 def extract_image_refs(message) -> list[dict]:
     """从群消息里抠出图片引用：兼容 OneBot 段数组与官方附件两种结构。
 
@@ -357,15 +405,12 @@ def extract_image_refs(message) -> list[dict]:
                 name = str(data.get("file") or "")
                 if url or name:
                     refs.append({"url": url, "file": name})
-        attachments = raw.get("attachments")
-        if isinstance(attachments, list):
-            for item in attachments:
-                if not isinstance(item, dict):
-                    continue
-                url = str(item.get("url") or "")
-                name = str(item.get("filename") or item.get("file") or "")
-                if url or name:
-                    refs.append({"url": url, "file": name})
+        refs.extend(_attachment_refs(raw.get("attachments")))
+    if not refs:
+        # 兜底：QQBotMessage 未把 attachments 同步进 raw 时，直接读原始事件对象
+        source = getattr(message, "source", None)
+        if source is not None:
+            refs.extend(_attachment_refs(_read_field(source, "attachments", None)))
     if refs:
         return refs
     # 兜底：raw_message 里的 CQ 码（NapCat 某些配置只给字符串）

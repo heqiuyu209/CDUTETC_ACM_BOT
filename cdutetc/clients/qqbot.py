@@ -92,6 +92,11 @@ class QQBotMessage:
         # raw 保持「字典」形态，与 OneBotMessage 一致（main 里会调用 raw.get）。
         # 原始 botpy 对象另存到 source，便于排查问题。
         self.raw = {}
+        # 官方协议的图片只出现在 attachments 里（正文 content 为空串），
+        # 必须同步进 raw，否则 memes.extract_image_refs 拿不到任何图片地址。
+        attachments = _normalize_attachments(data)
+        if attachments:
+            self.raw["attachments"] = attachments
         self.source = data
         self.id = str(msg_id or "")
         self.message_type = message_type
@@ -117,6 +122,29 @@ class QQBotMessage:
 def _field(data, name: str, default=None):
     """兼容原始事件字典与 SDK 模型，保留旧 SDK 没有暴露的字段。"""
     return data.get(name, default) if isinstance(data, dict) else getattr(data, name, default)
+
+
+def _normalize_attachments(data) -> list[dict]:
+    """把入站消息的 attachments 规范成 ``[{"url", "filename", "content_type"}]``。
+
+    平台下发的附件可能是 botpy 的 Attachment 对象（属性访问），也可能是原始
+    事件字典里的 dict（键访问），两种形态都要兼容；丢弃无地址也无文件名的空附件。
+    """
+    raw_attachments = _field(data, "attachments", None)
+    if not isinstance(raw_attachments, (list, tuple)):
+        return []
+    normalized: list[dict] = []
+    for item in raw_attachments:
+        url = str(_field(item, "url", "") or "")
+        filename = str(_field(item, "filename", "") or _field(item, "file", "") or "")
+        content_type = str(
+            _field(item, "content_type", "") or _field(item, "contentType", "") or ""
+        )
+        if url or filename:
+            normalized.append(
+                {"url": url, "filename": filename, "content_type": content_type}
+            )
+    return normalized
 
 
 def _normalize_mention(item) -> dict:
