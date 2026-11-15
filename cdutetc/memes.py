@@ -339,6 +339,12 @@ def strip_cq_codes(text: str) -> str:
     return " ".join(_CQ_RE.sub(" ", str(text or "")).split())
 
 
+def _decode_cq_parameter(value) -> str:
+    """CQ 实体只还原一层；URL 自身的百分号编码必须保持不变。"""
+    return (str(value or "").replace("&#91;", "[").replace("&#93;", "]")
+            .replace("&#44;", ",").replace("&amp;", "&"))
+
+
 def extract_image_refs(message) -> list[dict]:
     """从群消息里抠出图片引用：兼容 OneBot 段数组与官方附件两种结构。
 
@@ -353,6 +359,8 @@ def extract_image_refs(message) -> list[dict]:
                 if not isinstance(seg, dict) or seg.get("type") != "image":
                     continue
                 data = seg.get("data") or {}
+                if not isinstance(data, dict):
+                    continue
                 url = str(data.get("url") or "")
                 name = str(data.get("file") or "")
                 if url or name:
@@ -361,6 +369,9 @@ def extract_image_refs(message) -> list[dict]:
         if isinstance(attachments, list):
             for item in attachments:
                 if not isinstance(item, dict):
+                    continue
+                content_type = str(item.get("content_type") or "").lower()
+                if content_type and not content_type.startswith("image/"):
                     continue
                 url = str(item.get("url") or "")
                 name = str(item.get("filename") or item.get("file") or "")
@@ -374,8 +385,9 @@ def extract_image_refs(message) -> list[dict]:
         params = dict(
             part.split("=", 1) for part in match.group(1).split(",") if "=" in part
         )
-        url = unquote(str(params.get("url") or ""))
-        name = unquote(str(params.get("file") or ""))
+        # CQ 参数使用实体转义，不能 URL-decode，否则会破坏签名与查询参数。
+        url = _decode_cq_parameter(params.get("url"))
+        name = _decode_cq_parameter(params.get("file"))
         if url or name:
             refs.append({"url": url, "file": name})
     return refs

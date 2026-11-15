@@ -72,17 +72,18 @@ class Capabilities:
     """纯能力位载体：给拿不到客户端实例的只读业务函数使用。"""
 
     __slots__ = ("protocol", "supports_passive_reply",
-                 "supports_numeric_group_id", "supports_markdown")
+                 "supports_numeric_group_id", "supports_markdown", "supports_local_image")
 
     #: QQ 群号的长度上限（超过即视为官方不透明 openid）
     QQ_NUMERIC_MAX_LEN = 12
 
     def __init__(self, protocol: str, *, passive_reply: bool,
-                 numeric_group_id: bool, markdown: bool) -> None:
+                 numeric_group_id: bool, markdown: bool, local_image: bool = False) -> None:
         self.protocol = protocol
         self.supports_passive_reply = passive_reply
         self.supports_numeric_group_id = numeric_group_id
         self.supports_markdown = markdown
+        self.supports_local_image = local_image
 
     def accepts_group_id(self, group_id: str) -> bool:
         """群标识是否可用于授权。
@@ -105,7 +106,7 @@ _PROTOCOL_CAPABILITIES: dict[str, Capabilities] = {
                           numeric_group_id=False, markdown=True),
     # OneBot / NapCat：数字 QQ 群号、纯文本、主动发送
     "onebot": Capabilities("onebot", passive_reply=False,
-                           numeric_group_id=True, markdown=False),
+                           numeric_group_id=True, markdown=False, local_image=True),
 }
 
 
@@ -145,6 +146,7 @@ def capabilities_of(client) -> Capabilities:
         numeric_group_id=_flag(client, "supports_numeric_group_id",
                                defaults.supports_numeric_group_id),
         markdown=_flag(client, "supports_markdown", defaults.supports_markdown),
+        local_image=_flag(client, "supports_local_image", defaults.supports_local_image),
     )
 
 

@@ -92,6 +92,17 @@ class QQBotMessage:
         # raw 保持「字典」形态，与 OneBotMessage 一致（main 里会调用 raw.get）。
         # 原始 botpy 对象另存到 source，便于排查问题。
         self.raw = {}
+        attachments = _field(data, "attachments", [])
+        if isinstance(attachments, (list, tuple)) and attachments:
+            self.raw["attachments"] = [
+                {key: _field(item, key, "") or ""
+                 for key in ("url", "filename", "file", "content_type")}
+                for item in attachments
+            ]
+        author = _field(data, "author")
+        names = {key: _field(author, key, "") for key in ("username", "nickname")}
+        if any(names.values()):
+            self.raw["author"] = names
         self.source = data
         self.id = str(msg_id or "")
         self.message_type = message_type
