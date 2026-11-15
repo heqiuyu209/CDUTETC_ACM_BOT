@@ -426,6 +426,16 @@ NL_INTENT_ENABLED = os.getenv("ACM_NL_INTENT_ENABLED", "1") != "0"
 # 群内普通消息一律不进意图管线（不做预过滤、不调模型）。
 TEACHER_AUTO_INTENT_ENABLED = os.getenv("ACM_TEACHER_AUTO_INTENT_ENABLED", "1") != "0"
 
+# ================= 群聊娱乐（零 Token，默认开启） =================
+# 跟风复读（+1）：群友连续刷同一句话时被动复读一遍，全程不调模型、不占主动额度。
+ECHO_ENABLED = os.getenv("ACM_ECHO_ENABLED", "1") != "0"
+# 关键词表情包：命中高频词（WA了/TLE/AK/摸鱼 等）时随机发一张表情包，同样只走被动回复。
+MEME_ENABLED = os.getenv("ACM_MEME_ENABLED", "1") != "0"
+# 表情包静态资源公网根地址（例如 https://cdn.example.com/memes）。
+# 官方协议发图要由平台按 URL 拉取图片，因此必须是公网可访问地址；
+# 留空则整条发图链路自动跳过，不影响其它任何功能。
+MEME_BASE_URL = os.getenv("ACM_MEME_BASE_URL", "").strip()
+
 # ================= 自动周赛（v2） =================
 # 在提前提醒窗口前按模板生成周赛，启动时补最近未来场次；默认不通知全员，
 # 超管确认后才通知全员或 /修正 调整/删除。地点不纳入管理。
@@ -521,6 +531,8 @@ RECOMMENDED_CONFIG = {
     "ACM_ALLOWED_GROUPS": ENV_ALLOWED_GROUPS,
     "ACM_TEACHER_WHITELIST": ENV_TEACHER_WHITELIST,
     "ACM_SUPER_ADMIN": SUPER_ADMIN,
+    # 表情包素材的公网根地址：不配只是不能发图，其它功能照常。
+    "ACM_MEME_BASE_URL": MEME_BASE_URL,
 }
 
 

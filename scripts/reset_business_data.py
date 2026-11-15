@@ -21,6 +21,8 @@ BUSINESS_TABLES = (
     "custom_reminders",
     # 老师隐式意图的待补全队列：未确认的候选安排，属业务数据。
     "teacher_intent_pending",
+    # 官方富媒体表情包的 file_info 缓存：属可重建的运行态缓存，随重置清空。
+    "meme_file_cache",
     "collection_responses", "collections", "unanswered_questions", "group_faq",
     "training_sessions", "org_events", "competition_pending_updates",
     "competition_versions", "competition_sources", "competition_notify_groups",

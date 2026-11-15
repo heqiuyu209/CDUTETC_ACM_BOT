@@ -441,6 +441,19 @@ CREATE TABLE IF NOT EXISTS teacher_intent_pending (
 )
 """
 
+# 官方富媒体表情包的 file_info 缓存：上传接口按群限流，同一张图在同一群
+# 有效期内直接复用 file_info，避免每次发图都重新走一遍上传。
+_MEME_FILE_CACHE_DDL = """
+CREATE TABLE IF NOT EXISTS meme_file_cache (
+    group_openid  TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    file_info     TEXT NOT NULL DEFAULT '',
+    expires_at    TEXT NOT NULL DEFAULT '',
+    updated_at    TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (group_openid, relative_path)
+)
+"""
+
 _INDEX_DDL = (
     "CREATE INDEX IF NOT EXISTS idx_contests_group ON contests(group_id)",
     "CREATE INDEX IF NOT EXISTS idx_reminders_group ON reminders(group_id)",
@@ -481,6 +494,7 @@ _ALL_DDL = (
     _GROUP_NOTIFICATION_BLOCKS_DDL, _GROUP_NOTIFICATION_SETTINGS_DDL,
     _GROUP_SETTINGS_DDL, _CUSTOM_REMINDERS_DDL, _AUDIT_LOG_DDL,
     _ADMIN_WORKSPACES_DDL, _TEACHER_INTENT_PENDING_DDL,
+    _MEME_FILE_CACHE_DDL,
 )
 
 
@@ -4393,6 +4407,79 @@ def resolve_teacher_intent_pending(pid: int, status: str = "resolved",
             (status, _as_str(operator), now_str(), key),
         )
         return cur.rowcount > 0
+
+
+# ================= 官方富媒体表情包 file_info 缓存 =================
+# 平台上传接口会返回 file_info 的 ttl（秒）；这里记录绝对过期时刻，
+# 过期即视为未命中，由调用方重新上传，绝不复用可能已失效的 file_info。
+MEME_FILE_CACHE_TTL = 1800
+
+
+def get_meme_file_cache(group_openid: str, relative_path: str, *,
+                        now: datetime | None = None) -> str:
+    """取有效期内的 file_info；不存在或已过期返回空串，由调用方重新上传。"""
+    group = _as_str(group_openid)
+    relative = _as_str(relative_path)
+    if not group or not relative:
+        return ""
+    moment = now or datetime.now(TZ)
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT file_info, expires_at FROM meme_file_cache"
+            " WHERE group_openid = ? AND relative_path = ?",
+            (group, relative),
+        ).fetchone()
+    if not row:
+        return ""
+    file_info, expires_at = str(row[0] or ""), str(row[1] or "")
+    if not file_info or not expires_at:
+        return ""
+    try:
+        deadline = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+    except ValueError:
+        return ""
+    return file_info if deadline > moment else ""
+
+
+def save_meme_file_cache(group_openid: str, relative_path: str, file_info: str, *,
+                         ttl_seconds: int = MEME_FILE_CACHE_TTL,
+                         now: datetime | None = None) -> bool:
+    """写入/刷新 file_info 缓存；ttl 非正数时用默认有效期兜底。"""
+    group = _as_str(group_openid)
+    relative = _as_str(relative_path)
+    info = _as_str(file_info)
+    if not group or not relative or not info:
+        return False
+    ttl = _as_int(ttl_seconds)
+    if not ttl or ttl <= 0:
+        ttl = MEME_FILE_CACHE_TTL
+    moment = now or datetime.now(TZ)
+    expires_at = (moment + timedelta(seconds=ttl)).strftime("%Y-%m-%d %H:%M:%S")
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO meme_file_cache"
+            " (group_openid, relative_path, file_info, expires_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(group_openid, relative_path) DO UPDATE SET"
+            " file_info = excluded.file_info, expires_at = excluded.expires_at,"
+            " updated_at = excluded.updated_at",
+            (group, relative, info, expires_at,
+             moment.strftime("%Y-%m-%d %H:%M:%S")),
+        )
+    return True
+
+
+def purge_meme_file_cache(*, group_openid: str = "", now: datetime | None = None) -> int:
+    """清理过期（或指定群的）file_info 缓存，返回删除条数。"""
+    moment = (now or datetime.now(TZ)).strftime("%Y-%m-%d %H:%M:%S")
+    group = _as_str(group_openid)
+    sql = "DELETE FROM meme_file_cache WHERE expires_at <= ?"
+    args: list = [moment]
+    if group:
+        sql += " AND group_openid = ?"
+        args.append(group)
+    with _connect() as conn:
+        return conn.execute(sql, args).rowcount
 
 
 def drop_pending_deliveries(obj_type: str, obj_id: int, *, group_id: str = "") -> int:

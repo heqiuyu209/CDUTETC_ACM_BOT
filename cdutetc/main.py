@@ -35,12 +35,14 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from cdutetc import (
     admin_session,
+    chat_fun,
     commands,
     config,
     content_filter,
     crawler,
     daily_digest,
     llm,
+    memes,
     notifications,
     roles,
     teacher_intent,
@@ -820,6 +822,14 @@ class ACMBot:
                     and await self._handle_teacher_intent(
                         message, text, group_id, self._extract_member_id(message))):
                 return
+            # 零 Token 群聊娱乐：跟风复读（+1）与高频词表情包，都只走被动回复，
+            # 不调模型、不占主动配额；与上一步互斥，被意图管线消费的消息不会到这里。
+            if (not addressed
+                    and not text.startswith("/")
+                    and match_publish_command(text, config.PUBLISH_CMD) is None
+                    and await self._handle_chat_fun(
+                        message, text, group_id, self._extract_member_id(message))):
+                return
             # 群内默认必须 @ 本机器人 才响应（含命令），避免抢答他人命令；
             # ACM_GROUP_REQUIRE_AT=0 时回退为“无 @ 也受理显式命令”。
             if config.GROUP_REQUIRE_AT:
@@ -1083,6 +1093,82 @@ class ACMBot:
             if uid and body:
                 await self._send_private_result(str(uid), body)
         return True
+
+    async def _handle_chat_fun(self, message: OneBotMessage, text: str,
+                               group_id: str, member_id: str) -> bool:
+        """群聊娱乐：跟风复读与高频词表情包，全程零 Token。
+
+        Returns:
+            True  → 本条消息已由娱乐模块回应（复读或表情包），调用方直接返回；
+            False → 不回应，调用方继续原有流程（无 @ 时照旧被忽略）。
+        """
+        if not (config.ECHO_ENABLED or config.MEME_ENABLED):
+            return False
+        action = None
+        if config.ECHO_ENABLED:
+            try:
+                action = chat_fun.get_engine().observe(group_id, text, member_id)
+            except Exception:
+                # 娱乐功能是锦上添花，判定出错只记录，不影响群消息主流程。
+                logger.exception("复读机判定失败，跳过")
+                action = None
+        if action is not None:
+            if action.kind == "echo":
+                # 原样复读，不调模型、不拼接任何文案。
+                return await self._safe_reply(message, action.text)
+            if action.kind == "interrupt":
+                # 已进入打断分支：无论图有没有发出去，都不再叠加关键词表情包。
+                await self._send_meme(message, group_id, action.category)
+                return True
+        if not config.MEME_ENABLED:
+            return False
+        try:
+            category = memes.get_engine().should_trigger(group_id, text)
+        except Exception:
+            logger.exception("表情包触发判定失败，跳过")
+            return False
+        if not category:
+            return False
+        return await self._send_meme(message, group_id, category)
+
+    async def _send_meme(self, message: OneBotMessage, group_id: str,
+                         category: str) -> bool:
+        """被动发一张官方富媒体表情包；任何前置条件缺失都静默降级为不回复。"""
+        # 官方富媒体只存在于 QQ 开放平台协议；OneBot 拼不出 file_info，直接跳过。
+        if self.protocol != "qqbot":
+            return False
+        if not config.MEME_BASE_URL:
+            return False
+        trigger = memes.get_engine().resolve(category)
+        if trigger is None:
+            # 素材目录缺失/为空，或未拼出公网地址：安静跳过，不报错也不阻塞。
+            return False
+        if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
+            return False
+        msg_id = str(getattr(message, "id", "") or "")
+        if not msg_id:
+            return False
+        try:
+            file_info = db.get_meme_file_cache(group_id, trigger.relative_path)
+            if not file_info:
+                uploaded = await self.client.upload_group_media(group_id, trigger.url)
+                if not uploaded:
+                    return False
+                file_info, ttl_seconds = uploaded
+                try:
+                    db.save_meme_file_cache(group_id, trigger.relative_path, file_info,
+                                            ttl_seconds=ttl_seconds)
+                except Exception:  # noqa: BLE001 - 缓存写失败绝不影响本次发送
+                    logger.warning("表情包 file_info 缓存写入失败，本次仍继续发送")
+            seq = _clamp_reply_seq(_reply_sequence.get() + 1)
+            _reply_sequence.set(seq)
+            result = await self.client.send_group_media_result(
+                group_id, file_info, reply_to=msg_id, reply_seq=seq,
+            )
+            return bool(result)
+        except Exception:
+            logger.exception("表情包发送失败，跳过")
+            return False
 
     async def _handle_publish(self, message: OneBotMessage, text: str,
                               group_id: str, member_id: str):
