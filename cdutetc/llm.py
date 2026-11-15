@@ -20,8 +20,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from cdutetc import config
-from cdutetc import content_filter
+from cdutetc import config, content_filter
 from cdutetc.publish_text import normalize_local_time_value
 
 logger = logging.getLogger(__name__)
@@ -45,6 +44,20 @@ _CONTEST_TIME_FIELDS = (
     "official_reg_deadline", "official_time",
 )
 _FALLBACK_ERR = "模型调用失败，请稍后再试或直接发送比赛信息"
+
+
+def normalize_text_value(value) -> str | None:
+    """把模型偶发返回的 list/tuple 文本字段归一化为顿号分隔字符串。
+
+    模型经常把 tracks 等文本字段输出成 JSON 数组（如 ["C","C++"]），
+    直接按严格类型校验会整条拒绝提取结果。这里统一清洗：
+    - list/tuple → "、".join(去空后的字符串元素)
+    - 其它类型原样返回，由调用方做严格校验
+    """
+    if isinstance(value, (list, tuple)):
+        parts = [str(x).strip() for x in value if str(x).strip()]
+        return "、".join(parts)
+    return value
 
 
 def normalize_time(text, *, now: datetime | None = None) -> str | None:
@@ -90,7 +103,7 @@ def validate_contest_info(info, *, now: datetime | None = None) -> tuple[dict | 
 
     cleaned: dict = {"name": name.strip()}
     for field in _CONTEST_TIME_FIELDS:
-        raw = info.get(field)
+        raw = normalize_text_value(info.get(field))
         if raw is None or (isinstance(raw, str) and not raw.strip()):
             cleaned[field] = ""  # 时间缺失 = 待定
             continue
@@ -101,7 +114,7 @@ def validate_contest_info(info, *, now: datetime | None = None) -> tuple[dict | 
             return None, f"{field} 时间无法解析：{raw}（请使用 YYYY-MM-DD HH:MM 格式）"
         cleaned[field] = norm
     for field in _STRING_FIELDS:
-        value = info.get(field)
+        value = normalize_text_value(info.get(field))
         if value is None:
             cleaned[field] = ""
         elif isinstance(value, str):
@@ -277,6 +290,19 @@ async def extract_contest(raw_text: str) -> tuple[dict | None, str | None]:
         "contest_time（比赛时间，YYYY-MM-DD HH:MM）、mode（形式）、location（地点）。\n"
         "可选字段：edition（届次）、official_reg_start（报名开始，YYYY-MM-DD HH:MM）、"
         "tracks（赛道）、raw_note（官方规则）、device_req（设备要求）、summary（摘要）。\n"
+        "tracks 等文本字段一律输出字符串；赛道有多个时用顿号连接，"
+        "如 \"C、C++、Python、Java\"，禁止输出 JSON 数组。\n"
+        "输入可能含「老师直接通知」与「官网链接抓取参考」两段，老师通知是本群老师/负责人的"
+        "直接发布，优先级高于任何网页内容：\n"
+        "- 老师通知明确给出的比赛时间、报名截止、赛道、地点，必须原样采用；\n"
+        "- 老师通知可能只针对某一赛道/项目给出具体日期（如「程序设计挑战赛：比赛时间：2026年11月29日」），"
+        "即使官网页面同时列了多个未定时间的其他赛道，也必须把该具体日期写进 official_time 与 contest_time，"
+        "严禁因官网没有统一时间就返回空值或省略；\n"
+        "- 老师通知点明了参赛赛道或语言（如「程序设计挑战赛，支持 C、C++、Python、Java」）时，"
+        "tracks 必须体现老师通知中的赛道，不得照搬官网的全部赛项；\n"
+        "- 官网参考仅用于补充老师通知里没有的背景（届次、主办方、报名入口等），"
+        "官网的通用介绍、首页栏目文字不得覆盖老师通知中的时间和赛道；\n"
+        "- 两段冲突时一律以老师通知为准。\n"
         "无法确定的字段省略，不猜测或用空字段覆盖原信息。\n"
         f"当前北京时间：{reference:%Y-%m-%d %H:%M}。聊天中的今天/明天以此为准；未写日期的明确钟点按今天解释。"
         "网页相对日期应依据其明确的发布日期，参照不明时省略，不直接套用今天。\n"

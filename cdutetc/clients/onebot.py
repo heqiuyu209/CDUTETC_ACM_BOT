@@ -12,7 +12,7 @@ import json
 import logging
 import re
 import time
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
 
 import websockets
 

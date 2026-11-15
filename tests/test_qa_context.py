@@ -16,7 +16,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from cdutetc import commands, config, database as db, llm, qa_context
+from cdutetc import commands, config, llm, qa_context
+from cdutetc import database as db
 from cdutetc.reminder import TZ
 
 NOW = datetime(2026, 11, 11, 18, 0, tzinfo=TZ)  # 周三 18:00

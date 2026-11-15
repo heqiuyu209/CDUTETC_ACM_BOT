@@ -1,11 +1,11 @@
 """本群 FAQ 检索：本地意图区分、候选排序和可选的低成本模型消歧。"""
 
 import asyncio
-from collections import OrderedDict
-from functools import lru_cache
 import re
 import time
 import unicodedata
+from collections import OrderedDict
+from functools import lru_cache
 
 from cdutetc import config, content_filter, database, llm
 

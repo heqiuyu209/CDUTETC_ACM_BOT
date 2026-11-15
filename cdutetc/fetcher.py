@@ -16,15 +16,15 @@
 
 import asyncio
 import codecs
-from contextvars import ContextVar
 import ipaddress
-from html.parser import HTMLParser
-from io import StringIO
 import logging
 import re
 import socket
 import ssl
 import zlib
+from contextvars import ContextVar
+from html.parser import HTMLParser
+from io import StringIO
 from urllib.parse import quote, urljoin, urlparse, urlsplit
 
 from cdutetc import config
@@ -46,6 +46,9 @@ _HIDDEN_TAGS = frozenset(("script", "style", "noscript", "iframe"))
 
 _sem = asyncio.Semaphore(config.FETCH_CONCURRENCY)
 _request_deadline = ContextVar("fetch_request_deadline", default=None)
+# 附加请求头（如 Referer）：按 asyncio 上下文传递，重定向逐跳沿用。
+_extra_headers = ContextVar("fetch_extra_headers", default=())
+_HEADER_NAME_OK = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 
 
 class FetchError(Exception):
@@ -130,7 +133,7 @@ async def _connect(host: str, ip: str, port: int, scheme: str):
         return await asyncio.open_connection(
             host=ip, port=port, ssl=ctx, server_hostname=host if ctx else None
         )
-    except (OSError, asyncio.TimeoutError) as e:
+    except (TimeoutError, OSError) as e:
         raise FetchError(f"连接失败（{host}:{port}）: {e}") from e
 
 
@@ -141,7 +144,7 @@ async def _read_headers(reader, initial: bytes = b"") -> tuple[int, dict[str, st
             raise FetchError("响应头过大")
         try:
             chunk = await asyncio.wait_for(reader.read(4096), timeout=config.FETCH_TIMEOUT)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise FetchError("读取响应头超时") from None
         if not chunk:
             raise FetchError("响应头读取失败（连接提前关闭）")
@@ -211,7 +214,7 @@ async def _read_fixed(reader, initial: bytes, limit: int, expected: int | None) 
         try:
             remaining = (expected if expected is not None else limit) - total
             chunk = await asyncio.wait_for(reader.read(min(65536, remaining + 1)), timeout=config.FETCH_TIMEOUT)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise FetchError("读取响应体超时") from None
         if not chunk:
             if expected is not None:
@@ -234,7 +237,7 @@ async def _read_chunked(reader, initial: bytes, limit: int) -> bytes:
         nonlocal buf
         try:
             chunk = await asyncio.wait_for(reader.read(n), timeout=config.FETCH_TIMEOUT)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise FetchError("读取响应体超时") from None
         if not chunk:
             raise FetchError("chunked 响应不完整")
@@ -324,7 +327,7 @@ async def _request_once(url: str) -> tuple[int, dict[str, str], bytes]:
             return await _request_once_impl(url, deadline)
         deadline = asyncio.get_running_loop().time() + config.FETCH_TIMEOUT
         return await asyncio.wait_for(_request_once_impl(url, deadline), timeout=config.FETCH_TIMEOUT)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise FetchError("链接抓取超时") from None
     except (OSError, UnicodeError) as e:
         raise FetchError(f"链接抓取失败：{type(e).__name__}") from e
@@ -349,22 +352,24 @@ async def _request_once_impl(url: str, deadline: float) -> tuple[int, dict[str, 
     for index, ip in enumerate(ips):
         remaining = deadline - loop.time()
         if remaining <= 0:
-            raise asyncio.TimeoutError
+            raise TimeoutError
         try:
             reader, writer = await asyncio.wait_for(
                 _connect(host, ip, port, scheme), remaining / (len(ips) - index)
             )
             break
-        except (FetchError, OSError, asyncio.TimeoutError) as error:
+        except (TimeoutError, FetchError, OSError) as error:
             if index == len(ips) - 1:
                 raise FetchError(f"所有已验证地址连接失败（{host}:{port}）") from error
     try:
+        extra = "".join(f"{name}: {value}\r\n" for name, value in _extra_headers.get())
         req = (
             f"GET {target} HTTP/1.1\r\n"
             f"Host: {authority}\r\n"
             f"User-Agent: {_UA}\r\n"
             "Accept: text/html,text/plain,application/json,application/xml;q=0.9,*/*;q=0.1\r\n"
             "Accept-Encoding: gzip\r\n"
+            f"{extra}"
             "Connection: close\r\n\r\n"
         )
         writer.write(req.encode("ascii"))
@@ -385,7 +390,7 @@ async def _request_once_impl(url: str, deadline: float) -> tuple[int, dict[str, 
         try:
             remaining = deadline - loop.time()
             if remaining <= 0:
-                raise asyncio.TimeoutError
+                raise TimeoutError
             await asyncio.wait_for(writer.wait_closed(), timeout=min(remaining, 0.1))
         except Exception:
             transport = getattr(writer, "transport", None)
@@ -538,12 +543,12 @@ async def _extract_text_async(body: bytes, content_type: str, source_url: str, d
         parser = _VisibleTextParser()
         for offset in range(0, len(text), _PARSE_BLOCK_CHARS):
             if loop.time() >= deadline:
-                raise asyncio.TimeoutError
+                raise TimeoutError
             parser.feed_bounded(text[offset:offset + _PARSE_BLOCK_CHARS])
             await asyncio.sleep(0)
         text = parser.finish()
     if loop.time() >= deadline:
-        raise asyncio.TimeoutError
+        raise TimeoutError
     logger.info("抓取成功: %s（%d 字符）", source_url, len(text))
     return text
 
@@ -565,7 +570,7 @@ async def _fetch_hop(url: str) -> tuple[int, dict[str, str], str]:
 
     try:
         return await asyncio.wait_for(run(), timeout=config.FETCH_TIMEOUT)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise FetchError("链接抓取超时") from None
 
 
@@ -583,6 +588,36 @@ async def fetch_text(url: str) -> str:
     """
     text, _ = await fetch_text_with_headers(url)
     return text
+
+
+def _sanitize_extra_headers(headers) -> tuple[tuple[str, str], ...]:
+    """过滤附加请求头：只放行常规名值，挡住 CRLF 注入等非法内容。"""
+    pairs: list[tuple[str, str]] = []
+    for name, value in dict(headers or {}).items():
+        key, val = str(name or "").strip(), str(value or "").strip()
+        if not key or not _HEADER_NAME_OK.fullmatch(key):
+            raise FetchError(f"非法请求头名：{key!r}")
+        if any(ch in val for ch in "\r\n") or not val:
+            raise FetchError(f"非法请求头值：{key}")
+        try:
+            val.encode("ascii")
+        except UnicodeEncodeError:
+            raise FetchError(f"请求头值必须为 ASCII：{key}") from None
+        pairs.append((key, val))
+    return tuple(pairs)
+
+
+async def fetch_text_with_extra_headers(url: str, headers=None) -> str:
+    """带附加请求头抓取正文（如牛客需要的 Referer），重定向逐跳保留。
+
+    附加头只在本次抓取的 asyncio 上下文内生效，不影响其它抓取。
+    """
+    pairs = _sanitize_extra_headers(headers)
+    token = _extra_headers.set(pairs)
+    try:
+        return await fetch_text(url)
+    finally:
+        _extra_headers.reset(token)
 
 
 async def fetch_text_with_headers(url: str) -> tuple[str, dict[str, str]]:

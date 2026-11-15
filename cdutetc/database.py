@@ -25,14 +25,13 @@ import logging
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
+from cdutetc import config, content_filter
 from cdutetc.config import DB_PATH
-
-from cdutetc import config
-from cdutetc import content_filter
 from cdutetc.errors import DeliveryCode
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -413,6 +412,34 @@ CREATE TABLE IF NOT EXISTS audit_log (
 )
 """
 
+_ADMIN_WORKSPACES_DDL = """
+CREATE TABLE IF NOT EXISTS admin_workspaces (
+    user_openid   TEXT PRIMARY KEY,
+    group_openid  TEXT NOT NULL DEFAULT '',
+    updated_at    TEXT NOT NULL DEFAULT ''
+)
+"""
+
+# 老师自然语言通知中「时间模糊」的那部分：先落库成待补全条目，
+# 私聊提醒老师/超管补时间，绝不拿猜测的时间去排提醒。
+_TEACHER_INTENT_PENDING_DDL = """
+CREATE TABLE IF NOT EXISTS teacher_intent_pending (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id    TEXT NOT NULL,
+    sender_id   TEXT NOT NULL DEFAULT '',
+    msg_id      TEXT NOT NULL DEFAULT '',
+    raw_text    TEXT NOT NULL DEFAULT '',
+    intent      TEXT NOT NULL DEFAULT '',
+    slots_json  TEXT NOT NULL DEFAULT '{}',
+    missing     TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'pending',
+    resolved_by TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT '',
+    updated_at  TEXT NOT NULL DEFAULT '',
+    UNIQUE (group_id, msg_id)
+)
+"""
+
 _INDEX_DDL = (
     "CREATE INDEX IF NOT EXISTS idx_contests_group ON contests(group_id)",
     "CREATE INDEX IF NOT EXISTS idx_reminders_group ON reminders(group_id)",
@@ -452,6 +479,7 @@ _ALL_DDL = (
     _REMINDER_DELIVERIES_DDL, _REMINDER_SUCCESS_RECEIPTS_DDL,
     _GROUP_NOTIFICATION_BLOCKS_DDL, _GROUP_NOTIFICATION_SETTINGS_DDL,
     _GROUP_SETTINGS_DDL, _CUSTOM_REMINDERS_DDL, _AUDIT_LOG_DDL,
+    _ADMIN_WORKSPACES_DDL, _TEACHER_INTENT_PENDING_DDL,
 )
 
 
@@ -715,20 +743,29 @@ def list_contests(group_id: str | None = None) -> list[dict]:
     return [_row_to_contest(r) for r in rows]
 
 
-def list_question_contests(group_id: str, limit: int = 5) -> list[dict]:
+def list_question_contests(group_id: str, limit: int = 5, *, order: str = "recent") -> list[dict]:
     """查询问答用比赛：已确认公共比赛 + 本群已归属的旧记录。
 
     调用方须先校验群白名单。v2 公共正式比赛供允许群共享，草稿与待审
-    更新不进入上下文；旧记录在 SQL 层按群过滤。按最近更新/创建时间
-    排序并限量，统一为问答使用的名称、时间、形式、地点和来源字段。
+    更新不进入上下文；旧记录在 SQL 层按群过滤。按 ``order`` 排序并限量，
+    统一为问答使用的名称、时间、形式、地点和来源字段，并带出 id 供调用方
+    做同时间排序的稳定兜底。
+
+    ``order="recent"``：按最近更新/创建时间倒序（问答上下文用）；
+    ``order="start"``：按开赛时间正序 —— 有明确开赛时间的在前且由近到远，
+    时间未定（空值）排最后，开赛时间相同按 id 升序（「近期比赛」展示用）。
     """
     if not group_id or limit <= 0:
         return []
-    fields = ("name", "reg_deadline", "contest_time", "mode", "location", "source_link")
+    fields = ("name", "reg_deadline", "contest_time", "mode", "location", "source_link", "id")
+    order_sql = (
+        "CASE WHEN contest_time IS NULL OR TRIM(contest_time) = '' THEN 1 ELSE 0 END,"
+        " contest_time ASC, id ASC"
+        if order == "start" else "sort_time DESC, is_public DESC, id DESC")
     with _connect() as conn:
         rows = conn.execute(
-            """
-            SELECT name, reg_deadline, contest_time, mode, location, source_link
+            f"""
+            SELECT name, reg_deadline, contest_time, mode, location, source_link, id
             FROM (
                 SELECT name, official_reg_deadline AS reg_deadline,
                        official_time AS contest_time, '' AS mode, '' AS location,
@@ -753,7 +790,7 @@ def list_question_contests(group_id: str, limit: int = 5) -> list[dict]:
                        source_link, created_at AS sort_time, 0 AS is_public, id
                 FROM contests WHERE group_id = ?
             )
-            ORDER BY sort_time DESC, is_public DESC, id DESC
+            ORDER BY {order_sql}
             LIMIT ?
             """,
             (group_id, group_id, limit),
@@ -2609,6 +2646,13 @@ def _sync_contest_start_reminders(conn: sqlite3.Connection, competition_id: int,
         "SELECT status, official_time FROM competitions WHERE id = ?", (competition_id,)
     ).fetchone()
     if row is None:
+        # 比赛记录已不存在（物理清理或被替换）：残留的待发节点必须一并取消，
+        # 否则开赛前 15 分钟会推一条指向不存在比赛的提醒。
+        conn.execute(
+            "UPDATE reminder_deliveries SET status = 'cancelled', lease_token = '', lease_until = ''"
+            " WHERE obj_type = 'competition' AND obj_id = ? AND remind_type = 'contest_start'"
+            " AND status IN ('pending', 'sending')", (competition_id,),
+        )
         return
     offsets = tuple(getattr(config, "CONTEST_REMIND_OFFSETS_MINUTES", (30, 15)))
     try:
@@ -3161,18 +3205,59 @@ def list_pending_deliveries(limit: int = 200) -> list[dict]:
 
 
 def list_deliveries(group_id: str, *, statuses: tuple[str, ...] | None = None,
-                    limit: int = 200) -> list[dict]:
+                    limit: int = 200, order: str = "id") -> list[dict]:
+    """列出某群投递记录。
+
+    order="id"：按主键倒序（发送/巡检链路沿用，保持既有行为）；
+    order="schedule"：按预计触发时间正序（同时间按 id 正序），供展示层从近到远排列。
+    """
     where = "group_id = ?"
     args: list = [group_id]
     if statuses:
         where += " AND status IN (" + ",".join("?" for _ in statuses) + ")"
         args.extend(statuses)
+    # scheduled_at 为空的记录排在最后，避免空串抢占队首。
+    order_by = ("scheduled_at = '', scheduled_at, id" if order == "schedule" else "id DESC")
     with _connect() as conn:
         rows = conn.execute(
-            f"SELECT {_DELIVERY_COLS} FROM reminder_delivery_states WHERE {where} ORDER BY id DESC LIMIT ?",
+            f"SELECT {_DELIVERY_COLS} FROM reminder_delivery_states WHERE {where} ORDER BY {order_by} LIMIT ?",
             [*args, limit],
         ).fetchall()
     return [_row_to_delivery(row) for row in rows]
+
+
+_TARGET_NAME_COLUMNS = {
+    "competition": ("competitions", "name"),
+    "collection": ("collections", "title"),
+    "training_session": ("training_sessions", "title"),
+}
+
+
+def get_target_names(pairs: Iterable[tuple[str, int]]) -> dict[tuple[str, int], str]:
+    """批量解析提醒目标名称，键为 (obj_type, obj_id)；已删除或不支持的类型不返回。"""
+    grouped: dict[str, set[int]] = {}
+    for obj_type, obj_id in pairs:
+        if obj_type not in _TARGET_NAME_COLUMNS:
+            continue
+        try:
+            grouped.setdefault(obj_type, set()).add(int(obj_id))
+        except (TypeError, ValueError):
+            continue
+    names: dict[tuple[str, int], str] = {}
+    if not grouped:
+        return names
+    with _connect() as conn:
+        for obj_type, ids in grouped.items():
+            table, column = _TARGET_NAME_COLUMNS[obj_type]
+            marks = ",".join("?" for _ in ids)
+            rows = conn.execute(
+                f"SELECT id, {column} FROM {table} WHERE id IN ({marks})", sorted(ids),
+            ).fetchall()
+            for row in rows:
+                text = (row[1] or "").strip()
+                if text:
+                    names[(obj_type, int(row[0]))] = text
+    return names
 
 
 def get_group_notification_block(protocol: str, group_id: str) -> dict | None:
@@ -4145,3 +4230,199 @@ def remove_entity_alias(entity_type: str, openid: str, operator: str = "") -> bo
             add_audit(operator, openid if entity_type == "group" else "",
                       "remove_alias", entity_type, openid, "", "", conn=conn)
         return bool(cur.rowcount)
+
+
+# =====================================================================
+# 超管私聊工作区（Active Group）持久化
+# =====================================================================
+# 内存版的 admin_session 重启即丢，会让重启后的私聊管理落到 ADMIN_GROUP（可能
+# 是测试群）。这里把「某个超管锁定的工作区」落库：重启后按 user_openid 恢复。
+# 语义约定：
+#   · 无记录            → 从未选定过，调用方可回落到默认正式群；
+#   · group_openid = '' → 用户显式 /重置群 清过，调用方不得再回落到默认群；
+#   · group_openid 非空 → 该超管上次锁定的工作区。
+
+
+def set_admin_workspace(user_openid: str, group_openid: str) -> None:
+    """写入/覆盖某超管的工作区；传空串表示「显式清空」而非删除记录。"""
+    uid = _as_str(user_openid)
+    if not uid:
+        raise ValueError("超管标识不能为空")
+    gid = _as_str(group_openid)
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO admin_workspaces (user_openid, group_openid, updated_at)"
+            " VALUES (?, ?, ?)"
+            " ON CONFLICT(user_openid) DO UPDATE SET group_openid = excluded.group_openid,"
+            " updated_at = excluded.updated_at",
+            (uid, gid, now_str()),
+        )
+
+
+def get_admin_workspace(user_openid: str) -> str | None:
+    """返回该超管上次锁定的工作区；无记录或已被显式清空都返回 None。"""
+    uid = _as_str(user_openid)
+    if not uid:
+        return None
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT group_openid FROM admin_workspaces WHERE user_openid = ?", (uid,)
+        ).fetchone()
+    if row is None or not (row[0] or "").strip():
+        return None
+    return row[0].strip()
+
+
+def has_admin_workspace(user_openid: str) -> bool:
+    """该超管是否有过工作区记录（含「显式清空」的空记录）。"""
+    uid = _as_str(user_openid)
+    if not uid:
+        return False
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM admin_workspaces WHERE user_openid = ?", (uid,)
+        ).fetchone()
+    return row is not None
+
+
+def clear_admin_workspace(user_openid: str) -> None:
+    """显式清空：保留一条空记录，防止重启后又自动回落到默认群。"""
+    set_admin_workspace(user_openid, "")
+
+
+# =====================================================================
+# 老师自然语言通知：模糊意图待补全队列 + 改期/取消时的旧提醒作废
+# =====================================================================
+
+_TEACHER_INTENT_COLS = (
+    "id, group_id, sender_id, msg_id, raw_text, intent, slots_json, missing,"
+    " status, resolved_by, created_at, updated_at"
+)
+
+
+def _row_to_teacher_intent(row: sqlite3.Row) -> dict:
+    try:
+        slots = json.loads(row[6] or "{}")
+    except ValueError:
+        slots = {}
+    return {
+        "id": row[0], "group_id": row[1], "sender_id": row[2], "msg_id": row[3],
+        "raw_text": row[4], "intent": row[5],
+        "slots": slots if isinstance(slots, dict) else {},
+        "missing": [item for item in (row[7] or "").split(",") if item],
+        "status": row[8], "resolved_by": row[9],
+        "created_at": row[10], "updated_at": row[11],
+    }
+
+
+def add_teacher_intent_pending(group_id: str, *, sender_id: str = "", msg_id: str = "",
+                               raw_text: str = "", intent: str = "",
+                               slots: dict | None = None,
+                               missing: list[str] | None = None) -> int:
+    """记录一条「时间/事项不完整」的老师通知，等待补全后转正式安排。
+
+    同一 (群, 消息) 只留一条：平台重推同一条消息时更新原记录而不是堆积重复待办。
+    """
+    gid = _as_str(group_id)
+    if not gid:
+        raise ValueError("群标识不能为空")
+    payload = json.dumps(slots or {}, ensure_ascii=False, sort_keys=True)
+    gaps = ",".join(item for item in (missing or []) if item)
+    stamp = now_str()
+    # UNIQUE(group_id, msg_id) 要求键非空且稳定：取不到入站 msg_id 时（如本地补录）
+    # 退化为正文摘要，保证同一段话重复进来是更新而不是堆一条新待办。
+    key = _as_str(msg_id) or "text:" + hashlib.sha1(
+        _as_str(raw_text).encode("utf-8")).hexdigest()[:16]
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO teacher_intent_pending (group_id, sender_id, msg_id, raw_text,"
+            " intent, slots_json, missing, status, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,'pending',?,?)"
+            " ON CONFLICT(group_id, msg_id) DO UPDATE SET"
+            " sender_id = excluded.sender_id, raw_text = excluded.raw_text,"
+            " intent = excluded.intent, slots_json = excluded.slots_json,"
+            " missing = excluded.missing, status = 'pending', updated_at = excluded.updated_at",
+            (gid, _as_str(sender_id), key, _as_str(raw_text), _as_str(intent),
+             payload, gaps, stamp, stamp),
+        )
+        row = conn.execute(
+            "SELECT id FROM teacher_intent_pending WHERE group_id = ? AND msg_id = ?",
+            (gid, key),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def get_teacher_intent_pending(pid: int) -> dict | None:
+    """按 id 读取一条待补全条目。"""
+    try:
+        key = int(pid)
+    except (TypeError, ValueError):
+        return None
+    with _connect() as conn:
+        row = conn.execute(
+            f"SELECT {_TEACHER_INTENT_COLS} FROM teacher_intent_pending WHERE id = ?",
+            (key,),
+        ).fetchone()
+    return _row_to_teacher_intent(row) if row else None
+
+
+def list_teacher_intent_pending(group_id: str = "", status: str = "pending") -> list[dict]:
+    """列出待补全条目；group_id 留空表示全部群。"""
+    where, args = [], []
+    if _as_str(group_id):
+        where.append("group_id = ?")
+        args.append(_as_str(group_id))
+    if status:
+        where.append("status = ?")
+        args.append(_as_str(status))
+    clause = f" WHERE {' AND '.join(where)}" if where else ""
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_TEACHER_INTENT_COLS} FROM teacher_intent_pending{clause}"
+            " ORDER BY id DESC",
+            args,
+        ).fetchall()
+    return [_row_to_teacher_intent(r) for r in rows]
+
+
+def resolve_teacher_intent_pending(pid: int, status: str = "resolved",
+                                   operator: str = "") -> bool:
+    """关闭待补全条目（resolved=已补全 / dropped=放弃）；不物理删除。"""
+    if status not in ("resolved", "dropped"):
+        raise ValueError("状态必须是 resolved 或 dropped")
+    try:
+        key = int(pid)
+    except (TypeError, ValueError):
+        return False
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE teacher_intent_pending SET status = ?, resolved_by = ?, updated_at = ?"
+            " WHERE id = ? AND status = 'pending'",
+            (status, _as_str(operator), now_str(), key),
+        )
+        return cur.rowcount > 0
+
+
+def drop_pending_deliveries(obj_type: str, obj_id: int, *, group_id: str = "") -> int:
+    """作废某对象的**未发送**提醒节点，返回删除条数。
+
+    课程改期/取消、比赛改期后，旧时间点的 pending 行已经不可能再被
+    ``build_*_reminders`` 命中（扫描式计划只按最新数据重建），留着只会让
+    「待发清单」显示出并不存在的节点，因此在改期时清掉。
+    只删 ``status='pending'``：``sending`` 行可能正被别的进程持有租约，
+    删除会破坏其回执写入，交给 ``reconcile_deliveries`` 自然收尾。
+    """
+    try:
+        oid = int(obj_id)
+    except (TypeError, ValueError):
+        return 0
+    sql = ("DELETE FROM reminder_deliveries WHERE obj_type = ? AND obj_id = ?"
+           " AND status = 'pending'")
+    args: list = [_as_str(obj_type), oid]
+    if _as_str(group_id):
+        sql += " AND group_id = ?"
+        args.append(_as_str(group_id))
+    with _connect() as conn:
+        cur = conn.execute(sql, args)
+        return cur.rowcount
+

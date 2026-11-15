@@ -10,14 +10,9 @@ from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import pytest
+
+from cdutetc import commands, config, database, main, reminder
 from cdutetc.clients.onebot import OneBotClient, OneBotMessage
-
-from cdutetc import commands
-from cdutetc import config
-from cdutetc import database
-from cdutetc import main
-from cdutetc import reminder
-
 
 NOW = datetime(2026, 11, 1, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
 

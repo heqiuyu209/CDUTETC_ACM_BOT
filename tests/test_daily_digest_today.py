@@ -11,13 +11,15 @@
 """
 
 import asyncio
+import logging
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from cdutetc import config, daily_digest, database as db, main, reminder
+from cdutetc import config, daily_digest, main, reminder
+from cdutetc import database as db
 from cdutetc.clients.qqbot import QQBotClient
 from cdutetc.reminder import TZ
 
@@ -52,9 +54,13 @@ def _course(group_id="g1", weekday="周四", start="19:00", end="21:00",
 
 
 def _contest(name="Codeforces Round 999", official_time="2026-11-12 22:00",
-             group_id="g1") -> int:
-    cid = db.create_competition({"name": name, "official_time": official_time},
-                                status="confirmed")
+             group_id="g1", official_site="", edition="") -> int:
+    info = {"name": name, "official_time": official_time}
+    if official_site:
+        info["official_site"] = official_site
+    if edition:
+        info["edition"] = edition
+    cid = db.create_competition(info, status="confirmed")
     db.set_competition_notify_groups(cid, [group_id])
     return cid
 
@@ -174,3 +180,121 @@ def test_digest_job_respects_global_switch(env, monkeypatch):
 
     monkeypatch.setattr(config, "DAILY_DIGEST_ENABLED", True)
     assert asyncio.run(bot._daily_digest_job(now=THU)) == 1
+
+
+# ------------------------------------------------- F. 今日筛选 + 无赛静默跳过
+
+def test_digest_lists_only_today_when_two_today_and_one_tomorrow(env):
+    """今日 2 场 + 明日 1 场：晨报只能出现今日 2 场，明日场次一个字都不能有。"""
+    _contest(name="CF 今日 19:00 场", official_time="2026-11-12 19:00")
+    _contest(name="CF 今日 23:30 场", official_time="2026-11-12 23:30")
+    _contest(name="CF 明日 22:00 场", official_time="2026-11-13 22:00")
+
+    detail = daily_digest.collect_daily_digest("g1", THU)
+
+    assert detail["today_contest_count"] == 2
+    text = detail["text"]
+    assert "CF 今日 19:00 场" in text
+    assert "CF 今日 23:30 场" in text
+    assert "CF 明日 22:00 场" not in text
+
+
+def test_digest_excludes_retracted_and_undated_contests(env):
+    """被撤回为 draft（非 confirmed）与时间未定（无法解析 00:00:00–23:59:59）的场次都不进晨报。"""
+    _contest(name="CF 今日正常场", official_time="2026-11-12 20:00")
+    retracted = _contest(name="CF 今日撤回场", official_time="2026-11-12 21:00")
+    db.set_competition_status(retracted, "draft", operator="admin")
+    _contest(name="CF 今日待定场", official_time="")
+
+    detail = daily_digest.collect_daily_digest("g1", THU)
+
+    assert detail["today_contest_count"] == 1
+    assert "CF 今日正常场" in detail["text"]
+    assert "CF 今日撤回场" not in detail["text"]
+    assert "CF 今日待定场" not in detail["text"]
+
+
+def test_digest_job_silently_skips_when_no_contest_today(env, caplog):
+    """今日 0 场（明天、后天都有）时必须静默跳过：不调发送接口、返回 0、只记 INFO。"""
+    _contest(name="CF 明日 22:00 场", official_time="2026-11-13 22:00")
+    _contest(name="CF 后天 22:00 场", official_time="2026-11-14 22:00")
+    api = SimpleNamespace(post_group_message=AsyncMock(return_value={"id": "sent"}))
+    client = QQBotClient("offline-app", "offline-secret")
+    client._client = SimpleNamespace(api=api)
+    bot = main.ACMBot(client)
+
+    assert daily_digest.collect_daily_digest("g1", THU)["text"] is None
+    with caplog.at_level(logging.INFO):
+        assert asyncio.run(bot._daily_digest_job(now=THU)) == 0
+
+    api.post_group_message.assert_not_awaited()
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("[晨报] 群 g1 今日无比赛，已跳过发送" in text for text in messages)
+    assert any("[晨报] 群 g2 今日无比赛，已跳过发送" in text for text in messages)
+    assert all("今日暂无比赛" not in text for text in messages)
+
+
+# ------------------------------------------------- G. 按平台分组排版
+
+def _groups_in(text: str) -> list[str]:
+    """按出现顺序取出所有平台分隔行。"""
+    return [line.strip("-").strip() for line in text.splitlines()
+            if line.startswith("-----")]
+
+
+def test_digest_groups_contests_by_platform(env):
+    """五类平台各一场：分组标题按固定顺序出现，有链接才输出「链接：」行。"""
+    _weekly(name="队内周赛", official_time="2026-11-15 19:00")   # 无链接
+    _contest(name="牛客小白月赛 100", official_time="2026-11-15 20:00",
+             official_site="https://ac.nowcoder.com/acm/contest/88888")
+    _contest(name="Codeforces Round 2030", official_time="2026-11-15 22:35",
+             official_site="https://codeforces.com/contest/2030")
+    _contest(name="AtCoder Beginner Contest 380", official_time="2026-11-15 20:00",
+             official_site="https://atcoder.jp/contests/abc380")
+    _contest(name="蓝桥杯热身赛", official_time="2026-11-15 14:00")   # 无平台、无链接
+
+    text = daily_digest.build_daily_digest("g1", SUN)
+
+    assert text.splitlines()[0] == "☀️ CDUTETC ACM 今日早报（11-15 周日）"
+    assert "🏆 今日赛事（5 场）" in text
+    assert _groups_in(text) == ["CDUTETC_ACM", "牛客", "Codeforces", "AtCoder", "其他赛事"]
+    # 每场都是「- HH:MM（倒计时后）」+ 名称两行结构
+    assert "- 19:00（11 小时后）\n  队内周赛" in text
+    assert "- 22:35（14 小时 35 分钟后）\n  Codeforces Round 2030" in text
+    # 有链接的场次紧跟链接行
+    assert "  链接：https://ac.nowcoder.com/acm/contest/88888" in text
+    assert "  链接：https://codeforces.com/contest/2030" in text
+    assert "  链接：https://atcoder.jp/contests/abc380" in text
+    # 无链接的场次不能出现空的「链接：」标签
+    cdutetc_block = text.split("-------牛客-------")[0]
+    assert "队内周赛" in cdutetc_block and "链接：" not in cdutetc_block
+    other_block = text.split("-------其他赛事-------")[1]
+    assert "蓝桥杯热身赛" in other_block and "链接：" not in other_block
+
+
+def test_digest_sorts_contests_inside_platform_group(env):
+    """同一平台内按开赛时间升序，与入库顺序无关。"""
+    _contest(name="Codeforces Round 991", official_time="2026-11-15 22:35",
+             official_site="https://codeforces.com/contest/2031")
+    _contest(name="Codeforces Round 990", official_time="2026-11-15 19:00",
+             official_site="https://codeforces.com/contest/2030")
+
+    text = daily_digest.build_daily_digest("g1", SUN)
+
+    assert _groups_in(text) == ["Codeforces"]
+    assert text.index("Codeforces Round 990") < text.index("Codeforces Round 991")
+
+
+def test_digest_has_no_command_footer(env):
+    """晨报结尾不得再出现分隔线与「发送对应命令…查看详情」引导。"""
+    _course(title="周日集训")
+    _contest(name="牛客小白月赛 100", official_time="2026-11-15 20:00",
+             official_site="https://ac.nowcoder.com/acm/contest/88888")
+    db.create_custom_reminder("g1", "交周报", "2026-11-15 21:00")
+
+    text = daily_digest.build_daily_digest("g1", SUN)
+
+    assert "发送对应命令" not in text
+    assert "查看详情" not in text
+    assert "------------------------" not in text
+    assert text.rstrip().endswith("21:00 交周报")

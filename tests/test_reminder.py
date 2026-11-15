@@ -1,6 +1,6 @@
 """提醒时间解析（legacy contests 链已下线，仅保留通用解析用例）。"""
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 from zoneinfo import ZoneInfo
 
 from cdutetc import reminder

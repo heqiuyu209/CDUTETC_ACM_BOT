@@ -8,14 +8,10 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import config
-from cdutetc import crawler
-from cdutetc import database
-from cdutetc import main
-from cdutetc.fetcher import FetchError
+from cdutetc import config, crawler, database, main
 from cdutetc.clients.onebot import OneBotMessage
 from cdutetc.errors import DeliveryMode, DeliveryResult
-
+from cdutetc.fetcher import FetchError
 
 URL = "https://contest.example.com/announcement"
 PAGE = "  校赛公告\n报名截止 2026-11-10 23:59\n"

@@ -1,16 +1,13 @@
 """未补零旧日期的截止判断、真实提醒去重及成功事实迁移回归。"""
 
-from datetime import datetime
 import sqlite3
+from datetime import datetime
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import commands
-from cdutetc import config
-from cdutetc import database
-from cdutetc import reminder
+from cdutetc import commands, config, database, reminder
 
 RAW = "2026-11-01 9:00"
 TARGET = "2026-11-01 09:00"

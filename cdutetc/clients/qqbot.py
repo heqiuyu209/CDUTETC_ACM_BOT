@@ -20,12 +20,12 @@ botpy 采用延迟导入：未安装时本模块仍可被导入，只有真正�
 """
 
 import asyncio
-from collections import OrderedDict
-from dataclasses import dataclass
 import logging
 import secrets
 import time
-from typing import Awaitable, Callable
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 from cdutetc.clients.base import BaseBotClient
 
@@ -51,6 +51,33 @@ def _import_botpy():
             "使用官方机器人需要安装 botpy：pip install -r requirements-qqbot.txt"
         ) from error
     return botpy
+
+
+# 群消息去重窗口：平台可能把同一条 @ 消息同时投递到「群 @ 事件」和
+# 「群全量事件」，5 分钟内按 msg_id 只处理一次。
+GROUP_MSG_DEDUP_TTL = 300.0
+# 去重表容量上限：TTL 之外再加一道内存保护，防止极端刷屏撑爆内存。
+GROUP_MSG_DEDUP_LIMIT = 2048
+
+
+def build_group_intents(botpy):
+    """构造订阅 intent：群 @ 消息 + 群全量消息一起收。
+
+    平台侧 GROUP_MESSAGE_CREATE（群全量消息）与 GROUP_AT_MESSAGE_CREATE 同属
+    GROUP_AND_C2C_EVENT (1 << 25)，即 botpy 的 public_messages，位掩码无需再加；
+    真正的开关是「机器人在平台开启接收所有消息」+ 本模块补的 group_message_create 解析器。
+    新版本 SDK 若提供具名 group_messages 开关，则顺带打开（老版本会因未知 kwarg 报错）。
+    """
+    for kwargs in ({"public_messages": True, "group_messages": True},
+                   {"public_messages": True}):
+        try:
+            intents = botpy.Intents(**kwargs)
+        except TypeError:
+            continue
+        if "group_messages" in kwargs:
+            logger.info("已订阅群 @ 消息与群全量消息（GROUP_AND_C2C_EVENT）")
+        return intents
+    return botpy.Intents(public_messages=True)
 
 
 class QQBotMessage:
@@ -185,20 +212,36 @@ class QQBotClient(BaseBotClient):
         self._last_rx = time.monotonic()
         # 主动消息不复用 SDK 的默认序号1；随机起点也减少重启后的序号重合。
         self._active_msg_seq = secrets.randbelow(2**31 - 2) + 1
-        self._recent_group_messages: OrderedDict[tuple[str, str], None] = OrderedDict()
+        # 入站消息幂等表：(group_id, msg_id) -> 首次处理时刻；带 TTL 与容量上限。
+        self._recent_group_messages: OrderedDict[tuple[str, str], float] = OrderedDict()
+
+    def _seen_recently(self, wrapped: QQBotMessage, now: float) -> bool:
+        """同一条群消息 5 分钟内只处理一次；顺带惰性清理过期条目。"""
+        # 官方协议一条 @ 消息可能同时触发群 @ 事件与群全量事件，必须按 msg_id 幂等。
+        if not (wrapped.group_id and wrapped.id):
+            return False
+        key = (wrapped.group_id, wrapped.id)
+        hit = self._recent_group_messages.get(key)
+        if hit is not None and now - hit < GROUP_MSG_DEDUP_TTL:
+            return True
+        self._recent_group_messages[key] = now
+        self._recent_group_messages.move_to_end(key)
+        while self._recent_group_messages:
+            oldest_at = next(iter(self._recent_group_messages.values()))
+            if len(self._recent_group_messages) > GROUP_MSG_DEDUP_LIMIT \
+                    or now - oldest_at >= GROUP_MSG_DEDUP_TTL:
+                self._recent_group_messages.popitem(last=False)
+                continue
+            break
+        return False
 
     async def _receive_group_message(self, wrapped: QQBotMessage) -> None:
         self._last_rx = time.monotonic()
         if self.group_msg_handler is None:
             return
-        # 同一消息可能同时以群 @ 和全量事件到达；未 @ 消息不占用已处理记录。
-        if wrapped.always_addressed and wrapped.group_id and wrapped.id:
-            key = (wrapped.group_id, wrapped.id)
-            if key in self._recent_group_messages:
-                return
-            self._recent_group_messages[key] = None
-            if len(self._recent_group_messages) > 1024:
-                self._recent_group_messages.popitem(last=False)
+        if self._seen_recently(wrapped, time.monotonic()):
+            logger.debug("重复群消息已忽略（msg_id=%s）", wrapped.id)
+            return
         try:
             await self.group_msg_handler(wrapped)
         except Exception:  # noqa: BLE001
@@ -244,7 +287,7 @@ class QQBotClient(BaseBotClient):
                     except Exception:  # noqa: BLE001
                         logger.exception("私聊消息处理失败")
 
-        intents = botpy.Intents(public_messages=True)
+        intents = build_group_intents(botpy)
         self._client = _Client(intents=intents)
         try:
             await self._client.start(appid=self.appid, secret=self.secret)
@@ -268,7 +311,9 @@ class QQBotClient(BaseBotClient):
 
     async def _post_result(self, action: str, *, mode, **params):
         from cdutetc.errors import (
-            DeliveryCode, DeliveryResult, result_from_exception,
+            DeliveryCode,
+            DeliveryResult,
+            result_from_exception,
         )
 
         protocol = "qqbot"

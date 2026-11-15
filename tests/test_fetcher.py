@@ -13,7 +13,6 @@ import pytest
 from cdutetc import fetcher
 from cdutetc.fetcher import FetchError, _is_public_ip, _parse_url
 
-
 # ---------- URL 解析 ----------
 
 

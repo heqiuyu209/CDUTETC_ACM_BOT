@@ -4,14 +4,13 @@
 验证权限先于抓取、失败不写库、按群隔离、免审发布与命令路由/FAQ/提问收集等行为。
 """
 
-import pytest
 from unittest.mock import AsyncMock, Mock
 
-from cdutetc import config
-from cdutetc import database
-from cdutetc import main
-from cdutetc.fetcher import FetchError
+import pytest
+
+from cdutetc import config, database, main
 from cdutetc.clients.onebot import OneBotMessage
+from cdutetc.fetcher import FetchError
 
 
 def _msg(content="你好", group="g1", member="m1"):

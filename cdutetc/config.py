@@ -128,7 +128,8 @@ def _drop_empty_env(environ=None) -> list[str]:
     return removed
 
 
-ENV_DROPPED_EMPTY = _drop_empty_env()
+# 启动时清掉值为空的 ACM_* 环境变量（必须保留该副作用，返回值无人使用）。
+_drop_empty_env()
 
 # ================= QQ 机器人接入（OneBot/NapCat，必填） =================
 # NapCatQQ 正向 WebSocket 地址，例如 ws://127.0.0.1:3001
@@ -330,10 +331,13 @@ LLM_CONCURRENCY = int(os.getenv("ACM_LLM_CONCURRENCY", "2"))              # 模�
 TZ_NAME = "Asia/Shanghai"
 REMIND_CHECK_INTERVAL_MINUTES = int(os.getenv("ACM_REMIND_CHECK_INTERVAL_MINUTES", "30"))
 # 开赛计划独立于旧版提前小时数，批准时即持久化；扫描间隔不会被旧30分钟配置拖慢。
+# 开赛前 15 分钟是硬性节点：环境变量只能追加其它节点，不能把它剔除，
+# 否则运维一旦只写 "30" 就会静默丢失「开赛前 15 分钟提醒」。
+CONTEST_REMIND_REQUIRED_MINUTES = 15
 CONTEST_REMIND_OFFSETS_MINUTES = tuple(sorted({
     int(x.strip()) for x in os.getenv("ACM_CONTEST_REMIND_OFFSETS_MINUTES", "30,15").split(",")
     if x.strip()
-}, reverse=True))
+} | {CONTEST_REMIND_REQUIRED_MINUTES}, reverse=True))
 CONTEST_REMIND_CHECK_SECONDS = int(os.getenv("ACM_CONTEST_REMIND_CHECK_SECONDS", "30"))
 CONTEST_REMIND_GRACE_SECONDS = int(os.getenv("ACM_CONTEST_REMIND_GRACE_SECONDS", "120"))
 if (not CONTEST_REMIND_OFFSETS_MINUTES or any(x <= 0 for x in CONTEST_REMIND_OFFSETS_MINUTES)
@@ -343,6 +347,7 @@ if (not CONTEST_REMIND_OFFSETS_MINUTES or any(x <= 0 for x in CONTEST_REMIND_OFF
 REMIND_BEFORE_HOURS = int(os.getenv("ACM_REMIND_BEFORE_HOURS", "24"))
 if REMIND_CHECK_INTERVAL_MINUTES < 1 or REMIND_BEFORE_HOURS <= 0:
     raise RuntimeError("提醒扫描间隔和提前小时数必须大于零")
+# 旧群赛事兼容扫描仍使用这两种提醒类型。
 REMIND_TYPES = ("reg_deadline", "contest_time")
 # 多节点提前提醒（小时，逗号分隔，支持小数）。例：24,1,0.167 表示
 # 提前 24 小时、1 小时、10 分钟各提醒一次。每场活动不建独立定时器，
@@ -418,6 +423,10 @@ PUBLISH_SCOPE_TO_SOURCE = os.getenv("ACM_PUBLISH_SCOPE_TO_SOURCE", "1") != "0"
 # 老师用自然语言描述比赛（没带「发布」命令）时，是否让模型先判断意图，
 # 判为「在发布比赛」就自动转入发布流程。关闭则只认显式命令。
 NL_INTENT_ENABLED = os.getenv("ACM_NL_INTENT_ENABLED", "1") != "0"
+# 老师在群里用自然语言说安排（「周三晚七点讲图论」「下周找个晚上补题」）时，
+# 是否自动识别意图并登记课程/比赛。关闭后只认 / 开头的显式命令，
+# 群内普通消息一律不进意图管线（不做预过滤、不调模型）。
+TEACHER_AUTO_INTENT_ENABLED = os.getenv("ACM_TEACHER_AUTO_INTENT_ENABLED", "1") != "0"
 
 # ================= 自动周赛（v2） =================
 # 在提前提醒窗口前按模板生成周赛，启动时补最近未来场次；默认不通知全员，
@@ -481,6 +490,13 @@ def _contest_crawl_clock() -> tuple[int, int]:
 
 
 CONTEST_CRAWL_HOUR, CONTEST_CRAWL_MINUTE = _contest_crawl_clock()
+
+# 晨报必须晚于当日赛程抓取：否则会把「今天刚抓到的新比赛」漏在晨报之外。
+# 配置写早（含相等）时不报错，而是自动顺延到抓取完成后的 10 分钟，
+# 保证任何环境变量组合下晨报都能读到当天最新赛程。
+if (DAILY_DIGEST_HOUR * 60 + DAILY_DIGEST_MINUTE) <= (CONTEST_CRAWL_HOUR * 60 + CONTEST_CRAWL_MINUTE):
+    _digest_minutes = min(CONTEST_CRAWL_HOUR * 60 + CONTEST_CRAWL_MINUTE + 10, 23 * 60 + 59)
+    DAILY_DIGEST_HOUR, DAILY_DIGEST_MINUTE = divmod(_digest_minutes, 60)
 # 自动抓取生成的记录默认不通知全员，由超管确认后处理（/修正 或 /比赛详情 人工核对）。
 
 # ================= 本地数据 =================

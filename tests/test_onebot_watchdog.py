@@ -8,7 +8,6 @@
 import asyncio
 import time
 
-
 from cdutetc.clients.onebot import OneBotClient
 
 

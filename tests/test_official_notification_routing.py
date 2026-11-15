@@ -96,7 +96,7 @@ async def test_non_admin_cannot_trigger_notification_test(official_bot):
 
 
 async def test_contest_job_uses_structured_result_callback(official_bot, monkeypatch):
-    bot, api = official_bot
+    bot, _api = official_bot
     check = AsyncMock(return_value=0)
     monkeypatch.setattr(main, "check_contest_start_reminders", check)
     await bot._contest_remind_job()

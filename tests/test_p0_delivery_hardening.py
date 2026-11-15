@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cdutetc import config, database, main, notifications
-from cdutetc.errors import DeliveryCode, classify_exception
 from cdutetc.clients.qqbot import QQBotClient
+from cdutetc.errors import DeliveryCode, classify_exception
 
 
 class ServerError(RuntimeError):

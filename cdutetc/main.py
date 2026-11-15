@@ -26,32 +26,46 @@ import logging
 import re
 import sqlite3
 import time
+import types
 from dataclasses import replace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from cdutetc import (
+    admin_session,
+    commands,
+    config,
+    content_filter,
+    crawler,
+    daily_digest,
+    llm,
+    notifications,
+    roles,
+    teacher_intent,
+)
+from cdutetc import database as db
+from cdutetc.alias_helper import format_group_name
 from cdutetc.clients.base import BaseBotClient, capabilities_of
 from cdutetc.clients.onebot import OneBotClient, OneBotMessage
-
-from cdutetc import admin_session
-from cdutetc import commands
-from cdutetc import config
-from cdutetc.alias_helper import format_group_name, format_user_name
-from cdutetc import content_filter
-from cdutetc import crawler
-from cdutetc import daily_digest
-from cdutetc import database as db
-from cdutetc import llm
-from cdutetc import roles
-from cdutetc import notifications
-from cdutetc.errors import AppErrorCode, DeliveryMode, DeliveryResult, result_from_exception, safe_error_hint
 from cdutetc.contest_fields import map_competition_info
 from cdutetc.database import create_published_competition_once, init_db
+from cdutetc.errors import (
+    AppErrorCode,
+    DeliveryMode,
+    DeliveryResult,
+    result_from_exception,
+    safe_error_hint,
+)
 from cdutetc.fetcher import FetchError, fetch_text
 from cdutetc.llm import extract_contest, normalize_time
-from cdutetc.publish_text import is_timed_contest_announcement, parse_simple_publication
+from cdutetc.publish_text import (
+    extract_declared_contest_time,
+    extract_declared_tracks,
+    is_timed_contest_announcement,
+    parse_simple_publication,
+)
 from cdutetc.reminder import (
     check_contest_start_reminders,
     check_custom_reminders,
@@ -63,10 +77,9 @@ from cdutetc.utils import (
     extract_url,
     is_addressed_to_bot,
     is_allowed_group,
+    is_super_admin,
     match_publish_command,
     message_mentions,
-    is_super_admin,
-    mentioned_user_ids,
     parse_command,
     strip_at,
 )
@@ -217,6 +230,75 @@ def _build_publish_receipt(info: dict, *, status: str, ref: int) -> str:
     return "\n".join(lines)
 
 
+def _runtime_teacher_record(account_id: str) -> dict | None:
+    """在动态老师名单里按 openid 精确匹配，命中才返回记录。
+
+    只做精确相等，绝不做前缀/模糊匹配——展示身份宁可落到兜底，也不能张冠李戴。
+    """
+    if not account_id:
+        return None
+    try:
+        teachers = db.list_runtime_teachers() or []
+    except (sqlite3.Error, ValueError):
+        return None
+    for record in teachers:
+        if str(record.get("user_id") or "").strip() == account_id:
+            return record
+    return None
+
+
+def _format_submitter(submitted_by: str) -> str:
+    """实时解析比赛发布人的展示文案（备注名 → 超管 → 老师 → 兜底）。
+
+    严格只认「当前这条消息触发者」的真实账号标识（群聊 member_id / 私聊 uid），
+    严禁回退成群默认负责老师：身份漂移会让待确认卡片把超管记成老师。
+    """
+    account_id = (submitted_by or "").strip()
+    if not account_id:
+        return "未知成员（无账号标识）"
+    short = account_id[:8]
+
+    try:
+        label_name = (db.get_account_label("user", account_id) or "").strip()
+    except (sqlite3.Error, ValueError):
+        label_name = ""
+    try:
+        alias = db.get_entity_alias("user", account_id) or {}
+    except (sqlite3.Error, ValueError):
+        alias = {}
+    alias_name = str(alias.get("display_name") or "").strip()
+    alias_qq = str(alias.get("numeric_id") or "").strip()
+
+    # 1) 超管身份锁定：有备注展示备注，没有就展示超级管理员；不读老师名单覆盖
+    if is_super_admin(account_id):
+        if label_name:
+            return f"{label_name}（超管）"
+        return f"超级管理员（ID: {short}...）"
+
+    # 2) 已绑定老师：runtime_teachers 里存在精确 openid 记录
+    teacher = _runtime_teacher_record(account_id)
+    if teacher is not None:
+        teacher_name = (
+            label_name
+            or alias_name
+            or str(teacher.get("note") or "").strip()
+        )
+        teacher_qq = alias_qq
+        if not teacher_name:
+            teacher_name = f"老师（ID: {short}...）"
+        if teacher_qq:
+            return f"{teacher_name}（老师, QQ: {teacher_qq}）"
+        return f"{teacher_name}（老师）"
+
+    # 3) 兜底：既不是超管也不在老师名单；有备注名/已绑 QQ 时仍展示，避免信息丢失
+    display_name = label_name or alias_name
+    if display_name and alias_qq:
+        return f"{display_name}（QQ: {alias_qq}）"
+    if display_name:
+        return f"{display_name}（ID: {short}...）"
+    return f"未知成员（ID: {short}...）"
+
+
 def _build_publish_review(pending: dict) -> str:
     """构造发给超管的待确认申请正文（含全部已整理字段与查重提示）。"""
     info = json.loads(pending.get("fields_json") or "{}")
@@ -234,7 +316,7 @@ def _build_publish_review(pending: dict) -> str:
     if (info.get("official_time") or "").strip():
         lines.append(f"提醒计划：同意后安排开始前 {_format_remind_offsets()}的未来节点，已错过的不补发")
     lines.append(f"来源群：{format_group_name(pending.get('group_id') or '')}")
-    lines.append(f"提交人：{format_user_name(pending.get('submitted_by') or '')}")
+    lines.append(f"提交人：{_format_submitter(pending.get('submitted_by') or '')}")
     if pending.get("duplicate_note"):
         lines.append(f"⚠ 查重提示：{pending['duplicate_note']}")
     else:
@@ -379,6 +461,19 @@ class ACMBot:
             max_instances=1,
             coalesce=True,
         )
+        if config.AUTO_CONTEST_CRAWL_ENABLED:
+            # 外部赛程同步单独成 job：启动即同步一次（重启后不必干等到第二天），
+            # 之后每天同一时刻再拉；否则机器人重启当天会一直缺赛程。
+            sched.add_job(
+                self._contest_crawl_job,
+                "cron",
+                hour=config.CONTEST_CRAWL_HOUR,
+                minute=config.CONTEST_CRAWL_MINUTE,
+                id="contest-crawl",
+                next_run_time=now,
+                max_instances=1,
+                coalesce=True,
+            )
         if config.DAILY_DIGEST_ENABLED:
             # 每日固定时刻推送一次聚合晨报；coalesce 保证服务重启/休眠后只补一次。
             sched.add_job(
@@ -452,6 +547,8 @@ class ACMBot:
             if content.strip().startswith("/") and is_super_admin(uid):
                 cmd, args = parse_command(content)
                 from cdutetc import group_admin
+                # 短别名归一：/面板→/管理、/绑老师→/群老师、/改→/修正
+                cmd = commands.canonical_command(cmd)
                 # 目标群会话指令最先处理：它们决定后续业务指令作用到哪个群
                 if cmd in commands.PRIVATE_SESSION_COMMANDS:
                     for reply in commands.handle_session_command(cmd, args, str(uid)) or []:
@@ -459,24 +556,54 @@ class ACMBot:
                             await self._send_private_result(uid, reply["text"])
                     return
                 if cmd in group_admin.COMMANDS:
+                    # /群配置 <序号|群名> 等价于切换工作区：先落库，再直接展示该群面板，
+                    # 这样不带 group_openid 也能一步完成「选群 + 看配置」。
+                    tokens = (args or "").split()
+                    if cmd == "群配置" and len(tokens) == 1 and tokens[0] != "全部":
+                        if commands.bind_active_group(str(uid), tokens[0]):
+                            args = ""
                     # 已绑定目标群时，群配置类指令默认落到该群（不带参数的 /群配置 即查该群）；
                     # 显式 /群配置 全部 属于跨群查询，仍按全局视角处理。
                     bound = admin_session.get_active_group(str(uid)) or ""
                     if "全部" in (args or ""):
                         bound = ""
-                    # 私聊 /群配置 <序号> 解析成功后顺手锁定工作区（C5），后续业务指令
-                    # 无需再 /选群。仅处理候选列表序号，避免与「按群查询」只读语义混淆；
-                    # 且在本条指令执行之后绑定，保证本条查询仍按原作用域解析。
-                    replies = group_admin.handle_command(cmd, args, uid, bound)
-                    if cmd == "群配置":
-                        tokens = (args or "").split()
-                        if len(tokens) == 1 and tokens[0].isdigit():
-                            commands.bind_active_group(str(uid), tokens[0])
+                    replies = group_admin.handle_command(cmd, args, uid, bound, private=True)
                     if any(reply.get("refresh_weekly") for reply in replies or []):
                         await self._weekly_contest_job()
                     # 私聊管理回执同样带工作区标牌，与业务指令出口保持一致
                     for reply in commands.with_private_header(replies, str(uid)) or []:
                         await self._send_private_result(uid, reply["text"])
+                    return
+                if cmd == "发布":
+                    # 超管私聊录入比赛：作用域=当前工作区群，抓取/提取/查重/入库全部复用
+                    # 群内 _handle_publish 链路，只是回执改走私聊，不在目标群刷屏。
+                    pub_group = admin_session.get_active_group(str(uid))
+                    if not pub_group:
+                        await self._send_private_result(
+                            uid,
+                            "还没有锁定工作区群，无法确定发布到哪个群。\n"
+                            "请先发送 /群配置 <序号> 选中目标群（/群配置 全部 可查看候选），"
+                            "再发送 /发布。",
+                        )
+                        return
+                    # 保留多行正文与链接：从原文里剥掉前缀命令词，不做任何摘要
+                    pub_text = content.strip()[3:].strip()
+                    if not pub_text:
+                        await self._send_private_result(
+                            uid,
+                            "用法：/发布 比赛名称 比赛时间（可附官网链接，支持多行）\n"
+                            f"本次将录入到工作区群 {pub_group}，所有回执只在当前私聊返回。",
+                        )
+                        return
+                    # 轻量消息对象：_handle_publish 只用到 group_id / id，
+                    # 另带 _private_uid 标记让 _safe_reply 改走私聊回执。
+                    priv_msg = types.SimpleNamespace(
+                        group_id=pub_group,
+                        user_id=uid,
+                        id=str(getattr(message, "id", "") or ""),
+                        _private_uid=uid,
+                    )
+                    await self._handle_publish(priv_msg, pub_text, pub_group, str(uid))
                     return
                 if cmd == "通知测试":
                     await self._send_private_result(uid, await self._notification_test(uid, args))
@@ -543,9 +670,15 @@ class ACMBot:
             if approve:
                 cid, created = db.approve_pending_publication(pid, operator=uid)
                 pending_item = db.get_pending_publication(pid) or {}
+                submitter_text = _format_submitter(pending_item.get("submitted_by") or "")
                 if created:
+                    logger.info(
+                        "发布申请 #%s 已入库为比赛 #%s｜提交人=%s｜审批人=%s",
+                        pid, cid, submitter_text, uid,
+                    )
                     await self._send_private_result(
                         uid, f"已入库：#{cid} {pending_item.get('name') or ''}。"
+                        f"提交人：{submitter_text}。"
                         f"已自动安排开赛前 {_format_remind_offsets()}的未来有效节点；"
                         "时间未定或已过节点不建计划。正在通知目标群。"
                     )
@@ -639,6 +772,15 @@ class ACMBot:
                 return
             text = strip_at(message.content)
             if not text:
+                return
+            # 群全量消息入口：老师没 @ 机器人、也没带 / 命令，只是在群里说安排
+            # （「周三晚七点讲图论」）时，交给隐式意图管线判断要不要登记。
+            # 队员的普通消息在这里一定返回 False，继续走原有逻辑直至放行。
+            if (not addressed
+                    and not text.startswith("/")
+                    and match_publish_command(text, config.PUBLISH_CMD) is None
+                    and await self._handle_teacher_intent(
+                        message, text, group_id, self._extract_member_id(message))):
                 return
             # 群内默认必须 @ 本机器人 才响应（含命令），避免抢答他人命令；
             # ACM_GROUP_REQUIRE_AT=0 时回退为“无 @ 也受理显式命令”。
@@ -856,6 +998,56 @@ class ACMBot:
 
         return True, None
 
+    @staticmethod
+    def _apply_teacher_text_fallback(info: dict, text: str) -> dict:
+        """老师原文兜底：官网正文吞掉时间/赛道时，用原文写明的日期与赛道补回。
+
+        - 比赛时间：提取结果为空而原文明确给出日期时补全（不覆盖模型已提取的有效时间）；
+        - 赛道：老师原文点名的赛道优先级最高，覆盖官网列出的全部赛项。
+        """
+        if not isinstance(info, dict):
+            return info
+        reference = datetime.now(ZoneInfo(config.TZ_NAME))
+        declared_time = extract_declared_contest_time(text, now=reference)
+        if declared_time and not (info.get("official_time") or info.get("contest_time")):
+            info["official_time"] = declared_time
+            info["contest_time"] = declared_time
+            logger.info("官网正文未给出比赛时间，按老师原文补全: %s", declared_time)
+        declared_tracks = extract_declared_tracks(text)
+        if declared_tracks and declared_tracks != (info.get("tracks") or ""):
+            info["tracks"] = declared_tracks
+            logger.info("赛道按老师原文覆盖: %s", declared_tracks)
+        return info
+
+    async def _handle_teacher_intent(self, message: OneBotMessage, text: str,
+                                     group_id: str, member_id: str) -> bool:
+        """老师在群里随口说安排时，识别意图并登记课程/比赛。
+
+        Returns:
+            True  → 本消息由意图管线接管（含判定为闲聊后的静默），调用方直接返回；
+            False → 不是老师或与本管线无关，调用方按原有流程继续（队员闲聊不受影响）。
+        """
+        if not config.TEACHER_AUTO_INTENT_ENABLED:
+            return False
+        try:
+            result = await teacher_intent.handle_message(
+                text, group_id=group_id, sender_id=member_id,
+                msg_id=str(getattr(message, "id", "") or ""),
+            )
+        except Exception:
+            # 意图识别是锦上添花，任何异常都退回原有流程，不能拖垮群消息处理。
+            logger.exception("老师意图识别失败，回退原有流程")
+            return False
+        if result is None:
+            return False
+        reply = result.get("reply") or ""
+        if reply and result.get("action") in {"saved", "pending"}:
+            await self._safe_reply(message, reply)
+        for uid, body in result.get("notify_private") or []:
+            if uid and body:
+                await self._send_private_result(str(uid), body)
+        return True
+
     async def _handle_publish(self, message: OneBotMessage, text: str,
                               group_id: str, member_id: str):
         """发布命令：老师/超管权限校验 → 抓取 → 提取 → 校验 → 私聊超管确认。"""
@@ -881,7 +1073,15 @@ class ACMBot:
         else:
             page = ""
 
-        raw_text = f"链接正文：{page}\n老师原文：{text}" if page else f"老师原文：{text}"
+        # 老师原文永远排在最前：官网首页往往只有通用介绍，抢权会吞掉真实比赛信息
+        if page:
+            raw_text = (
+                f"【老师直接通知（最高优先级，必须优先提取其中的时间、赛道与报名要求）】\n{text}\n\n"
+                f"【官网链接抓取参考（仅用于补充老师通知中未提及的届次、主办方等背景信息，"
+                f"严禁覆盖老师通知中的时间和赛道）】\n{page}"
+            )
+        else:
+            raw_text = f"老师原文：{text}"
         try:
             info = None if url else parse_simple_publication(text, now=datetime.now(ZoneInfo(config.TZ_NAME)))
         except ValueError as error:
@@ -897,6 +1097,10 @@ class ACMBot:
                 "可以再发一次，尽量包含比赛名称和时间；实在没有也能先存个名字~",
             )
             return
+
+        # 有官网正文时再做一次「老师原文」确定性兜底：网页泛化内容不得吞掉原文写明的日期/赛道
+        if page:
+            info = self._apply_teacher_text_fallback(info, text)
 
         info["source_link"] = url
         try:
@@ -965,7 +1169,10 @@ class ACMBot:
                 receipt += (f"\n超管私聊推送失败（成功{sent}/{len(config.SUPER_ADMIN)}）：{codes}。"
                             f"申请 #{pid} 已保留，超管可私聊发送 /待确认列表 后回复“同意 {pid}”。")
             await self._safe_reply(message, receipt)
-            logger.info("发布申请 #%s 已提交超管确认：%s", pid, info.get("name"))
+            logger.info(
+                "发布申请 #%s 已提交超管确认：%s｜提交人=%s",
+                pid, info.get("name"), _format_submitter(member_id),
+            )
             return
 
         # 显式关闭确认流程时直接发布。
@@ -1077,6 +1284,12 @@ class ACMBot:
 
     async def _safe_reply(self, message: OneBotMessage, content: str) -> bool:
         """只回复当前入站群消息，官方适配不得复用历史ID或转主动重发。"""
+        # 超管私聊录入比赛时，入参是 SimpleNamespace 轻量消息：没有真实群上下文，
+        # 一律走私聊回执，避免落进 send_group 的群白名单校验。
+        private_uid = getattr(message, "_private_uid", None)
+        if private_uid:
+            result = await self._send_private_result(str(private_uid), content)
+            return bool(result)
         group_id = message.group_id
         if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
             return False
@@ -1190,6 +1403,8 @@ class ACMBot:
         设计要点：
         - 只对授权群（运行时白名单）逐个生成，某群内容为空则整群跳过，
           不发空消息浪费额度；
+        - 今日无比赛（且当天没有其它可报事务）时静默跳过，只记 INFO 日志，
+          绝不发送「今日暂无比赛」这类空通知占用主动额度；
         - 单群失败不影响其他群：配额耗尽（11253/11263）已在
           ``_send_group_result`` 内持久熔断，这里只记告警并继续下一个群；
         - now 供离线验证注入，无时区按北京时间处理。
@@ -1202,13 +1417,22 @@ class ACMBot:
             logger.info("主动群消息未启用，暂停晨报投递")
             return 0
         sent = 0
+        skipped = 0
         try:
             for group_id in sorted(config.ALLOWED_GROUPS):
                 try:
                     if not db.group_switch_enabled(group_id, "daily_digest_enabled"):
                         continue
-                    text = daily_digest.build_daily_digest(group_id, now=now)
+                    detail = daily_digest.collect_daily_digest(group_id, now=now)
+                    text = detail["text"]
                     if not text:
+                        # 硬性跳过规则：全天无赛即静默跳过；即便群开关关闭导致
+                        # 赛事段为空，也不会发出任何「今日暂无比赛」字样。
+                        if detail["contest_enabled"] and detail["today_contest_count"] == 0:
+                            logger.info("[晨报] 群 %s 今日无比赛，已跳过发送", group_id)
+                        else:
+                            logger.info("[晨报] 群 %s 今日无可推送内容，已跳过发送", group_id)
+                        skipped += 1
                         continue
                     result = await self._send_group_result(group_id, text)
                 except Exception:  # noqa: BLE001 - 单群异常不得中断其余群
@@ -1229,6 +1453,8 @@ class ACMBot:
             logger.exception("[晨报] 本次调度执行异常，跳过本轮等待下次触发")
         if sent:
             logger.info("[晨报] 本次成功推送 %d 个群的事务总览", sent)
+        if skipped:
+            logger.info("[晨报] 本次跳过 %d 个无可推送内容的群", skipped)
         return sent
 
     async def _weekly_contest_job(self, now: datetime | None = None):
@@ -1285,13 +1511,18 @@ class ACMBot:
     async def _crawl_job(self):
         """周期抓取公共来源（默认关闭）：变化检测 → 待审更新，不自动广播。
 
-        来源抓取之后，若开启了赛程自动抓取，再顺带抓 CF / 牛客赛程；
-        两段各自兜底，任一段异常都不影响另一段，也不会让调度器崩掉。
+        外部赛程抓取已拆到 ``_contest_crawl_job``，两者互不影响。
         """
         try:
             await crawler.run_fetch(send_group=self._send_group_result)
         except Exception:  # noqa: BLE001 - 网络/解析/DB 异常统一兜底，不逸出调度器
             logger.exception("[抓取] 本轮调度执行异常，跳过本轮等待下次触发")
+
+    async def _contest_crawl_job(self):
+        """抓取 CF / 牛客外部赛程：启动时与每日固定时刻各调一次。
+
+        赛程抓取失败只记日志，任何异常都不逸出调度器。
+        """
         if not config.AUTO_CONTEST_CRAWL_ENABLED:
             return
         try:
