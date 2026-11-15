@@ -257,9 +257,10 @@ async def test_real_sdk_image_reaches_background_collection(monkeypatch, tmp_pat
     await asyncio.gather(*list(bot._meme_tasks))
     fetch.assert_awaited_once_with("https://example.invalid/a.png")
     assert db.count_meme_hashes() == 1
-    assert list(tmp_path.rglob("*.png"))  # 临时库中包含新收素材
     stored = db.get_meme_hash(memes.image_md5(image.getvalue()))
-    assert (tmp_path / stored["file_path"]).read_bytes() == image.getvalue()
+    with Image.open(tmp_path / stored["file_path"]) as saved:
+        assert saved.format == "JPEG" and saved.size == (200, 200)
+        assert saved.getpixel((100, 100))[2] > 240  # 压缩后仍是蓝色图片
 
 
 def test_non_image_official_attachment_is_ignored():
@@ -371,3 +372,57 @@ def test_invalid_or_truncated_model_tag_never_leaks_to_chat(tag):
     text, category = persona_chat.split_meme_tag("接住 " + tag)
     assert text == "接住"
     assert category == ""
+
+
+async def test_gif_without_url_extension_keeps_animation(monkeypatch, tmp_path):
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (200, 200), "blue").save(
+        buffer, "GIF", save_all=True,
+        append_images=[Image.new("RGB", (200, 200), "red")], duration=100, loop=0)
+    data = buffer.getvalue()
+    result = await memes.collect_one_image(
+        {"url": "https://example.invalid/download?fileid=123", "file": "image-id"},
+        group_id="10001", root=tmp_path, downloader=AsyncMock(return_value=data))
+    assert result is not None
+    stored = (tmp_path / result["relative_path"]).read_bytes()
+    assert stored == data
+    with Image.open(io.BytesIO(stored)) as image:
+        assert image.n_frames == 2
+
+
+@pytest.mark.parametrize("proactive", [False, True])
+async def test_cancelling_media_send_cancels_network_task(monkeypatch, proactive):
+    bot, client, api = official_media_bot(monkeypatch)
+    started, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def hang(**kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    api.post_group_message.side_effect = hang
+    task = asyncio.create_task(bot._send_meme(message(), "10001", "question", proactive=proactive))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cancelled.is_set()
+    assert memes.get_engine().recent_sent("10001") == []
+
+
+async def test_onebot_active_image_failure_stays_isolated(monkeypatch):
+    monkeypatch.setattr(config, "MEME_ENABLED", True)
+    client = OneBotClient("ws://127.0.0.1:1")
+    client.call_api = AsyncMock(side_effect=RuntimeError("offline send failed"))
+    bot = main.ACMBot(client)
+    assert not await bot._send_meme(message(), "10001", "question", proactive=True)
+    assert memes.get_engine().recent_sent("10001") == []
+
+
+def test_official_nickname_survives_normalization():
+    wrapped = wrap_group_message({"author": SimpleNamespace(member_openid="u1", username="小明")})
+    assert main.ACMBot()._nickname_of(wrapped, "u1") == "小明"

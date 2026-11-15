@@ -716,7 +716,8 @@ async def collect_one_image(ref: dict, *, group_id: str, text: str = "",
     except Exception as exc:  # noqa: BLE001 - 台账读不到时宁可不收
         logger.info("收图去重查询失败：%s", exc)
         return None
-    suffix = file_suffix(name, url)
+    # QQ 下载地址可能只有 fileid，没有扩展名；GIF 必须按内容识别以保留动画。
+    suffix = GIF_SUFFIX if data[:6] in (b"GIF87a", b"GIF89a") else file_suffix(name, url)
     accepted, reason = should_collect(data, suffix=suffix)
     if not accepted:
         logger.info("收图跳过（%s）：%s", reason, (name or url)[:80])
