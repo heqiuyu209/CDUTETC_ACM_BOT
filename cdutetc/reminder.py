@@ -46,6 +46,12 @@ _DELIVERY_LEASE_SECONDS = 120
 _DELIVERY_SEND_TIMEOUT_SECONDS = 60
 
 
+def _resolved_now(now: datetime | None = None) -> datetime:
+    """把 ``now``（缺省取系统当前时间）统一成带北京时区的 datetime。"""
+    value = now if now is not None else datetime.now(TZ)
+    return value.replace(tzinfo=TZ) if value.tzinfo is None else value.astimezone(TZ)
+
+
 def _parse_time(text: str) -> datetime | None:
     """解析存档时间文本为带北京时区的 datetime；解析失败返回 None。"""
     if not text:
@@ -115,8 +121,7 @@ async def check_contest_start_reminders(send_group, now: datetime | None = None,
         raise ValueError("提醒尝试次数必须大于零")
 
     def clock():
-        value = now if now is not None else datetime.now(TZ)
-        return value.replace(tzinfo=TZ) if value.tzinfo is None else value.astimezone(TZ)
+        return _resolved_now(now)
 
     current = clock()
     allowed = set(config.ALLOWED_GROUPS)
@@ -348,8 +353,7 @@ async def check_general_reminders(send_group, now: datetime | None = None,
     fixed_now = now
 
     def current_time():
-        current = fixed_now if fixed_now is not None else datetime.now(TZ)
-        return current.replace(tzinfo=TZ) if current.tzinfo is None else current.astimezone(TZ)
+        return _resolved_now(fixed_now)
 
     reconcile_deliveries(current_time(), max_attempts=max_attempts,
                          allowed_groups=set(config.ALLOWED_GROUPS))
@@ -530,8 +534,7 @@ async def check_custom_reminders(send_group, now: datetime | None = None,
         raise ValueError("提醒尝试次数必须大于零")
 
     def clock():
-        value = now if now is not None else datetime.now(TZ)
-        return value.replace(tzinfo=TZ) if value.tzinfo is None else value.astimezone(TZ)
+        return _resolved_now(now)
 
     sent = 0
     allowed = set(config.ALLOWED_GROUPS)

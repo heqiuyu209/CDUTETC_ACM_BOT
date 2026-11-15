@@ -282,9 +282,6 @@ def build_help(member_id: str | None, topic: str = "", *, private: bool = False)
     return "\n".join(lines)
 
 
-# 兼容旧引用：默认按普通成员展示（不含管理命令）
-HELP_TEXT = build_help(None)
-
 # ---------------------------------------------------------------------
 # v2 命令：修正（超管）
 # ---------------------------------------------------------------------
@@ -619,7 +616,7 @@ def cmd_collection_register(group_id: str, sender: str, args: str) -> list[dict]
             cid = int(rest[0])
         except ValueError:
             return [{"group_id": group_id, "text": "征集 id 应为数字"}]
-        ok, msg = db.cancel_collection_registration(cid, group_id, sender)
+        _, msg = db.cancel_collection_registration(cid, group_id, sender)
         return [{"group_id": group_id, "text": msg}]
     try:
         cid = int(parts[0])
@@ -633,7 +630,7 @@ def cmd_collection_register(group_id: str, sender: str, args: str) -> list[dict]
             return [{"group_id": group_id, "text": f"报名参数错误：{e}"}]
         if not data:
             return [{"group_id": group_id, "text": "请使用 字段=值 填写报名资料"}]
-    ok, msg = db.register_collection(cid, group_id, sender, data)
+    _, msg = db.register_collection(cid, group_id, sender, data)
     return [{"group_id": group_id, "text": msg}]
 
 
@@ -1271,7 +1268,7 @@ def cmd_group_remove(group_id: str, sender: str, args: str) -> list[dict]:
     if not is_super_admin(sender):
         return [{"group_id": group_id, "text": "仅超管可移除群"}]
     gid, _ = _split_id_note(args)
-    ok, msg = roles.remove_group(gid, operator=sender)
+    _, msg = roles.remove_group(gid, operator=sender)
     return [{"group_id": group_id, "text": msg}]
 
 
@@ -1293,7 +1290,7 @@ def cmd_teacher_remove(group_id: str, sender: str, args: str) -> list[dict]:
     if not is_super_admin(sender):
         return [{"group_id": group_id, "text": "仅超管可移除老师"}]
     uid, _ = _split_id_note(args)
-    ok, msg = roles.remove_teacher(uid, operator=sender)
+    _, msg = roles.remove_teacher(uid, operator=sender)
     return [{"group_id": group_id, "text": msg}]
 
 

@@ -39,7 +39,7 @@ from cdutetc.clients.onebot import OneBotClient, OneBotMessage
 from cdutetc import admin_session
 from cdutetc import commands
 from cdutetc import config
-from cdutetc.alias_helper import format_group_name, format_user_name
+from cdutetc.alias_helper import format_group_name
 from cdutetc import content_filter
 from cdutetc import crawler
 from cdutetc import daily_digest
@@ -72,7 +72,6 @@ from cdutetc.utils import (
     match_publish_command,
     message_mentions,
     is_super_admin,
-    mentioned_user_ids,
     parse_command,
     strip_at,
 )

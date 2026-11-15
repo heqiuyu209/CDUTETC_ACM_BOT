@@ -66,7 +66,7 @@ async def test_course_command_enters_actual_main_reminder_job(db, monkeypatch):
 
 
 async def test_next_week_has_new_identity_but_same_week_and_restart_are_deduplicated(db):
-    tid, key = training()
+    tid, _key = training()
     sender = AsyncMock(return_value=True)
     assert await reminder.check_general_reminders(sender, now=NOW) == 1
     assert await reminder.check_general_reminders(sender, now=NOW) == 0

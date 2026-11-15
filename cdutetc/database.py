@@ -4200,20 +4200,3 @@ def clear_admin_workspace(user_openid: str) -> None:
     """显式清空：保留一条空记录，防止重启后又自动回落到默认群。"""
     set_admin_workspace(user_openid, "")
 
-
-def remove_admin_workspace(user_openid: str) -> None:
-    """物理删除记录（运维/测试用，删除后重新落入「无记录」语义）。"""
-    uid = _as_str(user_openid)
-    if not uid:
-        return
-    with _connect() as conn:
-        conn.execute("DELETE FROM admin_workspaces WHERE user_openid = ?", (uid,))
-
-
-def list_admin_workspaces() -> dict[str, str]:
-    """{user_openid: group_openid}；空串即「显式清空过」。"""
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT user_openid, group_openid FROM admin_workspaces ORDER BY updated_at DESC"
-        ).fetchall()
-    return {r[0]: (r[1] or "") for r in rows}

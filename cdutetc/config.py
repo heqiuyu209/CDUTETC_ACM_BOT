@@ -128,7 +128,8 @@ def _drop_empty_env(environ=None) -> list[str]:
     return removed
 
 
-ENV_DROPPED_EMPTY = _drop_empty_env()
+# 启动时清掉值为空的 ACM_* 环境变量（必须保留该副作用，返回值无人使用）。
+_drop_empty_env()
 
 # ================= QQ 机器人接入（OneBot/NapCat，必填） =================
 # NapCatQQ 正向 WebSocket 地址，例如 ws://127.0.0.1:3001
@@ -346,7 +347,6 @@ if (not CONTEST_REMIND_OFFSETS_MINUTES or any(x <= 0 for x in CONTEST_REMIND_OFF
 REMIND_BEFORE_HOURS = int(os.getenv("ACM_REMIND_BEFORE_HOURS", "24"))
 if REMIND_CHECK_INTERVAL_MINUTES < 1 or REMIND_BEFORE_HOURS <= 0:
     raise RuntimeError("提醒扫描间隔和提前小时数必须大于零")
-REMIND_TYPES = ("reg_deadline", "contest_time")
 # 多节点提前提醒（小时，逗号分隔，支持小数）。例：24,1,0.167 表示
 # 提前 24 小时、1 小时、10 分钟各提醒一次。每场活动不建独立定时器，
 # 仍由周期扫描按「已进入哪个节点窗口」判定，资源占用与比赛数量无关。

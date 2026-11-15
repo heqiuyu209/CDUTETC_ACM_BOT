@@ -8,7 +8,6 @@
 5) 私聊标牌优先展示认领到的真实群号，逐级降级。
 """
 
-from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pytest
