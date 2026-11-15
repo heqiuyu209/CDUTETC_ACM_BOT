@@ -53,9 +53,13 @@ def _course(group_id="g1", weekday="周四", start="19:00", end="21:00",
 
 
 def _contest(name="Codeforces Round 999", official_time="2026-11-12 22:00",
-             group_id="g1") -> int:
-    cid = db.create_competition({"name": name, "official_time": official_time},
-                                status="confirmed")
+             group_id="g1", official_site="", edition="") -> int:
+    info = {"name": name, "official_time": official_time}
+    if official_site:
+        info["official_site"] = official_site
+    if edition:
+        info["edition"] = edition
+    cid = db.create_competition(info, status="confirmed")
     db.set_competition_notify_groups(cid, [group_id])
     return cid
 
@@ -227,3 +231,69 @@ def test_digest_job_silently_skips_when_no_contest_today(env, caplog):
     assert any("[晨报] 群 g1 今日无比赛，已跳过发送" in text for text in messages)
     assert any("[晨报] 群 g2 今日无比赛，已跳过发送" in text for text in messages)
     assert all("今日暂无比赛" not in text for text in messages)
+
+
+# ------------------------------------------------- G. 按平台分组排版
+
+def _groups_in(text: str) -> list[str]:
+    """按出现顺序取出所有平台分隔行。"""
+    return [line.strip("-").strip() for line in text.splitlines()
+            if line.startswith("-----")]
+
+
+def test_digest_groups_contests_by_platform(env):
+    """五类平台各一场：分组标题按固定顺序出现，有链接才输出「链接：」行。"""
+    _weekly(name="队内周赛", official_time="2026-11-15 19:00")   # 无链接
+    _contest(name="牛客小白月赛 100", official_time="2026-11-15 20:00",
+             official_site="https://ac.nowcoder.com/acm/contest/88888")
+    _contest(name="Codeforces Round 2030", official_time="2026-11-15 22:35",
+             official_site="https://codeforces.com/contest/2030")
+    _contest(name="AtCoder Beginner Contest 380", official_time="2026-11-15 20:00",
+             official_site="https://atcoder.jp/contests/abc380")
+    _contest(name="蓝桥杯热身赛", official_time="2026-11-15 14:00")   # 无平台、无链接
+
+    text = daily_digest.build_daily_digest("g1", SUN)
+
+    assert text.splitlines()[0] == "☀️ CDUTETC ACM 今日早报（11-15 周日）"
+    assert "🏆 今日赛事（5 场）" in text
+    assert _groups_in(text) == ["CDUTETC_ACM", "牛客", "Codeforces", "AtCoder", "其他赛事"]
+    # 每场都是「- HH:MM（倒计时后）」+ 名称两行结构
+    assert "- 19:00（11 小时后）\n  队内周赛" in text
+    assert "- 22:35（14 小时 35 分钟后）\n  Codeforces Round 2030" in text
+    # 有链接的场次紧跟链接行
+    assert "  链接：https://ac.nowcoder.com/acm/contest/88888" in text
+    assert "  链接：https://codeforces.com/contest/2030" in text
+    assert "  链接：https://atcoder.jp/contests/abc380" in text
+    # 无链接的场次不能出现空的「链接：」标签
+    cdutetc_block = text.split("-------牛客-------")[0]
+    assert "队内周赛" in cdutetc_block and "链接：" not in cdutetc_block
+    other_block = text.split("-------其他赛事-------")[1]
+    assert "蓝桥杯热身赛" in other_block and "链接：" not in other_block
+
+
+def test_digest_sorts_contests_inside_platform_group(env):
+    """同一平台内按开赛时间升序，与入库顺序无关。"""
+    _contest(name="Codeforces Round 991", official_time="2026-11-15 22:35",
+             official_site="https://codeforces.com/contest/2031")
+    _contest(name="Codeforces Round 990", official_time="2026-11-15 19:00",
+             official_site="https://codeforces.com/contest/2030")
+
+    text = daily_digest.build_daily_digest("g1", SUN)
+
+    assert _groups_in(text) == ["Codeforces"]
+    assert text.index("Codeforces Round 990") < text.index("Codeforces Round 991")
+
+
+def test_digest_has_no_command_footer(env):
+    """晨报结尾不得再出现分隔线与「发送对应命令…查看详情」引导。"""
+    _course(title="周日集训")
+    _contest(name="牛客小白月赛 100", official_time="2026-11-15 20:00",
+             official_site="https://ac.nowcoder.com/acm/contest/88888")
+    db.create_custom_reminder("g1", "交周报", "2026-11-15 21:00")
+
+    text = daily_digest.build_daily_digest("g1", SUN)
+
+    assert "发送对应命令" not in text
+    assert "查看详情" not in text
+    assert "------------------------" not in text
+    assert text.rstrip().endswith("21:00 交周报")

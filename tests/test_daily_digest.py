@@ -139,12 +139,15 @@ def test_digest_renders_plain_text_overview(env):
 
     text = daily_digest.build_daily_digest("g1", NOW)
 
-    assert text.startswith(daily_digest.DIGEST_TITLE)
+    assert text.splitlines()[0] == "☀️ CDUTETC ACM 今日早报（11-11 周三）"
     assert "📚 今日课程/训练：" in text
     assert "2026-11-11 19:00-21:00 图论进阶 (地点：实训楼 B302)" in text
-    assert "🏆 今日赛事：" in text and "Codeforces Round 990" in text
+    assert "🏆 今日赛事（1 场）" in text and "Codeforces Round 990" in text
     assert "🗓 今日其他安排：" in text and "20:00 交周报" in text
-    assert text.rstrip().endswith(daily_digest.DIGEST_FOOTER)
+    # 底部不再追加命令引导与分隔线
+    assert "发送对应命令" not in text and "查看详情" not in text
+    assert "-" * 20 not in text
+    assert text.rstrip().endswith("20:00 交周报")
     for markdown in ("**", "##", "|", "`"):  # 纯文本，防官方客户端拦截
         assert markdown not in text
 
@@ -154,7 +157,7 @@ def test_digest_omits_empty_sections(env):
     text = daily_digest.build_daily_digest("g1", NOW)
     assert "🗓 今日其他安排：" in text
     assert "📚 今日课程/训练：" not in text
-    assert "🏆 今日赛事：" not in text
+    assert "🏆 今日赛事（" not in text
 
 
 # --------------------------------------------------------------- 搭便车
