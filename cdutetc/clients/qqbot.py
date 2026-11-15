@@ -371,6 +371,77 @@ class QQBotClient(BaseBotClient):
                 return GroupActivePermission(code="platform_error", platform_code=code)
         return GroupActivePermission()
 
+    async def upload_group_media(self, group_id: str, url: str, *,
+                                 file_type: int = 1) -> tuple[str, int] | None:
+        """把公网图片 URL 换成 file_info（官方富媒体发图的前置步骤）。
+
+        Returns:
+            (file_info, ttl 秒)；任何前置条件不满足或平台报错都返回 None，
+            由调用方静默降级，绝不让发图失败影响主业务流程。
+        """
+        group = str(group_id or "").strip()
+        address = str(url or "").strip()
+        if not group or not address:
+            return None
+        api = self._api()
+        if api is None:
+            return None
+        http = getattr(api, "_http", None)
+        if not callable(getattr(http, "request", None)):
+            return None
+        try:
+            from botpy.http import Route
+        except ImportError:
+            return None
+        route = Route("POST", "/v2/groups/{group_openid}/files", group_openid=group)
+        # sdkfileid 与 url 二选一，这里只走公网 URL 拉取。
+        payload = {"file_type": int(file_type), "url": address, "sdkfileid": ""}
+        try:
+            response = await asyncio.wait_for(http.request(route, json=payload), timeout=10.0)
+        except Exception as error:  # noqa: BLE001
+            logger.warning("表情包上传失败，跳过本次发图: %s", error)
+            return None
+        if not isinstance(response, dict):
+            return None
+        file_info = str(response.get("file_info") or "").strip()
+        if not file_info:
+            logger.warning("表情包上传未返回 file_info，跳过本次发图")
+            return None
+        ttl = response.get("ttl")
+        try:
+            ttl_seconds = int(ttl) if ttl is not None else 0
+        except (TypeError, ValueError):
+            ttl_seconds = 0
+        return file_info, ttl_seconds
+
+    async def send_group_media_result(self, group_id: str, file_info: str, *,
+                                      reply_to: str | None = None, reply_seq: int = 1):
+        """用 msg_type=7 发富媒体（图片）；有 reply_to 时走被动回复。"""
+        from cdutetc.errors import DeliveryCode, DeliveryMode, DeliveryResult
+
+        mode = DeliveryMode.PASSIVE if reply_to is not None else DeliveryMode.ACTIVE
+        if not str(file_info or "").strip():
+            return DeliveryResult(False, DeliveryCode.EMPTY_MESSAGE, "qqbot", mode)
+        if not str(group_id or "").strip():
+            return DeliveryResult(False, DeliveryCode.INVALID_TARGET, "qqbot", mode,
+                                  detail="empty_group_id")
+        if reply_to is not None and (not reply_to or type(reply_seq) is not int
+                                     or not 1 <= reply_seq <= 5):
+            return DeliveryResult(False, DeliveryCode.INVALID_REQUEST, "qqbot", mode,
+                                  detail="invalid_passive_reply")
+        params = {
+            "group_openid": group_id,
+            "msg_type": 7,
+            "media": {"file_info": file_info},
+        }
+        if reply_to is not None:
+            params["msg_id"] = reply_to
+            params["msg_seq"] = reply_seq
+        else:
+            self._active_msg_seq = self._active_msg_seq % (2**31 - 1) + 1
+            params["msg_seq"] = self._active_msg_seq
+        return await self._post_result("post_group_message", mode=mode, **params)
+
     async def send_group_msg_result(self, group_id: str, text: str, *,
                                     reply_to: str | None = None, reply_seq: int = 1,
                                     message_format: str = "text"):
