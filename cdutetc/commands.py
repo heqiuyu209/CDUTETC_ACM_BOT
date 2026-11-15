@@ -411,10 +411,10 @@ def _smart_amend_fields(rest: str) -> tuple[dict[str, str], str]:
 
 
 def _broadcast_to_groups(competition_name: str, cid: int, text: str, exclude: str = "") -> list[dict]:
-    """向全部允许群广播一条通知（排除触发群可选）。订阅体系已移除，修正/发布影响全体群。"""
+    """修正通知沿用该比赛的当前范围，不能绕过普通比赛或周赛的群隔离。"""
     return [
-        {"group_id": gid, "text": text}
-        for gid in sorted(config.ALLOWED_GROUPS)
+        {"group_id": gid, "text": text, "active_group": True}
+        for gid in sorted(db.get_competition_target_groups(cid))
         if gid != exclude
     ]
 
@@ -2014,6 +2014,9 @@ def _with_private_header(result: list[dict] | None, origin_sender: str,
     head = _private_header(origin_sender)
     decorated: list[dict] = []
     for item in result:
+        if item.get("active_group"):
+            decorated.append(item)
+            continue
         text = (item.get("text") or "").strip()
         decorated.append({**item, "text": f"{head}\n{text}"} if text else item)
     return decorated
@@ -2087,7 +2090,7 @@ async def _handle_command_impl(text: str, group_id: str, sender: str,
                 active_group, args = bound, ""
     # 私聊绑定目标群（或默认工作区）时降维成「单群视角」：作用域按该群校验，展示范围也只到该群
     if (private and is_super_admin(sender) and cmd not in PRIVATE_SESSION_COMMANDS
-            and cmd not in GROUP_ADMIN_COMMANDS):
+            and cmd not in GROUP_ADMIN_COMMANDS and cmd != "修正"):
         target = active_group
         if not target and cmd in WORKSPACE_COMMANDS:
             # 省略群标识：直接落到超管工作区（重启后按库恢复，未选定回落正式群）

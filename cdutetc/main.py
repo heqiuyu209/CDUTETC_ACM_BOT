@@ -94,6 +94,7 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 _reply_sequence = contextvars.ContextVar("qq_reply_sequence", default=0)
 _private_reply_context = contextvars.ContextVar("qq_private_reply_context", default=None)
+_ACTIVE_SEND_TIMEOUT_SECONDS = 20
 
 # 官方协议严格限制被动回复 msg_seq 在 [1,5]，第 6 条会被平台判为 INVALID_REQUEST。
 _MAX_PASSIVE_REPLY_SEQ = 5
@@ -119,6 +120,8 @@ def _merge_group_reply_texts(texts: list[str]) -> list[str]:
 
 
 def _notification_summary(sent: int, total: int) -> str:
+    if total == 0:
+        return "群通知未发送：没有已授权的目标群，请核对比赛通知范围和群授权。"
     if not config.GROUP_ACTIVE_MESSAGES_ENABLED and sent == 0:
         return "群通知未发送：主动群消息未启用，请联系管理员。"
     if sent == total:
@@ -129,6 +132,21 @@ def _notification_summary(sent: int, total: int) -> str:
         f"群通知已发送：{sent}/{total} 个目标群；"
         f"其余 {total - sent} 个群未确认发送，请管理员检查平台权限或限额。"
     )
+
+
+def _notification_details(results: list[tuple[str, DeliveryResult]]) -> str:
+    summary = _notification_summary(sum(result.ok for _, result in results), len(results))
+    lines = [summary]
+    for gid, result in results[:10]:
+        try:
+            label = db.describe_account("group", gid)
+        except sqlite3.Error:
+            label = gid if len(gid) <= 14 else f"{gid[:8]}…{gid[-4:]}"
+        status = "平台已接受" if result.ok else result.user_hint
+        lines.append(f"{label}：{status}")
+    if len(results) > 10:
+        lines.append(f"另有 {len(results) - 10} 个群，已计入上方汇总；失败详情见日志。")
+    return "\n".join(lines)
 
 
 def _build_publish_notice(info: dict, cid: int) -> str:
@@ -434,8 +452,7 @@ class ACMBot:
         now = now or datetime.now(tz)
         now = now.replace(tzinfo=tz) if now.tzinfo is None else now.astimezone(tz)
         sched = AsyncIOScheduler(timezone=config.TZ_NAME)
-        # legacy 比赛提醒（contests/reminders 旧表）已下线；此处只跑通用提醒
-        # （征集截止 / 公共比赛 / 课程开课），扫描节奏沿用原配置项。
+        # 通用与旧群赛事提醒共用扫描周期。
         sched.add_job(
             self._general_remind_job,
             "interval",
@@ -626,7 +643,7 @@ class ACMBot:
                     await self._send_private_result(uid, await self._notification_test(uid, args))
                     return
                 # 私聊绑定目标群后，业务指令按该群的单群视角执行（写库/查询/诊断都落到该群），
-                # 回执一律走私聊 _send_private_result，绝不向真实群发送任何消息。
+                # 管理回执走私聊；比赛修正产生的公告按目标群主动投递。
                 active_group = admin_session.get_active_group(str(uid))
                 admin_gid = active_group or admin_group_id()
                 if not admin_gid:
@@ -640,11 +657,20 @@ class ACMBot:
                             "或设置 ACM_ADMIN_GROUP / ACM_ALLOWED_GROUPS）",
                         )
                         return
+                # 私聊修正没有来源群；所有目标群都必须收到主动通知。
+                command_group = "" if cmd == "修正" else admin_gid
                 replies = await commands.handle_command(
-                    content, admin_gid, uid, private=True, active_group=active_group)
+                    content, command_group, uid, private=True, active_group=active_group)
+                group_notices = []
                 for reply in replies or []:
                     if reply.get("text"):
-                        await self._send_private_result(uid, reply["text"])
+                        if reply.get("active_group"):
+                            group_notices.append(reply)
+                        else:
+                            await self._send_private_result(uid, reply["text"])
+                if group_notices:
+                    results = await self._send_group_notices(group_notices)
+                    await self._send_private_result(uid, _notification_details(results))
                 return
             from cdutetc import group_admin
             if is_super_admin(uid):
@@ -696,7 +722,7 @@ class ACMBot:
                     await self._send_private_result(
                         uid, f"已入库：#{cid} {pending_item.get('name') or ''}。"
                         f"提交人：{submitter_text}。"
-                        f"已自动安排开赛前 {_format_remind_offsets()}的未来有效节点；"
+                        f"仅为有比赛时间的目标群安排开赛前 {_format_remind_offsets()}的未来节点；"
                         "时间未定或已过节点不建计划。正在通知目标群。"
                     )
                     await self._notify_publish_group(pending_item, cid, uid)
@@ -718,22 +744,32 @@ class ACMBot:
         """超管同意后发送新比赛通知：只发给该比赛的通知范围（默认仅来源群）。"""
         info = json.loads(pending_item.get("fields_json") or "{}")
         notice = _build_publish_notice(info, cid)
+        detail = await self._publish_to_groups(cid, notice)
+        await self._send_private_result(operator_id, f"比赛 #{cid} 已获批。\n{detail}")
+
+    async def _publish_to_groups(self, cid: int, notice: str) -> str:
         try:
             targets = sorted(db.get_competition_target_groups(cid))
         except (sqlite3.Error, ValueError):
-            targets = []
-        results = []
-        for gid in targets:
-            results.append(await self._send_group_result(gid, notice))
-        failures = [result for result in results if not result.ok]
-        if failures:
-            codes = sorted({getattr(result.code, "value", str(result.code)) for result in failures})
-            logger.warning("比赛 #%s 群通知结果失败码=%s", cid, ",".join(codes))
-            await self._send_private_result(
-                operator_id,
-                f"比赛 #{cid} 已获批并保存提醒计划，但群通知未全部确认送达："
-                + "、".join(f"[{code}]" for code in codes),
-            )
+            logger.exception("比赛 #%s 通知范围读取失败", cid)
+            return "群通知未发送：[internal] 通知范围读取失败，比赛资料已保存。"
+
+        results = await self._send_group_notices([{"group_id": gid, "text": notice} for gid in targets])
+        for gid, result in results:
+            if not result.ok:
+                logger.warning("比赛 #%s 群 %s 通知未发送 [%s]", cid, gid, result.code.value)
+        return _notification_details(results)
+
+    async def _send_group_notices(self, notices: list[dict]) -> list[tuple[str, DeliveryResult]]:
+        async def send(item):
+            try:
+                return await self._send_group_result(item["group_id"], item["text"])
+            except Exception as error:
+                logger.exception("群 %s 主动通知处理失败", item["group_id"])
+                return result_from_exception(error, protocol=self.protocol, mode=DeliveryMode.ACTIVE)
+
+        results = await notifications.map_by_group(notices, send)
+        return [(item["group_id"], result) for item, result in zip(notices, results)]
 
     # ---------- 群消息路由 ----------
 
@@ -897,8 +933,7 @@ class ACMBot:
                         for reply in replies
                         if reply.get("text")
                     ]
-            cross_sent = 0
-            cross_total = 0
+            group_notices = []
             admin_notice_texts = []
             same_group_texts = [
                 reply["text"] for reply in (replies or [])
@@ -930,9 +965,7 @@ class ACMBot:
                         await self._safe_reply(message, merged_texts[merged_cursor])
                         merged_cursor += 1
                 else:
-                    cross_total += 1
-                    if (await self._send_group_result(target_group, reply["text"])).ok:
-                        cross_sent += 1
+                    group_notices.append({"group_id": target_group, "text": reply["text"]})
                 if reply.get("notify_super_admin"):
                     admin_notice_texts.append(reply["text"])
             if admin_notice_texts:
@@ -955,8 +988,9 @@ class ACMBot:
                         f"操作已保存，超管私聊确认仅送达 {sent}/{len(config.SUPER_ADMIN)} 人；"
                         "未收到者可查看 /群列表 或 /老师列表。",
                     )
-            if cross_total:
-                await self._safe_reply(message, _notification_summary(cross_sent, cross_total))
+            if group_notices:
+                results = await self._send_group_notices(group_notices)
+                await self._safe_reply(message, _notification_details(results))
         except Exception:
             logger.exception("处理群消息失败")
             await self._safe_reply(message, safe_error_hint(AppErrorCode.INTERNAL))
@@ -1433,18 +1467,7 @@ class ACMBot:
         logger.info("已免审发布比赛: %s（群 %s）", info.get("name"), group_id)
         notice = _build_publish_notice(competition_info, cid)
         # 只发该比赛的通知范围（默认即发布它的群），不再全群广播
-        try:
-            targets = sorted(db.get_competition_target_groups(cid))
-        except (sqlite3.Error, ValueError):
-            targets = []
-        results = [await self._send_group_result(gid, notice) for gid in targets]
-        failures = [result for result in results if not result.ok]
-        if failures:
-            codes = sorted({getattr(result.code, "value", str(result.code)) for result in failures})
-            detail = _notification_summary(len(results) - len(failures), len(targets))
-            detail += " 失败码：" + ",".join(f"[{code}]" for code in codes)
-        else:
-            detail = _notification_summary(len(results), len(targets))
+        detail = await self._publish_to_groups(cid, notice)
         await self._safe_reply(
             message,
             _build_publish_receipt(competition_info, status="已入库", ref=cid)
@@ -1475,7 +1498,13 @@ class ACMBot:
                                                    message_format=requested_format)
         else:
             # 特意不调用_send_private：该方法可能为当前入站生成被动回复。
-            result = await notifications.send_private(self.client, target, text)
+            try:
+                result = await asyncio.wait_for(
+                    notifications.send_private(self.client, target, text),
+                    timeout=_ACTIVE_SEND_TIMEOUT_SECONDS,
+                )
+            except Exception as error:
+                result = result_from_exception(error, protocol=self.protocol, mode=DeliveryMode.ACTIVE)
         code = getattr(result.code, "value", str(result.code))
         answer = f"通知测试：{'平台已接受' if result.ok else '未确认发送'} [{code}] {result.user_hint}"
         if kind == "群" and result.ok:
@@ -1514,7 +1543,10 @@ class ACMBot:
             if msg_id:
                 kwargs = {"reply_to": msg_id, "reply_seq": seq}
         try:
-            return await notifications.send_private(self.client, user_id, text, **kwargs)
+            return await asyncio.wait_for(
+                notifications.send_private(self.client, user_id, text, **kwargs),
+                timeout=_ACTIVE_SEND_TIMEOUT_SECONDS,
+            )
         except Exception as error:
             logger.warning("私聊发送异常 [%s]", type(error).__name__)
             mode = DeliveryMode.PASSIVE if self.supports_passive_reply and kwargs else DeliveryMode.ACTIVE
@@ -1583,35 +1615,42 @@ class ACMBot:
         if message_format is not None and message_format not in ("text", "markdown"):
             return DeliveryResult(False, DeliveryCode.INVALID_REQUEST, self.protocol,
                                   detail="invalid_message_format")
+        recovering = False
         if self.supports_passive_reply and not permission_probe:
             block = db.get_group_notification_block(self.protocol, group_id)
             if block:
-                return DeliveryResult(False, DeliveryCode.ACTIVE_FORBIDDEN, self.protocol,
-                                      detail="active_permission_paused", platform_code=block["platform_code"])
+                if not db.claim_group_notification_retry(self.protocol, group_id):
+                    return DeliveryResult(False, DeliveryCode.ACTIVE_FORBIDDEN, self.protocol,
+                                          detail="active_permission_paused", platform_code=block["platform_code"])
+                recovering = True
         if self.supports_passive_reply:
             message_format = message_format or db.get_group_notification_format(self.protocol, group_id)
         else:
             message_format = "text"
-        if message_format == "markdown":
-            result = await notifications.send_group(self.client, group_id, text, message_format=message_format)
-        else:
-            result = await notifications.send_group(self.client, group_id, text)
+        try:
+            kwargs = {"message_format": message_format} if message_format == "markdown" else {}
+            result = await asyncio.wait_for(
+                notifications.send_group(self.client, group_id, text, **kwargs),
+                timeout=_ACTIVE_SEND_TIMEOUT_SECONDS,
+            )
+        except Exception as error:
+            result = result_from_exception(error, protocol=self.protocol, mode=DeliveryMode.ACTIVE)
         if self.supports_passive_reply:
             if result.code == DeliveryCode.ACTIVE_FORBIDDEN:
                 db.block_group_notifications(self.protocol, group_id, result.code.value, result.platform_code)
-                logger.warning("QQ主动发送被平台拒绝，已持久暂停该群，需恢复权限后执行 /通知测试 群 验证 [40034105]")
+                logger.warning("QQ主动发送被平台拒绝，已暂停该群；五分钟后有待发消息时重试，或 /通知测试 群 立即验证 [40034105]")
             elif result.code == DeliveryCode.QUOTA_EXHAUSTED:
-                # 配额耗尽当天无法恢复，必须熔断，否则30秒/30分钟定时任务会持续无效重试。
+                # 配额耗尽当天不进行五分钟恢复尝试；保持次日自动恢复语义。
                 db.block_group_notifications(self.protocol, group_id, result.code.value, result.platform_code)
                 logger.warning(
                     "[主动发信限流] 群 %s 今日主动消息配额已耗尽(11253/11263)，停止重试并触发今日熔断",
                     group_id,
                 )
-            elif result.ok and permission_probe:
+            elif result.ok and (permission_probe or recovering):
                 try:
                     db.confirm_group_notification_channel(self.protocol, group_id, message_format)
                 except sqlite3.Error:
-                    logger.exception("平台已接受主动测试，但本群通知格式和暂停状态保存失败")
+                    logger.exception("平台已接受主动消息，但本群通知格式和暂停状态保存失败")
                     result = replace(result, detail="channel_state_save_failed")
         return result
 
@@ -1625,7 +1664,7 @@ class ACMBot:
             logger.exception("开赛提醒计划扫描失败 [%s]", AppErrorCode.INTERNAL)
 
     async def _general_remind_job(self):
-        """周期检查通用提醒：征集登记截止 + 公共比赛 + 训练开始。"""
+        """周期检查征集、比赛和训练提醒。"""
         if not config.GROUP_ACTIVE_MESSAGES_ENABLED:
             logger.info("主动群消息未启用，暂停提醒投递")
             return

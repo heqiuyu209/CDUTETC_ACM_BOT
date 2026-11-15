@@ -358,6 +358,7 @@ CREATE TABLE IF NOT EXISTS group_notification_blocks (
     error_code    TEXT NOT NULL,
     platform_code INTEGER,
     blocked_at    TEXT NOT NULL,
+    retry_after   TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (protocol, group_id)
 )
 """
@@ -717,6 +718,9 @@ def init_db() -> None:
             for ddl in _INDEX_DDL:
                 conn.execute(ddl)
             _migrate_source_activity(conn)
+            block_columns = {r[1] for r in conn.execute("PRAGMA table_info(group_notification_blocks)")}
+            if "retry_after" not in block_columns:
+                conn.execute("ALTER TABLE group_notification_blocks ADD COLUMN retry_after TEXT NOT NULL DEFAULT ''")
     finally:
         if owns_conn:
             conn.close()
@@ -858,7 +862,10 @@ def has_reminded(group_id: str, contest_id: int, remind_type: str, target_time: 
             "SELECT 1 FROM reminders WHERE group_id=? AND contest_id=? AND remind_type=? AND target_time=?",
             (group_id, contest_id, remind_type, target_time),
         ).fetchone()
-        return row is not None
+        if row is not None:
+            return True
+        key = delivery_dedup_key(group_id, "legacy_contest", contest_id, remind_type, target_time)
+        return conn.execute("SELECT 1 FROM reminder_success_receipts WHERE dedup_key=?", (key,)).fetchone() is not None
 
 
 # LEGACY(P1): contests/reminders 旧表读写，仅供历史数据迁移与清理；新代码请用 competitions 新链。
@@ -2674,6 +2681,19 @@ def amend_competition(cid: int, info: dict, operator: str = "", note: str = "", 
         return True
 
 
+def sync_future_contest_start_reminders(now: datetime | None = None) -> None:
+    """启动和授权变化后补齐未来计划；不补过去节点、不重置发送历史。"""
+    current = _delivery_now(now)
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT id FROM competitions WHERE status='confirmed' AND official_time>=?",
+            (current.strftime("%Y-%m-%d %H:%M"),),
+        ).fetchall()
+        for (cid,) in rows:
+            _sync_contest_start_reminders(conn, cid, now=current)
+
+
 def _sync_contest_start_reminders(conn: sqlite3.Connection, competition_id: int,
                                   group_ids=None, *, now: datetime | None = None) -> None:
     """在业务写事务中同步比赛开赛前节点；过去节点不创建、不补发。"""
@@ -2906,6 +2926,21 @@ def _delivery_parse_time(text: str) -> datetime | None:
     return None
 
 
+def _legacy_reminder_succeeded_on(conn: sqlite3.Connection, group_id: str, contest_id: int,
+                                  remind_type: str, target_time: str) -> bool:
+    for row in conn.execute(
+        "SELECT target_time FROM reminders WHERE group_id=? AND contest_id=? AND remind_type=?",
+        (group_id, contest_id, remind_type),
+    ):
+        if _canonical_time(row[0]) == target_time:
+            return True
+    key = delivery_dedup_key(group_id, "legacy_contest", contest_id, remind_type, target_time)
+    return conn.execute(
+        "SELECT 1 FROM reminder_success_receipts WHERE dedup_key=? UNION ALL "
+        "SELECT 1 FROM reminder_deliveries WHERE dedup_key=? AND status='sent' LIMIT 1", (key, key),
+    ).fetchone() is not None
+
+
 def _delivery_invalid_status(conn: sqlite3.Connection, delivery: dict,
                              now: datetime, allowed_groups: set[str] | None = None) -> str | None:
     """发送前按当前对象状态/目标复核；旧计划失效即终结。"""
@@ -2933,6 +2968,15 @@ def _delivery_invalid_status(conn: sqlite3.Connection, delivery: dict,
             return "cancelled"
         if delivery["group_id"] not in _competition_target_groups_on(conn, delivery["obj_id"]):
             return "cancelled"
+        old_type = {"reg_deadline": "reg_deadline", "contest_start": "contest_time"}[delivery["remind_type"]]
+        migrations = conn.execute(
+            "SELECT object_id FROM audit_log WHERE action='migrate' AND object_type='contest' AND after_json=?",
+            (f"->competition {delivery['obj_id']}",),
+        ).fetchall()
+        for (old_id,) in migrations:
+            if old_id.isdecimal() and _legacy_reminder_succeeded_on(
+                    conn, delivery["group_id"], int(old_id), old_type, delivery["target_time"]):
+                return "cancelled"
     elif delivery["obj_type"] == "training_session":
         if delivery["remind_type"] != "start_time" or not delivery["group_id"]:
             return "cancelled"
@@ -2942,6 +2986,24 @@ def _delivery_invalid_status(conn: sqlite3.Connection, delivery: dict,
         target = _delivery_parse_time(delivery["target_time"])
         if (row is None or row[1] != delivery["group_id"] or target is None
                 or not training_occurrence_valid(_row_to_training(row), target)):
+            return "cancelled"
+    elif delivery["obj_type"] == "legacy_contest":
+        field = {"reg_deadline": "reg_deadline", "contest_time": "contest_time"}.get(delivery["remind_type"])
+        if field is None or not delivery["group_id"]:
+            return "cancelled"
+        row = conn.execute(f"SELECT group_id, {field} FROM contests WHERE id=?", (delivery["obj_id"],)).fetchone()
+        if (row is None or row[0] != delivery["group_id"]
+                or _canonical_time(row[1]) != delivery["target_time"]):
+            return "cancelled"
+        # 新比赛一旦确认接管，退回草稿待审也不能恢复旧表里的过期内容。
+        superseded = conn.execute(
+            "SELECT 1 FROM audit_log a JOIN competitions c ON a.after_json = '->competition ' || c.id"
+            " WHERE a.action='migrate' AND a.object_type='contest' AND a.object_id=?"
+            " AND (c.status='confirmed' OR EXISTS (SELECT 1 FROM competition_versions v"
+            " WHERE v.competition_id=c.id AND v.kind='confirmed')) LIMIT 1",
+            (str(delivery["obj_id"]),),
+        ).fetchone()
+        if superseded:
             return "cancelled"
     else:
         return "cancelled"
@@ -3009,6 +3071,20 @@ def claim_delivery(group_id: str, obj_type: str, obj_id: int, remind_type: str,
         return None
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        if obj_type == "competition" and remind_type in ("reg_deadline", "contest_start"):
+            old_type = "contest_time" if remind_type == "contest_start" else "reg_deadline"
+            inflight = conn.execute(
+                "SELECT d.lease_token, d.lease_until FROM reminder_deliveries d"
+                " JOIN audit_log a ON a.object_id=CAST(d.obj_id AS TEXT)"
+                " WHERE a.action='migrate' AND a.object_type='contest' AND a.after_json=?"
+                " AND d.obj_type='legacy_contest' AND d.group_id=? AND d.remind_type=?"
+                " AND d.target_time=? AND d.status='sending'",
+                (f"->competition {obj_id}", group_id, old_type, target_time),
+            ).fetchall()
+            for lease_token, lease_until in inflight:
+                until = _delivery_parse_time(lease_until)
+                if lease_token and until and until > now:
+                    return None
         if key != legacy_key:
             legacy = conn.execute(
                 "SELECT status FROM reminder_deliveries WHERE dedup_key = ?", (legacy_key,),
@@ -3031,6 +3107,18 @@ def claim_delivery(group_id: str, obj_type: str, obj_id: int, remind_type: str,
         )
         row = conn.execute(f"SELECT {_DELIVERY_COLS} FROM reminder_deliveries WHERE dedup_key = ?", (key,)).fetchone()
         delivery = _row_to_delivery(row)
+        if obj_type == "legacy_contest":
+            history = conn.execute(
+                "SELECT target_time, sent_at FROM reminders WHERE group_id=? AND contest_id=? AND remind_type=?",
+                (group_id, obj_id, remind_type),
+            ).fetchall()
+            for history_target, sent_at in history:
+                if _canonical_time(history_target) == target_time:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO reminder_success_receipts (dedup_key, lease_token, sent_at) VALUES (?, ?, ?)",
+                        (key, "legacy-history", sent_at),
+                    )
+                    return None
         if remind_type == "contest_start":
             scheduled = _delivery_parse_time(delivery.get("scheduled_at") or "")
             if scheduled is None or now < scheduled or delivery["status"] == "cancelled":
@@ -3231,12 +3319,12 @@ def get_group_notification_block(protocol: str, group_id: str) -> dict | None:
     """按协议和群读取暂停状态；配额耗尽只阻断发生当天。"""
     with _connect() as conn:
         row = conn.execute(
-            "SELECT error_code, platform_code, blocked_at FROM group_notification_blocks WHERE protocol=? AND group_id=?",
+            "SELECT error_code, platform_code, blocked_at, retry_after FROM group_notification_blocks WHERE protocol=? AND group_id=?",
             (protocol, group_id),
         ).fetchone()
     if not row:
         return None
-    block = dict(zip(("error_code", "platform_code", "blocked_at"), row))
+    block = dict(zip(("error_code", "platform_code", "blocked_at", "retry_after"), row))
     if block["error_code"] == DeliveryCode.QUOTA_EXHAUSTED.value:
         blocked_at = _delivery_parse_time(block["blocked_at"])
         now = _delivery_parse_time(now_str())
@@ -3245,13 +3333,59 @@ def get_group_notification_block(protocol: str, group_id: str) -> dict | None:
     return block
 
 
+_GROUP_PERMISSION_RETRY_SECONDS = 300
+
+
+def _group_retry_time(block: dict) -> datetime:
+    retry_after = _delivery_parse_time(block.get("retry_after") or "")
+    if retry_after is not None:
+        return retry_after
+    blocked_at = _delivery_parse_time(block.get("blocked_at") or "") or _delivery_now()
+    return blocked_at + timedelta(seconds=_GROUP_PERMISSION_RETRY_SECONDS)
+
+
+def group_notification_paused(protocol: str, group_id: str, now: datetime | None = None) -> bool:
+    block = get_group_notification_block(protocol, group_id)
+    return block is not None and (block["error_code"] != DeliveryCode.ACTIVE_FORBIDDEN.value
+                                  or _delivery_now(now) < _group_retry_time(block))
+
+
+def claim_group_notification_retry(protocol: str, group_id: str) -> bool:
+    """跨任务/进程共用五分钟冷却；领取不解除暂停，成功回执才解除。"""
+    current = _delivery_now()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT error_code, blocked_at, retry_after FROM group_notification_blocks WHERE protocol=? AND group_id=?",
+            (protocol, group_id),
+        ).fetchone()
+        if row is None:
+            return True
+        block = dict(zip(("error_code", "blocked_at", "retry_after"), row))
+        if block["error_code"] == DeliveryCode.QUOTA_EXHAUSTED.value:
+            blocked_at = _delivery_parse_time(block["blocked_at"])
+            quota_now = _delivery_parse_time(now_str())
+            return bool(blocked_at and quota_now and blocked_at.date() < quota_now.date())
+        if block["error_code"] != DeliveryCode.ACTIVE_FORBIDDEN.value:
+            return False
+        if current < _group_retry_time(block):
+            return False
+        conn.execute(
+            "UPDATE group_notification_blocks SET retry_after=? WHERE protocol=? AND group_id=?",
+            ((current + timedelta(seconds=_GROUP_PERMISSION_RETRY_SECONDS)).strftime("%Y-%m-%d %H:%M:%S"),
+             protocol, group_id),
+        )
+        return True
+
+
 def block_group_notifications(protocol: str, group_id: str, error_code: str, platform_code: int | None) -> None:
+    retry_after = (_delivery_now() + timedelta(seconds=_GROUP_PERMISSION_RETRY_SECONDS)).strftime("%Y-%m-%d %H:%M:%S")
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO group_notification_blocks (protocol, group_id, error_code, platform_code, blocked_at)"
-            " VALUES (?, ?, ?, ?, ?) ON CONFLICT(protocol, group_id) DO UPDATE SET"
-            " error_code=excluded.error_code, platform_code=excluded.platform_code, blocked_at=excluded.blocked_at",
-            (protocol, group_id, error_code, platform_code, now_str()),
+            "INSERT INTO group_notification_blocks (protocol, group_id, error_code, platform_code, blocked_at, retry_after)"
+            " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(protocol, group_id) DO UPDATE SET"
+            " error_code=excluded.error_code, platform_code=excluded.platform_code, blocked_at=excluded.blocked_at, retry_after=excluded.retry_after",
+            (protocol, group_id, error_code, platform_code, now_str(), retry_after),
         )
 
 
