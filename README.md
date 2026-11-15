@@ -304,6 +304,15 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
+独立抓取脚本 `web_scraping.py` 额外依赖 `requests`、`lxml`、`openai` 与 Playwright，机器人主体运行不需要；使用前还需安装 Chromium 内核：
+
+```bash
+pip install -r requirements-web-scraping.txt
+python -m playwright install chromium
+```
+
+运行前需在 `.env` 中配置 `DEEPSEEK_API_KEY`，以及搜索与正文抓取接口地址 `DEEPSEEK_SEARCH_API`、`DEEPSEEK_FETCH_API`。
+
 离线测试使用 mock、内存或隔离临时 SQLite，不依赖真实 QQ 账号、真实网络抓取与付费模型；覆盖权限默认拒绝、跨群隔离、草稿审核版本、旧库安全迁移、活动幂等登记/取消/容量/汇总、提醒去重与失败重试、变化检测与间隔控制、schema 校验失败不写库、SDK 消息回执与跨群通知路由等场景。
 
 ## 安全与健壮性设计
@@ -346,6 +355,7 @@ python -m pytest -q
 ├── .env.example                环境变量模板
 ├── requirements.txt            运行依赖
 ├── requirements-dev.txt        开发与测试依赖
+├── requirements-web-scraping.txt  独立抓取脚本 web_scraping.py 的额外依赖
 ├── cdutetc/                    机器人业务包
 │   ├── clients/                OneBot / QQ 官方机器人客户端
 │   ├── config.py               配置与环境变量解析、启动前校验
