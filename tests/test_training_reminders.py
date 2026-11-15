@@ -1,21 +1,18 @@
 """周期课程的真实 SQLite 实例投递、失效校验、群隔离与重启去重。"""
 
 import asyncio
-from datetime import datetime, timedelta, timezone
 import json
-from pathlib import Path
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
+
 import pytest
 
-from cdutetc import commands
-from cdutetc import config
-from cdutetc import database
-from cdutetc import main
-from cdutetc import reminder
+from cdutetc import commands, config, database, main, reminder
 from cdutetc.errors import DeliveryMode, DeliveryResult
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -192,7 +189,7 @@ async def test_effective_range_uses_occurrence_and_invalid_fields_are_not_guesse
 async def test_utc_clock_and_unpadded_time_produce_same_beijing_identity(db):
     tid, key = training(start_time="19:0", weekday="每星期天")
     sender = AsyncMock(return_value=True)
-    assert await reminder.check_general_reminders(sender, now=datetime(2026, 11, 1, 10, 59, tzinfo=timezone.utc)) == 1
+    assert await reminder.check_general_reminders(sender, now=datetime(2026, 11, 1, 10, 59, tzinfo=UTC)) == 1
     assert database.get_delivery_by_key(key)["status"] == "sent"
     with database._connect() as conn:
         conn.execute("UPDATE training_sessions SET start_time='19:00' WHERE id=?", (tid,))

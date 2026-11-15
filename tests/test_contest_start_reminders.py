@@ -2,8 +2,8 @@
 import asyncio
 import sqlite3
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
 import pytest
 

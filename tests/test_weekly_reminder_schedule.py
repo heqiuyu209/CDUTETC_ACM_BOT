@@ -1,20 +1,16 @@
 """通过真实 APScheduler 触发器验证预生成、跨周与启动提醒恢复。"""
 
 import asyncio
-from datetime import datetime, timedelta, timezone
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import config
-from cdutetc import database
-from cdutetc import main
-from cdutetc import reminder
+from cdutetc import config, database, main, reminder
 from cdutetc.errors import DeliveryMode, DeliveryResult
-
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -165,7 +161,7 @@ async def test_generation_before_monday_contest_uses_next_week_key(memory_db, mo
 @pytest.mark.parametrize("clock", [
     datetime(2026, 11, 1, 19, 0, tzinfo=TZ),
     datetime(2026, 11, 1, 19, 30, tzinfo=TZ),
-    datetime(2026, 11, 1, 11, 30, tzinfo=timezone.utc),
+    datetime(2026, 11, 1, 11, 30, tzinfo=UTC),
 ])
 async def test_started_occurrence_not_created_during_recovery(memory_db, clock):
     bot = new_bot()

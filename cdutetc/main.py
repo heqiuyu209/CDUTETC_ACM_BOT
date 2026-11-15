@@ -33,23 +33,30 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from cdutetc import (
+    admin_session,
+    commands,
+    config,
+    content_filter,
+    crawler,
+    daily_digest,
+    llm,
+    notifications,
+    roles,
+)
+from cdutetc import database as db
+from cdutetc.alias_helper import format_group_name
 from cdutetc.clients.base import BaseBotClient, capabilities_of
 from cdutetc.clients.onebot import OneBotClient, OneBotMessage
-
-from cdutetc import admin_session
-from cdutetc import commands
-from cdutetc import config
-from cdutetc.alias_helper import format_group_name
-from cdutetc import content_filter
-from cdutetc import crawler
-from cdutetc import daily_digest
-from cdutetc import database as db
-from cdutetc import llm
-from cdutetc import roles
-from cdutetc import notifications
-from cdutetc.errors import AppErrorCode, DeliveryMode, DeliveryResult, result_from_exception, safe_error_hint
 from cdutetc.contest_fields import map_competition_info
 from cdutetc.database import create_published_competition_once, init_db
+from cdutetc.errors import (
+    AppErrorCode,
+    DeliveryMode,
+    DeliveryResult,
+    result_from_exception,
+    safe_error_hint,
+)
 from cdutetc.fetcher import FetchError, fetch_text
 from cdutetc.llm import extract_contest, normalize_time
 from cdutetc.publish_text import (
@@ -69,9 +76,9 @@ from cdutetc.utils import (
     extract_url,
     is_addressed_to_bot,
     is_allowed_group,
+    is_super_admin,
     match_publish_command,
     message_mentions,
-    is_super_admin,
     parse_command,
     strip_at,
 )

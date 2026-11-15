@@ -36,7 +36,7 @@ async def _send_with_timeout(client, send_call, mode: DeliveryMode) -> DeliveryR
     """统一包裹底层发信协程：超时转 NETWORK_ERROR，绝不让调用方永久挂起。"""
     try:
         return await asyncio.wait_for(send_call, timeout=SEND_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return _timeout_result(client, mode)
 
 

@@ -5,15 +5,14 @@
 """
 
 import argparse
-from contextlib import closing
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import os
-from pathlib import Path
 import sqlite3
 import sys
 import uuid
-
+from contextlib import closing
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 
 # 子表、队列先清；不重置 sqlite_sequence，防止旧审批编号指向新记录。
 BUSINESS_TABLES = (
@@ -63,7 +62,7 @@ def _inventory(conn: sqlite3.Connection) -> tuple[dict[str, int], dict[str, int]
 
 def _backup(path: Path, directory: Path) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     destination = directory / f"{path.stem}-before-reset-{stamp}-{uuid.uuid4().hex[:8]}.sqlite3"
     # 备份含完整业务数据；新文件独占创建，Linux 上仅当前用户可读写。
     fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

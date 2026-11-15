@@ -7,9 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from cdutetc import config
-from cdutetc import database
-from cdutetc import main
+from cdutetc import config, database, main
 from cdutetc.clients.onebot import OneBotMessage
 from cdutetc.errors import DeliveryMode, DeliveryResult
 from cdutetc.utils import mentioned_user_ids

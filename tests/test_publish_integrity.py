@@ -1,16 +1,14 @@
 """OneBot 事件入口的发布边界与持久化回归。"""
 
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-import sqlite3
 
 import pytest
-from cdutetc.clients.onebot import OneBotMessage
 
-from cdutetc import commands
-from cdutetc import config
+from cdutetc import commands, config, main
 from cdutetc import database as db
-from cdutetc import main
+from cdutetc.clients.onebot import OneBotMessage
 from cdutetc.errors import DeliveryMode, DeliveryResult
 from cdutetc.utils import match_publish_command
 

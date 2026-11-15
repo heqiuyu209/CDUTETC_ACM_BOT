@@ -1,24 +1,19 @@
 """官网来源切换、正文基线和待审部分更新的真实 SQLite / 群命令回归。"""
 
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
 import asyncio
 import hashlib
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import pytest
+
+from cdutetc import commands, config, crawler, database, main
 from cdutetc.clients.onebot import OneBotMessage
-
-from cdutetc import commands
-from cdutetc import config
-from cdutetc import crawler
-from cdutetc import database
-from cdutetc import main
 from cdutetc.fetcher import FetchError
-
 
 OLD_URL = "https://contest.example.com/old"
 NEW_URL = "https://contest.example.com/new?a=1&b=2"

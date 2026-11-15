@@ -10,16 +10,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from cdutetc import crawler
-from cdutetc import config
-from cdutetc import database
-from cdutetc import llm
-from cdutetc.errors import DeliveryMode, DeliveryResult
-from cdutetc import main
-from cdutetc.contest_fields import map_competition_info
-from cdutetc.llm import validate_contest_info
+from cdutetc import config, crawler, database, llm, main
 from cdutetc.clients.onebot import OneBotMessage
-
+from cdutetc.contest_fields import map_competition_info
+from cdutetc.errors import DeliveryMode, DeliveryResult
+from cdutetc.llm import validate_contest_info
 
 URL = "https://contest.example.com/announcement?track=acm"
 PAGE = "校赛完整公告正文"

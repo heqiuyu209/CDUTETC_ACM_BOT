@@ -6,8 +6,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import config, database as db, reminder
-
+from cdutetc import config, reminder
+from cdutetc import database as db
 
 NOW = datetime(2026, 11, 8, 18, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
 

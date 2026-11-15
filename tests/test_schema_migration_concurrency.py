@@ -1,13 +1,13 @@
 """旧 schema 并发启动与整个迁移事务回滚的真实 SQLite 回归。"""
 
-from contextlib import closing
 import json
 import os
-from pathlib import Path
 import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import closing
+from pathlib import Path
 
 import pytest
 

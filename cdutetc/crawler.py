@@ -25,12 +25,10 @@ from datetime import datetime, timedelta
 from html import unescape
 from zoneinfo import ZoneInfo
 
-from cdutetc import config
+from cdutetc import config, fetcher, llm
 from cdutetc import database as db
-from cdutetc import fetcher
-from cdutetc import llm
-from cdutetc.contest_fields import map_competition_info
 from cdutetc.config import AUTO_FETCH_ENABLED, FETCH_MIN_INTERVAL_MINUTES, TZ_NAME
+from cdutetc.contest_fields import map_competition_info
 
 logger = logging.getLogger(__name__)
 

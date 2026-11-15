@@ -24,18 +24,18 @@ from cdutetc.database import (
     claim_delivery,
     delivery_dedup_key,
     finish_delivery,
+    get_competition_target_groups,
+    get_group_notification_block,
+    group_course_remind_enabled,
+    group_switch_enabled,
     list_competitions,
     list_training_sessions,
-    record_delivery_success,
     reconcile_deliveries,
+    record_delivery_success,
     training_occurrence_times,
     validate_delivery_claim,
 )
 from cdutetc.database import list_collections_all as _list_collections_all
-from cdutetc.database import get_competition_target_groups
-from cdutetc.database import get_group_notification_block
-from cdutetc.database import group_course_remind_enabled
-from cdutetc.database import group_switch_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -194,7 +194,7 @@ async def _send_reminder_result(send_group, group_id: str, text: str) -> tuple[b
             return ok, "" if ok else str(getattr(result, "user_hint", "") or ""), str(getattr(code, "value", code) or "")
         ok = bool(result)
         return ok, "" if ok else "[unknown] 发送结果未确认", "" if ok else "unknown"
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return False, "[timeout_unknown] 发送等待超时，平台是否已接受无法确认", "timeout_unknown"
     except Exception as error:
         logger.warning("提醒发送异常 [%s]", type(error).__name__)

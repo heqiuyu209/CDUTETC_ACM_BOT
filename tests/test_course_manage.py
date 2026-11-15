@@ -9,7 +9,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import commands, config, database as db, group_admin, reminder
+from cdutetc import commands, config, group_admin, reminder
+from cdutetc import database as db
 from cdutetc.utils import can_manage_group
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -89,6 +90,85 @@ def test_list_courses_shows_normalized_span_and_requirement(env):
 
 def test_list_courses_empty_notice(env):
     assert "暂无课程安排" in _text(commands.cmd_training_list(GID, OUTSIDER, ""))
+
+
+# ---------------------------------------------------------------- 列表多行排版
+
+def test_list_renders_multiline_card_with_indented_fields(env):
+    """每门课：标题独占一行，时间/地点/要求各自缩进成行，不再用「｜」挤成一行。"""
+    commands.cmd_training_add(GID, TEACHER, "算法特训 周四 19-21点 实训楼B302 要求=带电脑")
+    lines = _text(commands.cmd_training_list(GID, OUTSIDER, "")).splitlines()
+    assert "｜" not in "\n".join(lines)
+    assert lines[0] == "本群课程安排："
+    assert lines[1] == "1. 算法特训"
+    assert lines[2] == "    时间：周四 19:00-21:00"
+    assert lines[3] == "    地点：实训楼B302"
+    assert lines[4] == "    要求：带电脑"
+    # 修改提示收在列表最底部，单独一行，不占标题行
+    assert lines[-1] == commands._COURSE_LIST_MODIFY_TIP
+    assert "/课程修改" in lines[-1]
+
+
+def test_list_uses_pending_placeholder_and_skips_empty_requirement(env):
+    """地点为空/「无」/「待定」统一渲染成「待定」；要求为空时整行省略。"""
+    commands.cmd_training_add(GID, TEACHER, "标题=自习 时间=周三 20点")
+    commands.cmd_training_add(GID, TEACHER, "标题=串讲 时间=周四 19-21点 地点=无")
+    commands.cmd_training_add(GID, TEACHER, "标题=加练 时间=周五 19-21点 地点=二教B201")
+    text = _text(commands.cmd_training_list(GID, OUTSIDER, ""))
+    assert text.count("地点：待定") == 2
+    assert "地点：无" not in text
+    assert "地点：二教B201" in text
+    # 三门课都没写要求，整行省略而不是留个空的「要求：」
+    assert "要求：" not in text
+
+
+def test_list_shows_time_placeholder_when_span_missing(env):
+    """没填上课时间的课程也保持三行结构，时间显示待定，不塌成两行。"""
+    commands.cmd_training_add(GID, TEACHER, "标题=临时课 地点=二教B201")
+    lines = _text(commands.cmd_training_list(GID, OUTSIDER, "")).splitlines()
+    assert lines[1] == "1. 临时课"
+    assert lines[2] == "    时间：待定"
+    assert lines[3] == "    地点：二教B201"
+
+
+# ---------------------------------------------------------------- 地点字段防污染
+
+def test_add_course_positional_requirement_not_written_as_location(env):
+    """位置参数把「要求」挤到地点位时，文本归入 requirement，location 留空。"""
+    text = _text(commands.cmd_training_add(GID, TEACHER, "训练 周四 19-21点 自带电脑并提前签到"))
+    course = db.list_training_sessions(GID)[0]
+    assert course["location"] == ""
+    assert "自带电脑并提前签到" in (course["requirement"] or "")
+    assert "要求：" in text
+
+
+def test_add_course_rejects_location_text_starting_with_requirement(env):
+    """`地点=要求...` 这类以「要求」开头的值不写进 location。"""
+    commands.cmd_training_add(GID, TEACHER, "标题=训练 地点=要求全程签到并禁止迟到")
+    course = db.list_training_sessions(GID)[0]
+    assert course["location"] == ""
+    assert "要求全程签到并禁止迟到" in (course["requirement"] or "")
+
+
+def test_modify_rejects_requirement_like_location(env):
+    """`/课程修改` 的 地点= 若是一段规则长文，拒写并提示改用 要求=。"""
+    commands.cmd_training_add(GID, TEACHER, "训练 周四 19-21点 二教B201")
+    text = _text(commands.cmd_training_modify(GID, TEACHER, "1 地点=要求全程签到并禁止迟到早退"))
+    assert "已忽略" in text and "要求=" in text
+    assert "用法" not in text
+    assert db.get_group_course(GID, 1)["location"] == "二教B201"
+
+
+# ---------------------------------------------------------------- 地点清空
+
+@pytest.mark.parametrize("value", ["清空", "清除", "无", '""'])
+def test_modify_clears_location(env, value):
+    """`地点=清空/清除/无/""` 都清空已存地点，列表随之回落成「待定」。"""
+    commands.cmd_training_add(GID, TEACHER, "训练 周四 19-21点 二教B201")
+    text = _text(commands.cmd_training_modify(GID, TEACHER, f"1 地点={value}"))
+    assert "已清空" in text
+    assert db.get_group_course(GID, 1)["location"] == ""
+    assert "地点：待定" in _text(commands.cmd_training_list(GID, OUTSIDER, ""))
 
 
 def test_modify_by_index_updates_time(env):

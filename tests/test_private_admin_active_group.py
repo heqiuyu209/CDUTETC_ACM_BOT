@@ -15,9 +15,16 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import admin_session, commands, config, daily_digest
+from cdutetc import (
+    admin_session,
+    commands,
+    config,
+    daily_digest,
+    llm,
+    main,
+    reminder_preflight,
+)
 from cdutetc import database as db
-from cdutetc import llm, main, reminder_preflight
 from cdutetc.clients.qqbot import QQBotClient, QQBotMessage
 
 NOW = datetime(2026, 11, 11, 18, tzinfo=ZoneInfo("Asia/Shanghai"))

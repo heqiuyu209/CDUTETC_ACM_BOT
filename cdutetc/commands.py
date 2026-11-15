@@ -15,16 +15,12 @@ import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from cdutetc import config
-from cdutetc.clients.base import capabilities_of
-from cdutetc import content_filter
-from cdutetc import crawler
+from cdutetc import config, content_filter, crawler, llm, roles
 from cdutetc import database as db
 from cdutetc import faq as faq_search
-from cdutetc import llm
-from cdutetc import roles
-from cdutetc.fetcher import fetch_text
+from cdutetc.clients.base import capabilities_of
 from cdutetc.errors import AppErrorCode, safe_error_hint
+from cdutetc.fetcher import fetch_text
 from cdutetc.utils import (
     can_manage_group,
     is_super_admin,
@@ -683,28 +679,42 @@ def cmd_org_events(group_id: str, sender: str, args: str) -> list[dict]:
     return [{"group_id": group_id, "text": "\n".join(lines)}]
 
 
+_COURSE_LIST_INDENT = "    "
+_COURSE_LIST_MODIFY_TIP = "调整课程：/课程修改 <序号> 地点=... 要求=..."
+_COURSE_LOCATION_PLACEHOLDERS = ("无", "待定", "未知")
+
+
+def _course_location_display(location: str | None) -> str:
+    """列表里的地点展示值：空 / 纯空白 / 「无」/「待定」统一渲染成「待定」。"""
+    text = (location or "").strip()
+    return "待定" if (not text or text in _COURSE_LOCATION_PLACEHOLDERS) else text
+
+
 def cmd_training_list(group_id: str, sender: str, args: str) -> list[dict]:
+    """课程列表：每门课一行标题 + 缩进的「时间/地点/要求」多行卡片式排版。
+
+    旧版把名称、时间、地点、要求用「｜」挤成一行，要求一长就整行糊住；
+    现在改为缩进多行，要求为空时整行省略，操作提示统一收到列表最底部。
+    """
     sessions = db.list_training_sessions(group_id)
     if not sessions:
         return [{"group_id": group_id, "text": "本群暂无课程安排"}]
-    lines = ["本群课程安排（用 /课程修改 <序号> 调整）："]
+    lines = ["本群课程安排："]
     for index, s in enumerate(sessions, 1):
         need = "（需带电脑）" if s["needs_laptop"] else ""
         # 只展示 1-based 序号：课程 id 与序号常在删课后错位，同时出现会让人改错课；
         # 内部仍兼容 #id，只是列表里不再渲染。
-        cell = [f"{index}. {s['title']}{need}"]
+        lines.append(f"{index}. {s['title']}{need}")
         span = _format_course_time(
             s.get("weekday") or "", s.get("start_time") or "", s.get("end_time") or ""
         )
-        if span:
-            cell.append(span)
-        # 地点统一兜底：None / 空串 / 纯空白都渲染成「待定」，
-        # 且与「要求：」各自独占一段，避免拼接后粘成一行。
-        cell.append(f"地点：{(s.get('location') or '').strip() or '待定'}")
+        lines.append(f"{_COURSE_LIST_INDENT}时间：{span or '待定'}")
+        lines.append(f"{_COURSE_LIST_INDENT}地点：{_course_location_display(s.get('location'))}")
         requirement = (s.get("requirement") or "").strip()
         if requirement:
-            cell.append(f"要求：{requirement}")
-        lines.append("｜".join(cell))
+            lines.append(f"{_COURSE_LIST_INDENT}要求：{requirement}")
+    lines.append("")
+    lines.append(_COURSE_LIST_MODIFY_TIP)
     return [{"group_id": group_id, "text": "\n".join(lines)}]
 
 
@@ -847,6 +857,40 @@ def _strip_quotes(value: str) -> str:
     return text
 
 
+# 地点字段口径：只放地点本身。历史上有两处污染来源——位置参数把「要求」长文挤进地点位、
+# 以及人工把整段规则写成地点——两者都会让列表排版崩掉，所以在入库前统一收敛。
+# 注意「待定」不在清空词里：它就是列表兜底展示值，写了也不该被当成删除指令。
+_LOCATION_CLEAR_WORDS = frozenset({"清空", "删除", "清除", "去掉", "无", "空"})
+_LOCATION_REQUIREMENT_PREFIXES = ("要求", "课程要求", "内容", "备注", "注意", "提醒", "须知")
+_LOCATION_RULE_HINTS = (
+    "要求", "禁止", "必须", "自带", "自备", "需带", "请", "记得", "提前",
+    "不要", "电脑", "笔记本", "作业", "签到", "考勤",
+)
+_LOCATION_MAX_LEN = 24
+
+
+def _normalize_location_text(raw: str | None) -> str:
+    """去掉包裹引号、压缩空白，得到地点原始值（不做清空 / 污染判断）。"""
+    return " ".join(_strip_quotes((raw or "").strip()).split())
+
+
+def _is_location_cleared(text: str) -> bool:
+    """`地点=清空 / 地点=无 / 地点=""` 一律视为清空已有地点。"""
+    return not text or text in _LOCATION_CLEAR_WORDS
+
+
+def _looks_like_requirement(text: str) -> bool:
+    """判断「地点」值是否其实是一段课程要求（防污染 location 字段）。"""
+    if not text:
+        return False
+    if text.startswith(_LOCATION_REQUIREMENT_PREFIXES):
+        return True
+    # 长文本、多句、带规则动词的，都当成要求而不是地点。
+    if len(text) > _LOCATION_MAX_LEN or any(ch in text for ch in "\n。；;！!？?"):
+        return True
+    return any(hint in text for hint in _LOCATION_RULE_HINTS)
+
+
 def _split_course_fields(args: str) -> tuple[dict[str, str], str]:
     """抽出 `键=值` 参数，返回（字段字典，剩余位置参数文本）。
 
@@ -959,7 +1003,16 @@ def cmd_training_add(group_id: str, sender: str, args: str) -> list[dict]:
     raw_requirement = (fields.get("要求") or fields.get("内容") or "").strip()
     weekday = "" if fields.get("时间") else (parts[1] if len(parts) > 1 else "")
     time_range = "" if fields.get("时间") else (parts[2] if len(parts) > 2 else "")
-    location = fields.get("地点", parts[3] if len(parts) > 3 else "")
+    location = _normalize_location_text(
+        fields["地点"] if "地点" in fields else (parts[3] if len(parts) > 3 else "")
+    )
+    if _is_location_cleared(location):
+        location = ""
+    elif _looks_like_requirement(location):
+        # 位置参数把「要求」挤到地点位（如 `/课程添加 训练 周四 19-21点 自带电脑`）时，
+        # 这段文本还给「要求」，地点留空——绝不把规则长文写进 location。
+        raw_requirement = " ".join(x for x in (raw_requirement, location) if x)
+        location = ""
     raw_time = fields.get("时间") or " ".join(x for x in (weekday, time_range) if x)
     time_fields = _apply_time_fields(raw_time) or _fallback_time_fields(weekday, time_range)
     info: dict[str, object] = {
@@ -1094,9 +1147,18 @@ def cmd_training_modify(group_id: str, sender: str, args: str) -> list[dict]:
             notices.append("已忽略位置参数里的时间（键值对 时间= 优先）")
     elif positional_time:
         updates.update(positional_time)
-    for key, field in (("地点", "location"), ("软件", "software"), ("设备", "device_req")):
+    for key, field in (("软件", "software"), ("设备", "device_req")):
         if fields.get(key):
             updates[field] = fields[key]
+    if "地点" in fields:
+        # 地点三态：清空词 → 置空；像要求长文 → 拒写并提示；否则按地址入库。
+        location_text = _normalize_location_text(fields["地点"])
+        if _is_location_cleared(location_text):
+            updates["location"] = ""
+        elif _looks_like_requirement(location_text):
+            notices.append("地点= 的值更像课程要求，已忽略；写要求请用 要求=")
+        else:
+            updates["location"] = location_text
     if "电脑" in fields:
         laptop = fields["电脑"].strip()
         if laptop in ("需要", "是", "要", "1"):
@@ -1106,6 +1168,9 @@ def cmd_training_modify(group_id: str, sender: str, args: str) -> list[dict]:
         else:
             notices.append("电脑= 只支持 需要/不需要")
     if not updates:
+        # 形如 `地点=<一段要求>` 被拒写时仍要把原因告诉用户，别只回一句用法。
+        if notices:
+            return [{"group_id": group_id, "text": "\n".join(notices)}]
         return [{"group_id": group_id, "text": _TRAINING_MODIFY_USAGE}]
     summarized = False
     if "requirement" in updates:
@@ -1133,7 +1198,8 @@ def cmd_training_modify(group_id: str, sender: str, args: str) -> list[dict]:
         if span:
             parts.append(f"时间={span}")
     if "location" in updates:
-        parts.append(f"地点={updated.get('location') or '地点待定'}")
+        cleared_location = (updated.get("location") or "").strip()
+        parts.append(f"地点={cleared_location or '已清空（列表显示待定）'}")
     if "needs_laptop" in updates:
         parts.append(f"需带电脑={'需要' if updated.get('needs_laptop') else '不需要'}")
     if "software" in updates:

@@ -1,20 +1,16 @@
 """管理角色放行、FAQ 与同群同题问题的事务收尾回归。"""
 
-from concurrent.futures import ThreadPoolExecutor
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from cdutetc.clients.onebot import OneBotMessage
 import pytest
 
-from cdutetc import commands
-from cdutetc import config
-from cdutetc import database
-from cdutetc import main
+from cdutetc import commands, config, database, main, utils
+from cdutetc.clients.onebot import OneBotMessage
 from cdutetc.errors import DeliveryMode, DeliveryResult
-from cdutetc import utils
 
 
 @pytest.fixture

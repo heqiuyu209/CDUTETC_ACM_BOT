@@ -27,13 +27,11 @@ import time
 import uuid
 from collections.abc import Iterable
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
+from cdutetc import config, content_filter
 from cdutetc.config import DB_PATH
-
-from cdutetc import config
-from cdutetc import content_filter
 from cdutetc.errors import DeliveryCode
 
 TZ = ZoneInfo("Asia/Shanghai")

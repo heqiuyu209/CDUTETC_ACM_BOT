@@ -3,7 +3,8 @@
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from cdutetc import config, database as db
+from cdutetc import config
+from cdutetc import database as db
 from cdutetc.clients.base import active_capabilities, active_protocol
 from cdutetc.reminder import _due_offset_hours, _parse_time
 

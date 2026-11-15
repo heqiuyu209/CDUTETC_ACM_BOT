@@ -13,9 +13,17 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from cdutetc import alias_helper, commands, config, database, group_admin, main, notifications
-from cdutetc.clients.qqbot import QQBotClient, QQBotMessage
+from cdutetc import (
+    alias_helper,
+    commands,
+    config,
+    database,
+    group_admin,
+    main,
+    notifications,
+)
 from cdutetc.clients.onebot import OneBotMessage
+from cdutetc.clients.qqbot import QQBotClient, QQBotMessage
 
 
 @pytest.fixture()

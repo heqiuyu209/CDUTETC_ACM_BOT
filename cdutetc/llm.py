@@ -20,8 +20,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from cdutetc import config
-from cdutetc import content_filter
+from cdutetc import config, content_filter
 from cdutetc.publish_text import normalize_local_time_value
 
 logger = logging.getLogger(__name__)

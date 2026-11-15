@@ -15,7 +15,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from cdutetc import commands, config, daily_digest, database as db, main, reminder_preflight
+from cdutetc import commands, config, daily_digest, main, reminder_preflight
+from cdutetc import database as db
 from cdutetc.clients.qqbot import QQBotClient
 from cdutetc.errors import DeliveryCode
 from cdutetc.reminder import TZ

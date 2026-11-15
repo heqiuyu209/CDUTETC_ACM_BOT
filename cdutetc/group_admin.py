@@ -1,14 +1,14 @@
 """超管按群管理及只读查询；群名/标识均来自已授权记录，不使用模型猜目标。"""
 
-from datetime import datetime, timedelta
 import re
 import shlex
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from cdutetc import config
-from cdutetc import database as db, reminder_view
-from cdutetc.utils import is_super_admin
+from cdutetc import config, reminder_view
+from cdutetc import database as db
 from cdutetc.clients.base import active_protocol
+from cdutetc.utils import is_super_admin
 
 COMMANDS = frozenset({"群配置", "群提醒", "周赛设置", "群老师"})
 TZ = ZoneInfo(config.TZ_NAME)

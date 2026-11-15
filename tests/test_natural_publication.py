@@ -1,6 +1,6 @@
 """复现真实发布语句：时间解析、双协议确认、批准与主动提醒全链路。"""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
@@ -210,7 +210,7 @@ def test_queries_and_negated_requests_are_not_explicit_publish_commands(text):
     ("今天下午13点比赛开始", "2026-11-07 13:00"),
 ])
 def test_chinese_and_relative_time_are_beijing_based(text, expected):
-    assert parse_simple_publication(text, now=NOW.astimezone(timezone.utc))["contest_time"] == expected
+    assert parse_simple_publication(text, now=NOW.astimezone(UTC))["contest_time"] == expected
 
 
 @pytest.mark.parametrize("text", ["今天25点比赛开始", "今天上午10点70比赛开始", "2026年2月30号10点比赛开始", "今天中午10点比赛开始"])

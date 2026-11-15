@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import commands, config, database, daily_digest, main
+from cdutetc import commands, config, daily_digest, database, main
 from cdutetc.clients.onebot import OneBotMessage
 
 TZ = ZoneInfo("Asia/Shanghai")

@@ -9,8 +9,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import crawler
-from cdutetc import database
+from cdutetc import crawler, database
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -68,7 +67,7 @@ def test_detect_change_hash_same_no_change(db):
 
 def test_detect_change_hash_differs(db):
     import hashlib
-    old = hashlib.sha256("旧内容".encode("utf-8")).hexdigest()
+    old = hashlib.sha256("旧内容".encode()).hexdigest()
     assert crawler.detect_change({"body_hash": old}, "新内容", "", "") is True
 
 
