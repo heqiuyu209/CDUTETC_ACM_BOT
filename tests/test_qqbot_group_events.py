@@ -127,12 +127,14 @@ async def test_same_message_in_new_and_legacy_events_only_replies_once(app, sdk,
     await sdk(adapter, scenario)
 
 
-async def test_unaddressed_event_does_not_suppress_later_legacy_at_message(app, sdk):
+async def test_same_msg_id_is_handled_once_across_both_events(app, sdk):
+    """同一条消息的两路投递（全量事件 + 旧 @ 事件）只处理一次。"""
     adapter, _ = app
     async def scenario(client):
         await client.feed("group_message_create", body(addressed=False))
         await client.feed("group_at_message_create", body(addressed=False))
-        client.api.post_group_message.assert_awaited_once()
+        client.api.post_group_message.assert_not_awaited()
+        assert adapter.group_msg_handler is not None
     await sdk(adapter, scenario)
 
 
@@ -177,6 +179,27 @@ async def test_group_dedup_is_bounded_and_scoped_by_group():
     adapter.group_msg_handler = AsyncMock()
     for i in range(1030):
         await adapter._receive_group_message(qqbot.wrap_group_at_message(body(mid=str(i))))
+    # 不同群的同号消息不算重复。
     await adapter._receive_group_message(qqbot.wrap_group_message(body(group="another-group", mid="1029")))
     assert adapter.group_msg_handler.await_count == 1031
-    assert len(adapter._recent_group_messages) == 1024
+    # 容量上限之内全部保留，超限按最旧先出。
+    assert len(adapter._recent_group_messages) <= qqbot.GROUP_MSG_DEDUP_LIMIT
+    assert len(adapter._recent_group_messages) == 1031
+
+
+async def test_group_dedup_expires_after_ttl(monkeypatch):
+    adapter = qqbot.QQBotClient("offline", "offline")
+    adapter.group_msg_handler = AsyncMock()
+    clock = [1000.0]
+    monkeypatch.setattr(qqbot.time, "monotonic", lambda: clock[0])
+    await adapter._receive_group_message(qqbot.wrap_group_at_message(body(mid="dup")))
+    # TTL 内重复投递被丢弃。
+    clock[0] += qqbot.GROUP_MSG_DEDUP_TTL - 1
+    await adapter._receive_group_message(qqbot.wrap_group_at_message(body(mid="dup")))
+    assert adapter.group_msg_handler.await_count == 1
+    # 过了窗口，同 msg_id 再到达（例如人为重发）应当重新处理。
+    clock[0] += 2
+    await adapter._receive_group_message(qqbot.wrap_group_at_message(body(mid="dup")))
+    assert adapter.group_msg_handler.await_count == 2
+    # 过期条目会被惰性清理，不会无限堆积。
+    assert len(adapter._recent_group_messages) == 1

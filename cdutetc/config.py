@@ -421,6 +421,10 @@ PUBLISH_SCOPE_TO_SOURCE = os.getenv("ACM_PUBLISH_SCOPE_TO_SOURCE", "1") != "0"
 # 老师用自然语言描述比赛（没带「发布」命令）时，是否让模型先判断意图，
 # 判为「在发布比赛」就自动转入发布流程。关闭则只认显式命令。
 NL_INTENT_ENABLED = os.getenv("ACM_NL_INTENT_ENABLED", "1") != "0"
+# 老师在群里用自然语言说安排（「周三晚七点讲图论」「下周找个晚上补题」）时，
+# 是否自动识别意图并登记课程/比赛。关闭后只认 / 开头的显式命令，
+# 群内普通消息一律不进意图管线（不做预过滤、不调模型）。
+TEACHER_AUTO_INTENT_ENABLED = os.getenv("ACM_TEACHER_AUTO_INTENT_ENABLED", "1") != "0"
 
 # ================= 自动周赛（v2） =================
 # 在提前提醒窗口前按模板生成周赛，启动时补最近未来场次；默认不通知全员，

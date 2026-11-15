@@ -19,6 +19,8 @@ BUSINESS_TABLES = (
     "reminder_success_receipts", "reminder_deliveries", "reminders",
     # 统一提醒中心的自定义提醒：属业务数据，正式启用前随重置一并清空。
     "custom_reminders",
+    # 老师隐式意图的待补全队列：未确认的候选安排，属业务数据。
+    "teacher_intent_pending",
     "collection_responses", "collections", "unanswered_questions", "group_faq",
     "training_sessions", "org_events", "competition_pending_updates",
     "competition_versions", "competition_sources", "competition_notify_groups",

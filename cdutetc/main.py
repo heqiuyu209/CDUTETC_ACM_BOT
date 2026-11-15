@@ -43,6 +43,7 @@ from cdutetc import (
     llm,
     notifications,
     roles,
+    teacher_intent,
 )
 from cdutetc import database as db
 from cdutetc.alias_helper import format_group_name
@@ -773,6 +774,15 @@ class ACMBot:
             text = strip_at(message.content)
             if not text:
                 return
+            # 群全量消息入口：老师没 @ 机器人、也没带 / 命令，只是在群里说安排
+            # （「周三晚七点讲图论」）时，交给隐式意图管线判断要不要登记。
+            # 队员的普通消息在这里一定返回 False，继续走原有逻辑直至放行。
+            if (not addressed
+                    and not text.startswith("/")
+                    and match_publish_command(text, config.PUBLISH_CMD) is None
+                    and await self._handle_teacher_intent(
+                        message, text, group_id, self._extract_member_id(message))):
+                return
             # 群内默认必须 @ 本机器人 才响应（含命令），避免抢答他人命令；
             # ACM_GROUP_REQUIRE_AT=0 时回退为“无 @ 也受理显式命令”。
             if config.GROUP_REQUIRE_AT:
@@ -1009,6 +1019,35 @@ class ACMBot:
             info["tracks"] = declared_tracks
             logger.info("赛道按老师原文覆盖: %s", declared_tracks)
         return info
+
+    async def _handle_teacher_intent(self, message: OneBotMessage, text: str,
+                                     group_id: str, member_id: str) -> bool:
+        """老师在群里随口说安排时，识别意图并登记课程/比赛。
+
+        Returns:
+            True  → 本消息由意图管线接管（含判定为闲聊后的静默），调用方直接返回；
+            False → 不是老师或与本管线无关，调用方按原有流程继续（队员闲聊不受影响）。
+        """
+        if not config.TEACHER_AUTO_INTENT_ENABLED:
+            return False
+        try:
+            result = await teacher_intent.handle_message(
+                text, group_id=group_id, sender_id=member_id,
+                msg_id=str(getattr(message, "id", "") or ""),
+            )
+        except Exception:
+            # 意图识别是锦上添花，任何异常都退回原有流程，不能拖垮群消息处理。
+            logger.exception("老师意图识别失败，回退原有流程")
+            return False
+        if result is None:
+            return False
+        reply = result.get("reply") or ""
+        if reply and result.get("action") in {"saved", "pending"}:
+            await self._safe_reply(message, reply)
+        for uid, body in result.get("notify_private") or []:
+            if uid and body:
+                await self._send_private_result(str(uid), body)
+        return True
 
     async def _handle_publish(self, message: OneBotMessage, text: str,
                               group_id: str, member_id: str):
