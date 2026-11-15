@@ -5,8 +5,9 @@
 """
 
 import io
+import random
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -155,7 +156,8 @@ async def test_collected_filename_has_tag_and_md5_prefix(tmp_path, db_conn):
     name = relative.rsplit("/", 1)[-1]
     md5 = memes.image_md5(data)
     assert relative.startswith(f"{memes.CATEGORY_AC}/")
-    assert name.endswith(f"_{md5[:8]}.png")
+    # 静态图落盘前统一转 JPEG，后缀随之变成 .jpg，但前缀仍是原始字节的 MD5。
+    assert name.endswith(f"_{md5[:8]}.jpg")
     assert memes.filename_tag(relative)
 
 
@@ -190,6 +192,143 @@ async def test_collect_skips_blacklisted_image(tmp_path, db_conn):
         enabled_check=lambda group: True,
     )
     assert collected == []
+
+
+# ---------------- 落盘瘦身与 file_info 缓存 ----------------
+
+def make_noisy_image(size=(1200, 1200), fmt="JPEG") -> bytes:
+    """造一张「大尺寸、大体积、细节丰富」的图，模拟群友发的高清图/截图。
+
+    小随机图双线性放大后细节足够多，体积天然在 2MB 上限内，
+    与真实表情包一样具备「压缩后体积大幅下降」的特性。
+    """
+    from PIL import Image
+
+    small = Image.frombytes("RGB", (size[0] // 8, size[1] // 8),
+                            random.randbytes((size[0] // 8) * (size[1] // 8) * 3))
+    image = small.resize(size, Image.BILINEAR)
+    buffer = io.BytesIO()
+    if fmt == "JPEG":
+        image.save(buffer, format="JPEG", quality=95)
+    else:
+        image.save(buffer, format=fmt)
+    return buffer.getvalue()
+
+
+def make_animated_gif(size=(200, 200), frames=3) -> bytes:
+    """造多帧 GIF，验证动图不被压成一帧。"""
+    from PIL import Image
+
+    images = [Image.new("RGB", size, (30 * i, 90, 200 - 20 * i)) for i in range(frames)]
+    buffer = io.BytesIO()
+    images[0].save(buffer, format="GIF", save_all=True, append_images=images[1:],
+                   duration=100, loop=0)
+    return buffer.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_collect_shrinks_wide_static_image(tmp_path, db_conn):
+    """1200x1200 静态图：等比缩到宽 500 并转 JPEG，体积显著变小。"""
+    data = make_noisy_image((1200, 1200))
+    collected = await memes.collect_from_message(
+        FakeMessage(["http://example.com/big.png"]), group_id="g1", text="绝杀",
+        root=tmp_path, downloader=make_downloader(data),
+        enabled_check=lambda group: True,
+    )
+    assert len(collected) == 1
+    relative = collected[0]["relative_path"]
+    assert relative.endswith(".jpg")
+    stored = (tmp_path / relative).read_bytes()
+
+    from PIL import Image
+
+    with Image.open(io.BytesIO(stored)) as image:
+        assert image.format == "JPEG"
+        assert image.mode == "RGB"
+        assert image.width <= memes.COLLECT_MAX_WIDTH
+        # 等比缩放：高度按同一比例缩小
+        assert image.height == round(1200 * memes.COLLECT_MAX_WIDTH / 1200)
+    assert len(stored) < len(data) / 2
+    # 去重口径不变：台账里存的是原始下载字节的 MD5
+    assert collected[0]["md5"] == memes.image_md5(data)
+    assert database.get_meme_hash(collected[0]["md5"])["file_path"] == relative
+
+
+@pytest.mark.asyncio
+async def test_collect_keeps_gif_untouched(tmp_path, db_conn):
+    """GIF 动图原样落盘：后缀不变、字节不变、帧数不变。"""
+    data = make_animated_gif()
+    collected = await memes.collect_from_message(
+        FakeMessage(["http://example.com/a.gif"]), group_id="g1", text="绝杀",
+        root=tmp_path, downloader=make_downloader(data),
+        enabled_check=lambda group: True,
+    )
+    relative = collected[0]["relative_path"]
+    assert relative.endswith(".gif")
+    assert (tmp_path / relative).read_bytes() == data
+
+    from PIL import Image
+
+    with Image.open(io.BytesIO((tmp_path / relative).read_bytes())) as image:
+        assert image.format == "GIF"
+        assert getattr(image, "n_frames", 1) == 3
+
+
+@pytest.mark.asyncio
+async def test_collect_dedupes_by_original_md5_after_shrinking(tmp_path, db_conn):
+    """压缩后仍按原图 MD5 去重：群友再发同一张原图，直接命中、不重复落盘。"""
+    data = make_noisy_image((900, 900))
+    md5 = memes.image_md5(data)
+    downloader = make_downloader(data)
+    message = FakeMessage(["http://example.com/big.png"])
+
+    first = await memes.collect_from_message(
+        message, group_id="g1", text="绝杀", root=tmp_path,
+        downloader=downloader, enabled_check=lambda group: True)
+    second = await memes.collect_from_message(
+        message, group_id="g1", text="绝杀", root=tmp_path,
+        downloader=downloader, enabled_check=lambda group: True)
+
+    assert len(first) == 1
+    assert second == []
+    assert database.count_meme_hashes() == 1
+    assert database.get_meme_hash(md5)["file_path"] == first[0]["relative_path"]
+    # 压缩前原图与压缩后文件不是同一份字节，但台账认的是原图 MD5
+    stored = (tmp_path / first[0]["relative_path"]).read_bytes()
+    assert memes.image_md5(stored) != md5
+
+
+def test_shrink_static_image_keeps_small_image_untouched_size(tmp_path):
+    """小图不放大：宽度本来就 ≤500 时只转格式，不改变像素尺寸。"""
+    from PIL import Image
+
+    data = make_image(size=(300, 200))
+    shrunk = memes.shrink_static_image(data)
+    assert shrunk is not data
+    with Image.open(io.BytesIO(shrunk)) as image:
+        assert image.format == "JPEG"
+        assert image.size == (300, 200)
+
+
+def test_shrink_static_image_falls_back_on_broken_bytes():
+    """损坏字节不抛异常：原样返回，交给上层按原图落盘。"""
+    broken = b"not-a-real-image"
+    assert memes.shrink_static_image(broken) is broken
+
+
+def test_meme_file_cache_default_ttl_is_one_day():
+    """file_info 缓存默认 24 小时（QQ 官方有效期 3 天，留足余量）。"""
+    assert database.MEME_FILE_CACHE_TTL == 86400
+
+
+def test_meme_file_cache_entry_lives_for_one_day(db_conn):
+    """23 小时后仍命中缓存，25 小时后视为过期需重新上传。"""
+    base = datetime.now(TZ)
+    database.save_meme_file_cache("g1", "ac/x.jpg", "file-info-blob", now=base)
+    assert database.get_meme_file_cache(
+        "g1", "ac/x.jpg", now=base + timedelta(hours=23)) == "file-info-blob"
+    assert database.get_meme_file_cache(
+        "g1", "ac/x.jpg", now=base + timedelta(hours=25)) == ""
 
 
 # ---------------- /删图 ----------------

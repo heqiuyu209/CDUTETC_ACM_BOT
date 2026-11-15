@@ -4627,7 +4627,9 @@ def count_meme_hashes(*, category: str = "", include_deleted: bool = False) -> i
 # ================= 官方富媒体表情包 file_info 缓存 =================
 # 平台上传接口会返回 file_info 的 ttl（秒）；这里记录绝对过期时刻，
 # 过期即视为未命中，由调用方重新上传，绝不复用可能已失效的 file_info。
-MEME_FILE_CACHE_TTL = 1800
+# QQ 官方给的 file_info 有效期是 3 天，取 24 小时（86400）留足余量：
+# 既躲开「拿失效 file_info 发图」的坑，又把一天内重复发同一张图的再次上传全省掉。
+MEME_FILE_CACHE_TTL = 86400
 
 
 def get_meme_file_cache(group_openid: str, relative_path: str, *,

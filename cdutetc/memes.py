@@ -7,7 +7,7 @@
 设计要点：
   - ``assets/memes/<分类>/`` 目录即分类，目录不存在或为空时整条链路静默跳过；
   - ``ACM_MEME_BASE_URL`` 未配置（空串）时不发图，绝不拼出半截地址；
-  - ``file_info`` 按 (群, 相对路径) 缓存进 ``meme_file_cache`` 表，有效期内直接复用，
+  - ``file_info`` 按 (群, 相对路径) 缓存进 ``meme_file_cache`` 表，24 小时内直接复用，
     避免每次发图都调上传接口；
   - 关键词触发受「25% 概率 + 每群 5 分钟冷却」双重限制，防止刷屏。
 """
@@ -81,6 +81,11 @@ COLLECT_MIN_SIDE = 80
 COLLECT_MAX_ASPECT = 2.2
 COLLECT_MIN_ASPECT = 0.45
 GIF_SUFFIX = ".gif"
+
+# 落盘前瘦身：QQ 侧拉图慢主要慢在体积，静态图统一缩到 500px 宽存 JPEG。
+# MD5 仍然算「下载到的原始字节」，压缩只影响磁盘上的文件，不影响去重口径。
+COLLECT_MAX_WIDTH = 500
+COLLECT_JPEG_QUALITY = 80
 
 # 收图归类：命中关键词 → (分类, 文件名前缀)。顺序即优先级，先命中先归。
 # 英文词按词边界匹配（避免 little 命中 TLE、machine 命中 AC 之类误判）。
@@ -213,6 +218,55 @@ def should_collect(data: bytes, *, suffix: str) -> tuple[bool, str]:
     if str(suffix or "").lower() == GIF_SUFFIX:
         return True, ""
     return inspect_static_image(data)
+
+
+def shrink_static_image(data: bytes, *, max_width: int = COLLECT_MAX_WIDTH,
+                        quality: int = COLLECT_JPEG_QUALITY) -> bytes:
+    """把静态图等比缩到 ``max_width`` 内并转成 JPEG，返回新字节。
+
+    返回 ``data`` 本身表示「没法压」（Pillow 缺失、图损坏、编码失败），
+    调用方据此保留原图与原始后缀。动图不走这里，避免多帧动画被压成一帧。
+    """
+    try:
+        from PIL import Image
+    except ImportError:  # 部署环境没装 Pillow：原样保存，不影响收录
+        return data
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image.load()
+            if image.mode in ("RGBA", "LA", "P"):
+                # 透明图统一铺白底：直接 convert("RGB") 会把透明区压成黑色
+                rgba = image.convert("RGBA")
+                frame = Image.new("RGB", rgba.size, (255, 255, 255))
+                frame.paste(rgba, mask=rgba.split()[-1])
+            else:
+                frame = image.convert("RGB")
+    except Exception as exc:  # noqa: BLE001 - 解析失败就按原图存
+        logger.info("表情包压缩跳过（无法解析）：%s", exc)
+        return data
+    if frame.width > max_width:
+        ratio = max_width / frame.width
+        frame = frame.resize((max_width, max(1, round(frame.height * ratio))),
+                             Image.LANCZOS)
+    buffer = io.BytesIO()
+    try:
+        frame.save(buffer, format="JPEG", quality=quality, optimize=True,
+                   progressive=True)
+    except Exception as exc:  # noqa: BLE001 - 编码失败退回原图
+        logger.info("表情包压缩跳过（编码失败）：%s", exc)
+        return data
+    shrunk = buffer.getvalue()
+    return shrunk or data
+
+
+def store_meme_bytes(data: bytes, *, suffix: str) -> tuple[bytes, str]:
+    """决定落盘内容与后缀：静态图压缩成 JPEG，GIF 原样保留。"""
+    if str(suffix or "").lower() == GIF_SUFFIX:
+        return data, suffix
+    shrunk = shrink_static_image(data)
+    if shrunk is data:  # 压缩失败：保留原图与原后缀，宁可不压也不丢图
+        return data, suffix
+    return shrunk, ".jpg"
 
 
 def meme_filename(tag: str, md5: str, suffix: str) -> str:
@@ -657,8 +711,10 @@ async def collect_one_image(ref: dict, *, group_id: str, text: str = "",
         return None
     lines = [text, *[str(item) for item in context][:COLLECT_CONTEXT_LINES]]
     category, tag = classify_collect(*lines)
-    relative = save_meme_file(data, category=category, md5=md5, tag=tag, suffix=suffix,
-                              root=root)
+    # 落盘前瘦身：静态图压成 500px 宽 JPEG，GIF 原样；MD5 仍用原始字节算。
+    payload, store_suffix = store_meme_bytes(data, suffix=suffix)
+    relative = save_meme_file(payload, category=category, md5=md5, tag=tag,
+                              suffix=store_suffix, root=root)
     if not relative:
         return None
     try:
