@@ -470,3 +470,25 @@ async def test_private_amend_with_workspace_notifies_workspace_without_private_h
     assert {c.kwargs["group_openid"] for c in api.post_group_message.await_args_list} == set(GROUPS)
     assert all(c.kwargs["content"].startswith("比赛「") for c in api.post_group_message.await_args_list)
     assert db.get_competition(cid)["summary"] == "updated"
+
+
+async def test_legacy_reminder_recovers_after_permission_cooldown(store):
+    gid = GROUPS[0]
+    target = "2026-11-10 11:00"
+    cid = db.save_contest(gid, {"name": "旧群赛事", "reg_deadline": target})
+    key = db.delivery_dedup_key(gid, "legacy_contest", cid, "reg_deadline", target)
+    db.block_group_notifications("qqbot", gid, "active_forbidden", 40034105)
+    app, api = bot()
+    assert await reminder.check_general_reminders(app._send_group_result) == 0
+    assert db.get_delivery_by_key(key) is None
+    api.post_group_message.assert_not_awaited()
+
+    store.clock.now += timedelta(minutes=5)
+    assert await reminder.check_general_reminders(app._send_group_result) == 1
+    assert db.get_group_notification_block("qqbot", gid) is None
+    assert db.has_reminded(gid, cid, "reg_deadline", target)
+    assert db.get_delivery_by_key(key)["status"] == "sent"
+    assert db.get_delivery_by_key(key)["attempts"] == 1
+    db.init_db()
+    assert await reminder.check_general_reminders(app._send_group_result) == 0
+    api.post_group_message.assert_awaited_once()

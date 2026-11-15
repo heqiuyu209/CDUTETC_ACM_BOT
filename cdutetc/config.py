@@ -347,6 +347,8 @@ if (not CONTEST_REMIND_OFFSETS_MINUTES or any(x <= 0 for x in CONTEST_REMIND_OFF
 REMIND_BEFORE_HOURS = int(os.getenv("ACM_REMIND_BEFORE_HOURS", "24"))
 if REMIND_CHECK_INTERVAL_MINUTES < 1 or REMIND_BEFORE_HOURS <= 0:
     raise RuntimeError("提醒扫描间隔和提前小时数必须大于零")
+# 旧群赛事兼容扫描仍使用这两种提醒类型。
+REMIND_TYPES = ("reg_deadline", "contest_time")
 # 多节点提前提醒（小时，逗号分隔，支持小数）。例：24,1,0.167 表示
 # 提前 24 小时、1 小时、10 分钟各提醒一次。每场活动不建独立定时器，
 # 仍由周期扫描按「已进入哪个节点窗口」判定，资源占用与比赛数量无关。
