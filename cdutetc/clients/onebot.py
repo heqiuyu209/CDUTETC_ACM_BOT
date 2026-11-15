@@ -13,6 +13,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 import websockets
 
@@ -103,6 +104,8 @@ class OneBotClient(BaseBotClient):
     supports_numeric_group_id = True
     # 纯文本消息体，没有 markdown 通道。
     supports_markdown = False
+    # 可用 [CQ:image,file=file://...] 直接发本机图片文件。
+    supports_local_image = True
 
     def __init__(self, ws_url: str, token: str = "", reconnect_delay: float = 5.0,
                  idle_timeout: float = 180.0):
@@ -272,6 +275,35 @@ class OneBotClient(BaseBotClient):
     async def send_group_msg(self, group_id: str, text: str) -> bool:
         """Backward-compatible bool wrapper."""
         return bool(await self.send_group_msg_result(group_id, text))
+
+    async def send_group_image_result(self, group_id: str, image_path: str, *,
+                                      reply_to: str | None = None,
+                                      reply_seq: int = 1):
+        """发送本机图片：拼 CQ 码走 send_group_msg（本地文件用 file:// 绝对路径）。
+
+        路径经 as_uri() 规范化，避免含空格/中文的素材路径被 CQ 码解析截断。
+        """
+        from cdutetc.errors import (
+            DeliveryCode,
+            DeliveryMode,
+            DeliveryResult,
+            result_from_onebot,
+        )
+
+        path = Path(str(image_path or ""))
+        if not path.is_file():
+            return DeliveryResult(False, DeliveryCode.NOT_FOUND, "onebot",
+                                  DeliveryMode.PASSIVE)
+        message = f"[CQ:image,file={path.as_uri()}]"
+        if reply_to:
+            message = f"[CQ:reply,id={reply_to}]{message}"
+        connected = self._ws is not None
+        resp = await self.call_api(
+            "send_group_msg",
+            group_id=int(group_id) if str(group_id).isdigit() else group_id,
+            message=message,
+        )
+        return result_from_onebot(resp, action="send_group_msg", connected=connected)
 
     async def send_private_msg_result(self, user_id: str, text: str, *,
                                       reply_to: str | None = None, reply_seq: int = 1):

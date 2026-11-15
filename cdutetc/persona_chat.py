@@ -172,7 +172,8 @@ def _system_prompt(status_text: str) -> str:
         "黑话：WA、TLE、AK、大模拟、DP、线段树、补题、红温。\n"
         "禁止客服腔：不说「作为AI助手」「有什么可以帮您」「很高兴为您服务」。\n"
         f"你现在的生活状态：{status_text}\n"
-        "若适合配图，在回复最后附一个 [MEME:ac|wa_tle|question|slacking|interrupt]，最多一个。"
+        "若适合配图，在回复最后附一个 [MEME:ac|wa_tle|question|slacking|interrupt]，最多一个。\n"
+        "如果这一句用一个表情包回应最合适、不需要文字，那就只输出 [MEME:ac|wa_tle|question|slacking|interrupt]，不要写别的字。"
     )
 
 

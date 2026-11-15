@@ -433,6 +433,8 @@ class ACMBot:
             config.QA_RATE_LIMIT_MAX_CALLS,
             config.QA_RATE_LIMIT_SECONDS,
         )
+        # 后台收图任务：只持有引用防被 GC 回收，不等待、不影响消息响应。
+        self._meme_tasks: set[asyncio.Task] = set()
         if client is not None:
             client.group_msg_handler = self.on_group_at_message_create
             client.private_msg_handler = self.on_private_message_create
@@ -824,6 +826,9 @@ class ACMBot:
                 )
                 return
             text = strip_at(message.content)
+            # 收图与文本滑窗在「有没有正文」之前处理：纯图片消息没有文本，
+            # 但它正是要收的对象；后台任务异步跑，绝不阻塞本条消息的响应。
+            self._schedule_meme_collect(message, group_id, text)
             if not text:
                 return
             # 群全量消息入口：老师没 @ 机器人、也没带 / 命令，只是在群里说安排
@@ -1159,32 +1164,96 @@ class ACMBot:
         if not config.MEME_ENABLED:
             return False
         try:
+            # 场景化插图：连续问号 → question，饭点/深夜抱怨 → slacking。
+            # 滑窗已由消息入口统一维护，这里不再重复 remember。
+            scene = memes.get_engine().scene_trigger(group_id, text, remember=False)
+        except Exception:
+            logger.exception("场景表情判定失败，跳过")
+            scene = ""
+        if scene:
+            return await self._send_meme(message, group_id, scene, text=text,
+                                         proactive=True)
+        try:
             category = memes.get_engine().should_trigger(group_id, text)
         except Exception:
             logger.exception("表情包触发判定失败，跳过")
             return False
         if not category:
             return False
-        return await self._send_meme(message, group_id, category)
+        return await self._send_meme(message, group_id, category, text=text)
+
+    def _schedule_meme_collect(self, message: OneBotMessage, group_id: str,
+                               text: str) -> None:
+        """按群开关把收图丢进后台任务；开关关闭时只维护文本滑窗。"""
+        try:
+            engine = memes.get_engine()
+            # 图片消息正文是 CQ 码串，先清干净再进滑窗，否则连问判定与归类全被污染。
+            clean_text = memes.strip_cq_codes(text)
+            # 先取历史上下文，再记当前文本：归类要用的是「这张图前后在聊什么」。
+            context = engine.recent_texts(group_id)[-memes.COLLECT_CONTEXT_LINES:]
+            engine.remember_text(group_id, clean_text)
+            if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
+                return
+            if not db.meme_collect_enabled(group_id):
+                return
+            if not memes.extract_image_refs(message):
+                return
+            task = asyncio.create_task(
+                memes.collect_from_message(
+                    message, group_id=group_id, text=clean_text, context=context,
+                )
+            )
+        except Exception:
+            logger.exception("收图任务投递失败，跳过")
+            return
+        self._meme_tasks.add(task)
+        task.add_done_callback(self._meme_tasks.discard)
+
+    async def _send_meme_local(self, group_id: str, relative_path: str, *,
+                               reply_to: str | None = None) -> bool:
+        """把素材目录里的本机文件直接发到群里；协议不支持就安静返回 False。"""
+        sender = getattr(self.client, "send_group_image_result", None)
+        if sender is None:
+            return False
+        path = memes.meme_path(relative_path)
+        if path is None:
+            return False
+        result = await sender(group_id, str(path), reply_to=reply_to)
+        return bool(result)
 
     async def _send_meme(self, message: OneBotMessage, group_id: str,
-                         category: str) -> bool:
-        """被动发一张官方富媒体表情包；任何前置条件缺失都静默降级为不回复。"""
-        # 官方富媒体只存在于 QQ 开放平台协议；OneBot 拼不出 file_info，直接跳过。
-        if self.protocol != "qqbot":
-            return False
-        if not config.MEME_BASE_URL:
-            return False
-        trigger = memes.get_engine().resolve(category)
-        if trigger is None:
-            # 素材目录缺失/为空，或未拼出公网地址：安静跳过，不报错也不阻塞。
+                         category: str, *, text: str = "",
+                         proactive: bool = False) -> bool:
+        """发一张表情包：OneBot 直接发本机文件，官方协议走富媒体上传。
+
+        Args:
+            text: 当前聊天文本，用于优先抽中文件名标签命中的那张图。
+            proactive: 主动插图（无入站消息可挂靠），走主动发送而非被动回复。
+        """
+        if not config.MEME_ENABLED:
             return False
         if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
             return False
-        msg_id = str(getattr(message, "id", "") or "")
-        if not msg_id:
+        engine = memes.get_engine()
+        # 官方协议必须拿到公网地址；OneBot 直接发本机文件，不需要公网地址。
+        trigger = engine.resolve(category, group_id=group_id, text=text,
+                                 require_url=self.protocol == "qqbot")
+        if trigger is None:
+            # 素材目录缺失/为空，或未拼出公网地址：安静跳过，不报错也不阻塞。
             return False
+        msg_id = str(getattr(message, "id", "") or "")
+        if proactive or not msg_id:
+            sent = await self._send_meme_local(group_id, trigger.relative_path)
+            if sent:
+                engine.record_sent(group_id, trigger.relative_path)
+            return sent
         try:
+            if self.protocol != "qqbot":
+                sent = await self._send_meme_local(group_id, trigger.relative_path,
+                                                   reply_to=msg_id)
+                if sent:
+                    engine.record_sent(group_id, trigger.relative_path)
+                return sent
             file_info = db.get_meme_file_cache(group_id, trigger.relative_path)
             if not file_info:
                 uploaded = await self.client.upload_group_media(group_id, trigger.url)
@@ -1201,6 +1270,8 @@ class ACMBot:
             result = await self.client.send_group_media_result(
                 group_id, file_info, reply_to=msg_id, reply_seq=seq,
             )
+            if result:
+                engine.record_sent(group_id, trigger.relative_path)
             return bool(result)
         except Exception:
             logger.exception("表情包发送失败，跳过")
@@ -1295,8 +1366,11 @@ class ACMBot:
             memory.observe(group_id, "学姐", reply)
         # 表情包顺风车：分类由本条回复明确指定，直接复用阶段二链路，
         # 不走关键词判定（因此天然跳过关键词冷却），任一前置条件缺失即安静不发。
-        if reply and category and config.MEME_ENABLED:
-            await self._send_meme(message, group_id, category)
+        # 模型也可能只给一个 [MEME:xx]、不写字，这时只发图、不发空文本。
+        if category and config.MEME_ENABLED:
+            sent = await self._send_meme(message, group_id, category, text=body)
+            if not reply:
+                return sent
         return bool(reply)
 
     async def _maybe_persona_interject(self, message: OneBotMessage, text: str,

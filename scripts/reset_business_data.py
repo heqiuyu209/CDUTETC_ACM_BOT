@@ -23,6 +23,8 @@ BUSINESS_TABLES = (
     "teacher_intent_pending",
     # 官方富媒体表情包的 file_info 缓存：属可重建的运行态缓存，随重置清空。
     "meme_file_cache",
+    # 自动收图的 MD5 指纹：重置后图库回到冷启动状态，指纹一并清空才对得上。
+    "meme_hashes",
     "collection_responses", "collections", "unanswered_questions", "group_faq",
     "training_sessions", "org_events", "competition_pending_updates",
     "competition_versions", "competition_sources", "competition_notify_groups",

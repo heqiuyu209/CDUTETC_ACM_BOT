@@ -180,6 +180,8 @@ _HELP_SECTIONS = (
         (3, "/认领老师 <QQ号> <姓名>", "在群里认领老师身份，名字用于提示展示"),
         (3, "/通知群 <比赛id> <群号,群号>", "设置该比赛通知哪些群"),
         (3, "/比赛状态 全部", "私聊查看全部已授权群的提醒就绪情况"),
+        (3, "/偷图 开|关", "按群开关零审核自动收图（自动过滤截图、去重、按上下文分类）"),
+        (3, "/删图", "删掉本群最近一次机器人发的表情包，并拉黑该图不再收录"),
     )),
 )
 
@@ -1651,7 +1653,7 @@ PRIVATE_SESSION_COMMANDS = frozenset({"选群", "切群", "当前群", "重置�
 GROUP_ADMIN_COMMANDS = frozenset({"群配置", "群提醒", "周赛设置", "群老师", "绑老师"})
 
 WORKSPACE_COMMANDS = frozenset({
-    "群配置", "群提醒", "周赛设置", "群老师", "绑老师", "群开关",
+    "群配置", "群提醒", "周赛设置", "群老师", "绑老师", "群开关", "偷图", "删图",
 })
 
 # 常用短别名，等价于原命令（旧写法保持可用）。
@@ -1831,6 +1833,12 @@ def render_admin_panel(uid: str, gid: str, now: datetime | None = None) -> str:
     label = _group_label(gid)
     state = "已锁定" if locked == gid else "默认"
     lines = [f"📌 工作区：{label}（{state}）"]
+    try:
+        collect_state = "开启" if db.meme_collect_enabled(gid) else "关闭"
+    except Exception:  # noqa: BLE001 - 面板不能因为开关读取异常整体失败
+        collect_state = "未知"
+        logger.warning("管理面板收图开关读取失败 [%s]", AppErrorCode.INTERNAL.value)
+    lines.append(f"🖼 自动收图：{collect_state}（/偷图 开|关 切换）")
     pending = db.list_pending_publications(status="pending")
     if pending:
         ids = "、".join(f"#{item['id']}" for item in pending[:5])
@@ -2134,6 +2142,8 @@ async def _handle_command_impl(text: str, group_id: str, sender: str,
         "课程取消": cmd_training_cancel,
         "课程修改": cmd_training_modify,
         "群开关": cmd_group_switch,
+        "偷图": lambda gid, uid, value: cmd_meme_collect(gid, uid, value, private=private),
+        "删图": lambda gid, uid, value: cmd_meme_delete(gid, uid, value, private=private),
         "提醒添加": cmd_reminder_add,
         "提醒列表": cmd_reminder_list,
         "提醒修改": cmd_reminder_modify,
@@ -2453,6 +2463,66 @@ def cmd_group_switch(group_id: str, sender: str, args: str) -> list[dict]:
     text = f"本群{GROUP_SWITCH_LABELS[key]}已{parts[1]}。"
     if not enabled:
         text += _SWITCH_OFF_HINTS[key]
+    return [{"group_id": group_id, "text": text}]
+
+
+# ---------------------------------------------------------------------
+# 零审核自动收图：/偷图 <开|关> 按群开关，/删图 撤销最近一张并拉黑
+# ---------------------------------------------------------------------
+
+MEME_TOGGLE_ON = frozenset({"开", "开启", "打开", "启用", "on", "1", "是"})
+MEME_TOGGLE_OFF = frozenset({"关", "关闭", "关掉", "停用", "off", "0", "否"})
+
+
+def cmd_meme_collect(group_id: str, sender: str, args: str, *,
+                     private: bool = False) -> list[dict]:
+    """/偷图：按群开关零审核自动收图（群内管理，或超管私聊针对工作区）。"""
+    if admin_scope(sender, group_id, private=private) is None:
+        return [{"group_id": group_id,
+                 "text": "⚠️ 自动收图开关仅限本群老师或超级管理员调整。"}]
+    if not str(group_id or "").strip():
+        return [{"group_id": group_id, "text": "请先 /切换 绑定一个工作区群，再执行 /偷图。"}]
+    value = (args or "").strip().lower()
+    if not value:
+        state = "开启" if db.meme_collect_enabled(group_id) else "关闭"
+        return [{"group_id": group_id,
+                 "text": f"本群自动收图：{state}。用法：/偷图 开 或 /偷图 关"}]
+    if value in MEME_TOGGLE_ON:
+        enabled = True
+    elif value in MEME_TOGGLE_OFF:
+        enabled = False
+    else:
+        raise ValueError("用法：/偷图 开 或 /偷图 关")
+    db.set_meme_collect_enabled(group_id, enabled, sender)
+    if not enabled:
+        return [{"group_id": group_id, "text": "已关闭本群自动收图：之后群友发的图不再收录。"}]
+    total = 0
+    try:
+        total = db.count_meme_hashes()
+    except Exception:  # noqa: BLE001 - 图库计数只用于提示，读不到不算失败
+        logger.warning("收图库计数失败 [%s]", AppErrorCode.INTERNAL.value)
+    return [{"group_id": group_id,
+             "text": f"✅ 本群自动收图已开启（图库现有 {total} 张）："
+                     "群友发的表情包会自动过滤截图/大图、去重后归入对应分类。"}]
+
+
+def cmd_meme_delete(group_id: str, sender: str, args: str, *,
+                    private: bool = False) -> list[dict]:
+    """/删图：删掉本群最近一次机器人发出的表情包，并把 MD5 拉黑防复收。"""
+    if admin_scope(sender, group_id, private=private) is None:
+        return [{"group_id": group_id,
+                 "text": "⚠️ 删图仅限本群老师或超级管理员执行。"}]
+    if not str(group_id or "").strip():
+        return [{"group_id": group_id, "text": "请先 /切换 绑定一个工作区群，再执行 /删图。"}]
+    from cdutetc import memes
+    outcome = memes.delete_last_sent(group_id)
+    if not outcome:
+        return [{"group_id": group_id, "text": "本群还没有机器人发图记录，没有可删的图。"}]
+    relative = outcome.get("relative_path") or ""
+    if outcome.get("md5"):
+        text = f"🗑 已删除并拉黑：{relative}（同一张图以后不会再被收录）"
+    else:
+        text = f"🗑 已删除：{relative}（内置素材，不在收图台账中）"
     return [{"group_id": group_id, "text": text}]
 
 

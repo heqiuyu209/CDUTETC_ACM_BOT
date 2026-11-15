@@ -454,6 +454,19 @@ CREATE TABLE IF NOT EXISTS meme_file_cache (
 )
 """
 
+# 自动收图去重表：MD5 主键天然唯一，删过的图保留 deleted=1 当黑名单，
+# 防止「删了又被别人重发一遍收回来」。tags 存命中的关键词（文件名前缀）。
+_MEME_HASHES_DDL = """
+CREATE TABLE IF NOT EXISTS meme_hashes (
+    md5        TEXT PRIMARY KEY,
+    category   TEXT NOT NULL DEFAULT '',
+    tags       TEXT NOT NULL DEFAULT '',
+    file_path  TEXT NOT NULL DEFAULT '',
+    deleted    INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT ''
+)
+"""
+
 # 三层持久化记忆之一：个人特征标签。每 (群, 成员) 只保留最近若干条短标签，
 # 由 0 Token 规则从群聊原话里截取，绝不调模型；超限由写入方自动淘汰最旧。
 _BOT_MEMORY_FACTS_DDL = """
@@ -517,6 +530,7 @@ _ALL_DDL = (
     _GROUP_SETTINGS_DDL, _CUSTOM_REMINDERS_DDL, _AUDIT_LOG_DDL,
     _ADMIN_WORKSPACES_DDL, _TEACHER_INTENT_PENDING_DDL,
     _MEME_FILE_CACHE_DDL,
+    _MEME_HASHES_DDL,
     # 机器人记忆两张表：属长期记忆，重置业务数据时保留（见 reset_business_data）。
     _BOT_MEMORY_FACTS_DDL, _BOT_DAILY_STATE_DDL,
 )
@@ -4502,6 +4516,112 @@ def resolve_teacher_intent_pending(pid: int, status: str = "resolved",
             (status, _as_str(operator), now_str(), key),
         )
         return cur.rowcount > 0
+
+
+# ================= 零审核自动收图：群开关 + MD5 去重台账 =================
+# 收图默认关闭（默认 0）：不主动开就不碰群友发的图，避免误收隐私内容。
+MEME_COLLECT_SETTING = "meme_collect_enabled"
+_MEME_COLLECT_ON = "on"
+_MEME_COLLECT_OFF = "off"
+
+
+def set_meme_collect_enabled(group_id: str, enabled: bool, operator: str = "") -> None:
+    """按群开关自动收图（默认关闭）。"""
+    if type(enabled) is not bool:
+        raise ValueError("请明确开启或关闭自动收图")
+    set_group_setting(group_id, MEME_COLLECT_SETTING,
+                      _MEME_COLLECT_ON if enabled else _MEME_COLLECT_OFF, operator)
+
+
+def meme_collect_enabled(group_id: str) -> bool:
+    """该群是否开启了自动收图；未设置过、库未初始化都按关闭处理。"""
+    try:
+        value = get_group_setting(group_id, MEME_COLLECT_SETTING, _MEME_COLLECT_OFF)
+    except sqlite3.OperationalError:
+        return False
+    return value.strip().lower() == _MEME_COLLECT_ON
+
+
+def get_meme_hash(md5: str) -> dict | None:
+    """按 MD5 取一条收图台账；不存在返回 None。"""
+    value = _as_str(md5)
+    if not value:
+        return None
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT md5, category, tags, file_path, deleted, created_at"
+            " FROM meme_hashes WHERE md5 = ?",
+            (value,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {"md5": row[0], "category": row[1], "tags": row[2], "file_path": row[3],
+            "deleted": bool(row[4]), "created_at": row[5]}
+
+
+def meme_hash_exists(md5: str) -> bool:
+    """该 MD5 是否已收过（含 deleted=1 的黑名单图，一律视为重复）。"""
+    return get_meme_hash(md5) is not None
+
+
+def save_meme_hash(md5: str, category: str, tags: str, file_path: str) -> bool:
+    """登记一张新收的表情包；MD5 已存在（含黑名单）时不覆盖，返回 False。"""
+    value = _as_str(md5)
+    if not value:
+        raise ValueError("收图台账需要 MD5")
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO meme_hashes (md5, category, tags, file_path, deleted, created_at)"
+            " VALUES (?, ?, ?, ?, 0, ?) ON CONFLICT(md5) DO NOTHING",
+            (value, _as_str(category), _as_str(tags), _as_str(file_path), now_str()),
+        )
+        return cur.rowcount > 0
+
+
+def mark_meme_hash_deleted(md5: str, *, file_path: str = "") -> bool:
+    """把一张已收的图拉黑（deleted=1），此后同 MD5 不再收录。"""
+    value = _as_str(md5)
+    if not value:
+        return False
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE meme_hashes SET deleted = 1, file_path = COALESCE(NULLIF(?, ''), file_path)"
+            " WHERE md5 = ?",
+            (_as_str(file_path), value),
+        )
+        return cur.rowcount > 0
+
+
+def find_meme_hash_by_path(file_path: str) -> dict | None:
+    """按本地相对路径反查台账（/删图 用路径找到 MD5 再拉黑）。"""
+    relative = _as_str(file_path)
+    if not relative:
+        return None
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT md5, category, tags, file_path, deleted, created_at"
+            " FROM meme_hashes WHERE file_path = ? ORDER BY created_at DESC LIMIT 1",
+            (relative,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {"md5": row[0], "category": row[1], "tags": row[2], "file_path": row[3],
+            "deleted": bool(row[4]), "created_at": row[5]}
+
+
+def count_meme_hashes(*, category: str = "", include_deleted: bool = False) -> int:
+    """统计已收图数量（可按分类过滤），供 /管理 与 /偷图 回执展示。"""
+    sql = "SELECT COUNT(*) FROM meme_hashes WHERE 1 = 1"
+    params: list = []
+    if not include_deleted:
+        sql += " AND deleted = 0"
+    clean = _as_str(category)
+    if clean:
+        sql += " AND category = ?"
+        params.append(clean)
+    with _connect() as conn:
+        row = conn.execute(sql, params).fetchone()
+    return int(row[0]) if row else 0
 
 
 # ================= 官方富媒体表情包 file_info 缓存 =================

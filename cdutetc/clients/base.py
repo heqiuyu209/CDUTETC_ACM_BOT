@@ -39,11 +39,23 @@ class BaseBotClient(ABC):
     #: 主动群消息是否支持 markdown
     supports_markdown: bool = False
 
+    #: 是否支持直接发送本机图片文件（OneBot 用 CQ 码，官方协议需先上传换 file_info）
+    supports_local_image: bool = False
+
     @abstractmethod
     async def send_group_msg_result(self, group_id: str, text: str, *,
                                     reply_to: str | None = None,
                                     reply_seq: int = 1) -> DeliveryResult:
         """发送群消息，返回结构化结果；不抛底层异常。"""
+
+    async def send_group_image_result(self, group_id: str, image_path: str, *,
+                                      reply_to: str | None = None,
+                                      reply_seq: int = 1) -> DeliveryResult:
+        """发送本机图片；协议不支持本地图片时返回 UNSUPPORTED，业务层据此降级。"""
+        from cdutetc.errors import DeliveryCode, DeliveryMode
+
+        return DeliveryResult(False, DeliveryCode.UNSUPPORTED,
+                              self.protocol or "", DeliveryMode.PASSIVE)
 
     def accepts_group_id(self, group_id: str) -> bool:
         """该群标识是否可作为授权目标；形态判定归客户端，业务层不猜字符串。"""
