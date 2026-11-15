@@ -541,6 +541,8 @@ class ACMBot:
             if content.strip().startswith("/") and is_super_admin(uid):
                 cmd, args = parse_command(content)
                 from cdutetc import group_admin
+                # 短别名归一：/面板→/管理、/绑老师→/群老师、/改→/修正
+                cmd = commands.canonical_command(cmd)
                 # 目标群会话指令最先处理：它们决定后续业务指令作用到哪个群
                 if cmd in commands.PRIVATE_SESSION_COMMANDS:
                     for reply in commands.handle_session_command(cmd, args, str(uid)) or []:
@@ -548,19 +550,18 @@ class ACMBot:
                             await self._send_private_result(uid, reply["text"])
                     return
                 if cmd in group_admin.COMMANDS:
+                    # /群配置 <序号|群名> 等价于切换工作区：先落库，再直接展示该群面板，
+                    # 这样不带 group_openid 也能一步完成「选群 + 看配置」。
+                    tokens = (args or "").split()
+                    if cmd == "群配置" and len(tokens) == 1 and tokens[0] != "全部":
+                        if commands.bind_active_group(str(uid), tokens[0]):
+                            args = ""
                     # 已绑定目标群时，群配置类指令默认落到该群（不带参数的 /群配置 即查该群）；
                     # 显式 /群配置 全部 属于跨群查询，仍按全局视角处理。
                     bound = admin_session.get_active_group(str(uid)) or ""
                     if "全部" in (args or ""):
                         bound = ""
-                    # 私聊 /群配置 <序号> 解析成功后顺手锁定工作区（C5），后续业务指令
-                    # 无需再 /选群。仅处理候选列表序号，避免与「按群查询」只读语义混淆；
-                    # 且在本条指令执行之后绑定，保证本条查询仍按原作用域解析。
-                    replies = group_admin.handle_command(cmd, args, uid, bound)
-                    if cmd == "群配置":
-                        tokens = (args or "").split()
-                        if len(tokens) == 1 and tokens[0].isdigit():
-                            commands.bind_active_group(str(uid), tokens[0])
+                    replies = group_admin.handle_command(cmd, args, uid, bound, private=True)
                     if any(reply.get("refresh_weekly") for reply in replies or []):
                         await self._weekly_contest_job()
                     # 私聊管理回执同样带工作区标牌，与业务指令出口保持一致

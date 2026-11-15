@@ -73,7 +73,11 @@ async def test_private_group_reminders_and_configuration_work_without_default_ad
     text = await app.send("/群提醒 集训队")
     assert "开赛前30分钟" in text and "待发送" in text
     assert "集训周赛" not in await app.send("/群配置 新生")
-    choices = await app.send("/群配置")
+    # /群配置 <群名> 顺带把工作区切到该群，之后不带参数即看该群配置
+    current = await app.send("/群配置")
+    assert "【新生】" in current and "集训队" not in current
+    # 参数全省略的 /切换 才是候选列表入口
+    choices = await app.send("/切换")
     assert "请选择" in choices and "集训队" in choices and "新生" in choices
 
 
@@ -116,7 +120,8 @@ async def test_teacher_assignment_is_atomic_and_does_not_grant_global_permission
 async def test_ambiguous_group_never_silently_selects_one(app):
     db.set_account_label("group", "new", "集训队")
     text = await app.send("这周集训队群有什么比赛")
-    assert "歧义" in text and "/群配置 team" in text and "/群配置 new" in text
+    # 歧义时引导用序号短命令消歧，不再要求抄 32 位 group_openid
+    assert "歧义" in text and "/切换 1" in text and "/切换 2" in text
     text = await app.send("/周赛设置 集训队 开启")
     assert "歧义" in text and db.get_weekly_groups() == set()
 

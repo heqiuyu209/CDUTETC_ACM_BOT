@@ -32,6 +32,8 @@ CONFIG_TABLES = (
     "group_weekly_settings", "group_teacher_assignments",
     # 群级键值开关（课程提醒开/关等）：属配置，重置业务数据时一并保留。
     "group_settings",
+    # 超管私聊工作区（user_openid → 目标群 openid）：属运行态偏好，保留可免重置后重选群。
+    "admin_workspaces",
 )
 
 

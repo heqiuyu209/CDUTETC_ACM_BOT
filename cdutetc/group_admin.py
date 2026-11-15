@@ -43,8 +43,76 @@ def _choices() -> str:
         return "还没有授权群。先在目标群 @我 /帮助，再由超管按提示加群。"
     lines = []
     for index, gid in enumerate(groups, 1):
-        lines.append(f"{index}. {_display(gid)}｜/群配置 {gid}")
-    return "请选择要查询的群（也可直接发 /群配置 <序号>）：\n" + "\n".join(lines)
+        lines.append(f"{index}. {_display(gid)}｜/切换 {index}")
+    return "请选择要操作的群（也可直接发 /切换 <序号|群名关键字>）：\n" + "\n".join(lines)
+
+
+# 默认工作区：没有历史绑定时优先落到「正式群」而不是测试群。
+# 名称命中这些词的群一律视为调试用群，不会被当作默认工作区。
+_TEST_GROUP_HINTS = ("测试", "test", "demo", "调试", "沙盒", "sandbox", "临时")
+
+
+def _safe_name(gid: str) -> str:
+    try:
+        return _name(gid) or ""
+    except Exception:  # noqa: BLE001 - 群名只是择优参考，取不到就退回群号
+        return ""
+
+
+def _is_test_group(gid: str) -> bool:
+    low = _safe_name(gid).lower()
+    return any(word in low for word in _TEST_GROUP_HINTS)
+
+
+def default_workspace() -> str:
+    """默认工作区：名称含「集训队」且非测试群优先，其次任意非测试群，最后兜底第一个。"""
+    groups = sorted(config.ALLOWED_GROUPS)
+    if not groups:
+        return ""
+    formal = [gid for gid in groups if not _is_test_group(gid)]
+    preferred = [gid for gid in formal if "集训队" in _safe_name(gid)]
+    return (preferred or formal or groups)[0]
+
+
+def active_workspace(sender: str = "", *, fallback: bool = True) -> str:
+    """超管当前工作区。
+
+    - 已锁定：直接返回（含重启后从数据库恢复的绑定）；
+    - 从未选定：回落到默认正式群（fallback=True 时），避免挂到测试群；
+    - 显式 /重置群 过：保持全局模式，不再自动回落。
+    """
+    from cdutetc import admin_session
+
+    gid = admin_session.get_active_group(sender) if sender else None
+    if gid and gid in config.ALLOWED_GROUPS:
+        return gid
+    if not fallback or not sender:
+        return ""
+    try:
+        if db.has_admin_workspace(sender):
+            return ""
+    except Exception:  # noqa: BLE001 - 库不可用时按未选定处理
+        return ""
+    return default_workspace()
+
+
+def choices() -> str:
+    """对外暴露的选择提示（/切换、/群配置 等无参数时展示）。"""
+    return _choices()
+
+
+def switch_workspace(sender: str, selector: str) -> tuple[str, str]:
+    """把超管私聊工作区切到 selector 指定的群并立即落库（等价 /群配置 <序号|群名>）。"""
+    from cdutetc import admin_session
+
+    text = (selector or "").strip()
+    if not text:
+        raise ValueError(_choices())
+    gid = resolve_group(text)
+    admin_session.set_active_group(sender, gid)
+    return gid, (f"已将操作群切换为 {_display(gid)}；后续私聊管理命令默认作用于该群。"
+                 "\n看总览：/管理｜解除锁定：/重置群")
+
 
 
 def _resolve_index(selector: str) -> str | None:
@@ -156,9 +224,9 @@ def describe(gid: str, *, this_week: bool = False, now: datetime | None = None, 
         for plan in plans[:6]:
             lines.append(f"· {plan['scheduled_at']:%m-%d %H:%M} {plan['name']}｜{plan['label']}｜{plan['state']}")
         if plans:
-            lines.append(f"完整提醒：/群提醒 {gid}")
+            lines.append("完整提醒：/群提醒（默认当前工作区）")
     if not db.get_group_teachers(gid):
-        lines.append(f"登记负责老师：/群老师 {gid} 老师标识（先用 /老师列表 查看已授权老师）")
+        lines.append("登记负责老师：/绑老师 老师标识（先用 /老师列表 查看已授权老师）")
     return "\n".join(lines)
 
 
@@ -199,7 +267,46 @@ def _parse_course_remind(parts: list[str], current_group: str) -> tuple[str, boo
     return gid, action[0] == "开启"
 
 
-def handle_command(command: str, args: str, sender: str, current_group: str = "") -> list[dict] | None:
+def _target_group(parts: list[str], *, workspace: str,
+                  show_choices: bool = True) -> tuple[str, list[str]]:
+    """解析命令的目标群与剩余参数，统一支持 openid / 序号 / 群名关键字。
+
+    省略群标识时默认使用超管当前工作区，从而免除拷贝 32 位 group_openid：
+    ``/绑老师 孔老师``、``/群提醒``、``/群配置`` 都直接作用于工作区。
+    """
+    if not parts:
+        if workspace:
+            return workspace, []
+        raise ValueError(_choices())
+    try:
+        return resolve_group(parts[0]), parts[1:]
+    except ValueError as error:
+        # 群内不给候选列表，避免把其他群名暴露给本群成员
+        choices = f"\n{_choices()}" if show_choices else ""
+        # 歧义（多个群同名）必须显式消歧，不能悄悄落到工作区
+        if "歧义" in str(error):
+            raise ValueError(f"{error}{choices}") from None
+        # 首个 token 不像群标识（如 /绑老师 孔老师、/周赛设置 开启）时，
+        # 整段都当作参数，作用群取超管工作区，实现免 group_openid 的短命令。
+        if workspace and not _looks_like_group_ref(parts[0]):
+            return workspace, parts
+        if workspace:
+            raise ValueError(f"没有匹配到唯一的已授权群。{choices}") from None
+        raise
+
+
+def _looks_like_group_ref(token: str) -> bool:
+    """粗略判断 token 是否在表达「群」：纯数字序号、含群字的名称、或群 openid。"""
+    text = (token or "").strip()
+    if not text:
+        return False
+    if text.isdigit():
+        return True
+    return "群" in text or text in config.ALLOWED_GROUPS
+
+
+def handle_command(command: str, args: str, sender: str, current_group: str = "",
+                   *, private: bool = False) -> list[dict] | None:
     if command not in COMMANDS:
         return None
     reply = lambda text, **extra: [{"group_id": current_group, "text": text, **extra}]
@@ -214,51 +321,49 @@ def handle_command(command: str, args: str, sender: str, current_group: str = ""
         return reply("群配置与变更仅超管执行；本群提醒可用 /群提醒、/比赛状态 查看。")
     try:
         parts = shlex.split(args)
-        if not parts:
-            if not current_group:
-                return reply(_choices())
-            parts = [current_group]
+        # 群内始终锁本群；私聊取超管工作区（重启后按库恢复，未选定则回落正式群）。
+        # 私聊不再硬锁群：显式带上群标识时仍允许跨群操作，省略时才落到工作区。
+        if private:
+            workspace, locked = active_workspace(sender), ""
+        else:
+            workspace, locked = current_group, current_group
         if command == "群配置" and parts == ["全部"]:
-            if current_group:
+            if locked:
                 return reply("跨群信息请在私聊中查询。")
             return reply(_describe_all())
         if command == "群配置" and "课程提醒" in parts:
-            remind_gid, enabled = _parse_course_remind(parts, current_group)
-            if current_group and remind_gid != current_group:
+            remind_gid, enabled = _parse_course_remind(parts, workspace)
+            if locked and remind_gid != locked:
                 return reply("跨群信息请在私聊中查询。")
             db.set_group_course_remind(remind_gid, enabled, sender)
             return reply(f"{_name(remind_gid)}课程提醒已{'开启' if enabled else '关闭'}。")
-        try:
-            gid = resolve_group(parts[0])
-        except ValueError:
-            if current_group:
-                return reply("请在私聊中选择其他群；查看本群可用 /群配置。")
-            raise
-        if current_group and gid != current_group:
+        gid, rest = _target_group(parts, workspace=workspace, show_choices=not locked)
+        if locked and gid != locked:
             return reply("跨群信息请在私聊中查询。")
         if command == "群配置":
-            if len(parts) != 1:
-                raise ValueError("用法：/群配置 群名或标识；私聊可用 /群配置 全部")
+            if rest:
+                raise ValueError("用法：/群配置 [群名或序号]；私聊可用 /群配置 全部")
             return reply(describe(gid))
         if command == "群提醒":
-            if len(parts) > 2:
-                raise ValueError("用法：/群提醒 群名或标识 [页码]")
+            if len(rest) > 1:
+                raise ValueError("用法：/群提醒 [群名或序号] [页码]")
             try:
-                page = int(parts[1]) if len(parts) == 2 else 1
+                page = int(rest[0]) if rest else 1
             except ValueError:
-                raise ValueError("用法：/群提醒 群名或标识 [页码]") from None
+                raise ValueError("用法：/群提醒 [群名或序号] [页码]") from None
             return reply(reminder_view.render(gid, page=page))
         if command == "周赛设置":
-            if len(parts) != 2 or parts[1] not in ("开启", "关闭"):
-                raise ValueError("用法：/周赛设置 群名或标识 开启|关闭")
-            db.set_weekly_group_enabled(gid, parts[1] == "开启", operator=sender)
-            message = f"{_name(gid)}的周赛已{parts[1]}，其他群设置不变。"
+            if len(rest) != 1 or rest[0] not in ("开启", "关闭"):
+                raise ValueError("用法：/周赛设置 [群名或序号] 开启|关闭")
+            db.set_weekly_group_enabled(gid, rest[0] == "开启", operator=sender)
+            message = f"{_name(gid)}的周赛已{rest[0]}，其他群设置不变。"
             if not config.WEEKLY_CONTEST_ENABLED:
                 message += "自动生成周赛已关闭；群设置已保存，已有场次按当前范围执行。"
             return reply(message, refresh_weekly=True)
-        if len(parts) == 1:
-            return reply(f"{_name(gid)}负责老师：{_teacher_names(gid)}\n设置：/群老师 {gid} 老师标识,老师标识；清空：/群老师 {gid} 清空")
-        selectors = re.split(r"[,，\s]+", " ".join(parts[1:]))
+        if not rest:
+            return reply(f"{_name(gid)}负责老师：{_teacher_names(gid)}"
+                         "\n设置：/绑老师 老师标识,老师标识；清空：/绑老师 清空")
+        selectors = re.split(r"[,，\s]+", " ".join(rest))
         teacher_ids = set() if selectors == ["清空"] else {_teacher_id(value) for value in selectors}
         db.set_group_teachers(gid, teacher_ids, operator=sender)
         return reply(f"{_name(gid)}负责老师：{_teacher_names(gid)}")

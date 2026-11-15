@@ -147,7 +147,7 @@ _HELP_SECTIONS = (
         (2, "/抓取一次", "立即检查一次比赛来源"),
     )),
     ("私聊调试（超管）", (
-        (3, "/选群 [序号|群名|群号]", "私聊绑定目标群，之后私聊指令都作用于该群"),
+        (3, "/选群 [序号|群名|群号]", "私聊绑定目标群，之后私聊指令都作用于该群（旧写法）"),
         (3, "/当前群", "查看私聊当前绑定的目标群"),
         (3, "/重置群", "解除绑定，恢复全局管理模式"),
         (3, "/晨报预览", "只在私聊回显该群晨报，不发送到群"),
@@ -157,17 +157,20 @@ _HELP_SECTIONS = (
         (2, "/老师列表", "查看已授权的群和老师"),
     )),
     ("比赛修正（超管）", (
-        (3, "/修正 <比赛id> <字段=值 ...>", "修正已发布的比赛信息"),
+        (3, "/改 <比赛id> <时间|链接|名称|赛道>", "免引号快捷修正，如 /改 12 11-29 09:00"),
+        (3, "/修正 <比赛id> <字段=值 ...>", "按字段精确修正（旧写法，仍可用）"),
         (3, "/修正 <比赛id> 重新提取 <链接>", "重新读取官网信息"),
         (3, "/待审列表", "查看来源更新带来的改动"),
         (3, "/待审批准 <更新id>", "采纳来源更新"),
         (3, "/待审拒绝 <更新id> [原因]", "忽略来源更新"),
     )),
     ("群与老师管理（超管）", (
-        (3, "/群配置 <群名或标识>", "私聊查看该群比赛、负责老师和提醒"),
-        (3, "/群提醒 <群名或标识> [页码]", "私聊查看指定群的提醒计划"),
-        (3, "/周赛设置 <群名或标识> 开启|关闭", "只修改这个群的周赛开关"),
-        (3, "/群老师 <群名或标识> [老师标识,老师标识|清空]", "登记本群负责老师"),
+        (3, "/管理", "一屏总览：工作区、待确认发布、24小时内提醒、短命令速查"),
+        (3, "/切换 <序号|群名>", "切换并记住工作区，重启后自动恢复"),
+        (3, "/群配置 [群名或标识]", "查看该群比赛、负责老师和提醒；省略则看工作区"),
+        (3, "/群提醒 [群名或标识] [页码]", "查看提醒计划；省略群则用工作区"),
+        (3, "/周赛设置 [群名或标识] 开启|关闭", "只修改这个群的周赛开关"),
+        (3, "/绑老师 [群名或标识] 老师姓名", "登记负责老师，省略群则用工作区（旧写法 /群老师）"),
         (3, "/加群 <群标识> [备注]", "让机器人在该群工作"),
         (3, "/删群 <群标识>", "取消该群授权"),
         (3, "/加老师 <QQ号> [备注]", "设置老师身份"),
@@ -182,7 +185,8 @@ _HELP_SECTIONS = (
     )),
 )
 
-_HELP_SUPER_FOOTER = "私聊审批：先 /待确认列表，再回复 同意 编号 或 拒绝 编号。\n私聊用 /群配置 群名 查看指定群；其他管理命令仍作用于默认管理群。"
+_HELP_SUPER_FOOTER = ("私聊审批：先 /待确认列表，再回复 同意 编号 或 拒绝 编号。\n"
+                      "先 /切换 集训队 锁定工作区，之后 /绑老师、/群提醒 等命令不必再带群标识。")
 
 _HELP_TOPICS = {
     "比赛": ("比赛",),
@@ -204,7 +208,7 @@ _HELP_EXAMPLES = {
     "问答": ((1, "例：@机器人 蓝桥杯什么时候报名？"),
              (2, "维护例：/FAQ添加 校赛在哪报名 = 在教务系统报名")),
     "提醒": ((3, "群通知测试例：/通知测试 群 Markdown"),),
-    "修正": ((3, "改名称示例：/修正 3 name=新的比赛名"),),
+    "修正": ((3, "快捷改期：/改 3 11-29 09:00；按字段：/修正 3 name=新的比赛名"),),
 }
 
 
@@ -339,6 +343,58 @@ def _parse_amend_fields(text: str) -> dict[str, str]:
     return _parse_field_values(text, _AMEND_FIELD_MAP)
 
 
+# ---- 免引号快捷改期 / 改链接 / 改名 -------------------------------------
+# 支持 `/改 <id> 11-29 09:00`、`/改 <id> 2026-11-29 09:00`、
+# `/改 <id> 11月29日 9:00` 这类不带 key= 的写法，按值的形态智能判定字段。
+_AMEND_INLINE_TIME = re.compile(
+    r"^(?:(?P<year>\d{4})[-/.])?(?P<month>\d{1,2})[-/.月](?P<day>\d{1,2})日?\s*"
+    r"(?P<hour>\d{1,2}):(?P<minute>\d{2})$"
+)
+_AMEND_URL_PATTERN = re.compile(r"^https?://\S+$", re.IGNORECASE)
+_AMEND_TRACK_SPLIT = re.compile(r"[、,，/]")
+
+
+def _parse_inline_time(text: str, now: datetime | None = None) -> str | None:
+    """把「11-29 09:00」「2026-11-29 09:00」「11月29日 9:00」补全为完整时间。"""
+    match = _AMEND_INLINE_TIME.match((text or "").strip())
+    if match is None:
+        return None
+    now = now or datetime.now(TZ)
+    year = int(match["year"]) if match["year"] else now.year
+    try:
+        moment = datetime(year, int(match["month"]), int(match["day"]),
+                          int(match["hour"]), int(match["minute"]))
+    except ValueError:
+        return None
+    return moment.strftime("%Y-%m-%d %H:%M")
+
+
+def _looks_like_tracks(value: str) -> bool:
+    """「C++、Python」这类短项并列当赛道；长句仍按比赛名称处理。"""
+    items = [item.strip() for item in _AMEND_TRACK_SPLIT.split(value) if item.strip()]
+    return len(items) >= 2 and all(len(item) <= 12 for item in items)
+
+
+def _smart_amend_fields(rest: str) -> tuple[dict[str, str], str]:
+    """解析修正参数：保留旧式 `字段=值`，同时支持免引号的单值快捷写法。
+
+    返回值：(字段字典, 识别说明)；无法识别时抛 ValueError。
+    """
+    text = (rest or "").strip()
+    if not text:
+        raise ValueError("请提供要改的值，如 /改 12 11-29 09:00")
+    if "=" in text:
+        return _parse_amend_fields(text), ""
+    when = _parse_inline_time(text)
+    if when:
+        return {"official_time": when}, f"开赛时间→{when}"
+    if _AMEND_URL_PATTERN.match(text):
+        return {"official_site": text}, "官网链接"
+    if _looks_like_tracks(text):
+        return {"tracks": text}, "赛道"
+    return {"name": text}, "比赛名称"
+
+
 def _broadcast_to_groups(competition_name: str, cid: int, text: str, exclude: str = "") -> list[dict]:
     """向全部允许群广播一条通知（排除触发群可选）。订阅体系已移除，修正/发布影响全体群。"""
     return [
@@ -352,18 +408,23 @@ async def cmd_amend(group_id: str, sender: str, args: str) -> list[dict]:
     """超管修正已发布比赛：字段纠正或重新提取官网，生成修正版本并通知各群。
 
     用法：
-      /修正 <比赛id> <字段=值 ...>      纠正指定字段
+      /修正 <比赛id> <字段=值 ...>      纠正指定字段（旧写法，保持兼容）
+      /改 <比赛id> <值>                 免引号快捷写法：
+                                        · 11-29 09:00 / 2026-11-29 09:00 → 改开赛时间
+                                        · http(s)://…                    → 改官网
+                                        · C++、Python                    → 改赛道
+                                        · 其他文本                       → 改比赛名称
       /修正 <比赛id> 重新提取 <链接>    重新抓取官网并提取，覆盖官方字段
     """
     if not is_super_admin(sender):
         return [{"group_id": group_id, "text": "仅超管可修正比赛信息 [permission]", "error_code": AppErrorCode.PERMISSION.value}]
     parts = args.strip().split(None, 1)
     if not parts:
-        return [{"group_id": group_id, "text": "用法：/修正 <比赛id> <字段=值 ...> 或 /修正 <比赛id> 重新提取 <链接>"}]
+        return [{"group_id": group_id, "text": "用法：/改 <比赛id> <值>（时间/链接/名称/赛道），或 /修正 <比赛id> 字段=值"}]
     try:
         cid = int(parts[0])
     except ValueError:
-        return [{"group_id": group_id, "text": "用法：/修正 <比赛id> <字段=值 ...>，id 应为数字"}]
+        return [{"group_id": group_id, "text": "用法：/改 <比赛id> <值>，id 应为数字"}]
     comp = db.get_competition(cid)
     if comp is None:
         return [{"group_id": group_id, "text": f"比赛 #{cid} 不存在"}]
@@ -371,11 +432,11 @@ async def cmd_amend(group_id: str, sender: str, args: str) -> list[dict]:
     if rest.startswith("重新提取"):
         return await _amend_refetch(group_id, cid, comp, rest)
     try:
-        info = _parse_amend_fields(rest)
+        info, hint = _smart_amend_fields(rest)
     except ValueError as e:
         return [{"group_id": group_id, "text": f"修正参数错误：{e}\n支持：name edition official_site official_reg_start official_reg_deadline official_time tracks official_rules device_req summary（或短名 site/reg_deadline/time/rules 等）"}]
     if not info:
-        return [{"group_id": group_id, "text": "请提供至少一个要修正的字段，如 /修正 1 official_reg_deadline=2026-12-01 23:59"}]
+        return [{"group_id": group_id, "text": "请提供至少一个要修正的字段，如 /改 1 11-29 09:00"}]
     try:
         ok = db.amend_competition(cid, info, operator=sender, note="超管 /修正")
     except ValueError as e:
@@ -383,7 +444,13 @@ async def cmd_amend(group_id: str, sender: str, args: str) -> list[dict]:
     if not ok:
         return [{"group_id": group_id, "text": f"比赛 #{cid} 不存在，无法修正"}]
     changed = "；".join(f"{k}={v}" for k, v in info.items())
-    msgs = [{"group_id": group_id, "text": f"已修正比赛「{comp['name']}」（#{cid}）：{changed}\n修正已生成版本记录"}]
+    tail = "修正已生成版本记录"
+    if "official_time" in info:
+        # amend_competition 已按新开赛时间重排「开赛前 N 分钟」提醒队列
+        tail += "；开赛提醒已按新时间重排"
+    elif hint:
+        tail += f"（识别为{hint}）"
+    msgs = [{"group_id": group_id, "text": f"已修正比赛「{comp['name']}」（#{cid}）：{changed}\n{tail}"}]
     msgs += _broadcast_to_groups(comp["name"], cid, f"比赛「{comp['name']}」（#{cid}）已被超管修正：{changed}", exclude=group_id)
     return msgs
 
@@ -1490,7 +1557,35 @@ def cmd_contest_status(group_id: str, sender: str, args: str, *, private: bool =
 # 这些指令只在私聊里生效，用于给超管私聊绑定一个目标群，之后私聊的
 # /课程* /FAQ* /比赛状态 /晨报预览 等指令都按该群的单群视角执行，
 # 回执全部走私聊，真实群完全无感知。
-PRIVATE_SESSION_COMMANDS = frozenset({"选群", "切群", "当前群", "重置群"})
+PRIVATE_SESSION_COMMANDS = frozenset({"选群", "切群", "当前群", "重置群", "切换", "管理", "面板"})
+
+# 省略群标识时自动落到「超管当前工作区」的群级管理命令：
+# 这些命令不必再粘贴 32 位 group_openid，也不必先 /选群。
+# 由 group_admin.handle_command 自行解析目标群的命令：它们支持
+# 「32 位 openid / 序号 / 群名关键字」三种写法，省略时落到超管工作区。
+GROUP_ADMIN_COMMANDS = frozenset({"群配置", "群提醒", "周赛设置", "群老师", "绑老师"})
+
+WORKSPACE_COMMANDS = frozenset({
+    "群配置", "群提醒", "周赛设置", "群老师", "绑老师", "群开关",
+})
+
+# 常用短别名，等价于原命令（旧写法保持可用）。
+COMMAND_ALIASES = {
+    "改": "修正",
+    "绑老师": "群老师",
+    "面板": "管理",
+}
+
+
+def canonical_command(cmd: str) -> str:
+    """把短别名（/改、/绑老师、/面板）归一成正式命令名；未命中原样返回。"""
+    if cmd in COMMAND_ALIASES:
+        return COMMAND_ALIASES[cmd]
+    lower = cmd.lower()
+    for alias, target in COMMAND_ALIASES.items():
+        if alias.lower() == lower:
+            return target
+    return cmd
 
 
 def _allowed_group_ids() -> list[str]:
@@ -1614,14 +1709,82 @@ def cmd_active_group_reset(uid: str) -> list[dict]:
     )}]
 
 
+def cmd_switch_workspace(uid: str, args: str) -> list[dict]:
+    """/切换：按序号或群名关键字切换工作区并落库（等价 /群配置 <序号|群名>）。"""
+    from cdutetc import group_admin
+    value = (args or "").strip()
+    if not value:
+        return [{"group_id": "", "text": group_admin.choices()}]
+    try:
+        gid, message = group_admin.switch_workspace(uid, value)
+    except ValueError as error:
+        return [{"group_id": "", "text": f"⚠️ {error}"}]
+    return [{"group_id": gid, "text": f"✅ {message}"}]
+
+
+def _panel_time(moment: datetime) -> str:
+    local = moment.astimezone(TZ) if moment.tzinfo else moment
+    return local.strftime("%m-%d %H:%M")
+
+
+def render_admin_panel(uid: str, gid: str, now: datetime | None = None) -> str:
+    """一屏总览：工作区、待确认发布、未来 24 小时提醒、短命令速查。"""
+    from cdutetc import admin_session, reminder_view
+    now = now or datetime.now(TZ)
+    locked = admin_session.get_active_group(uid)
+    if not gid:
+        return "\n".join([
+            "🌐 工作区：全局模式（未锁定任何群）",
+            "发送 /切换 <序号|群名> 绑定工作区，之后管理命令就不必再带群标识。",
+        ])
+    label = _group_label(gid)
+    state = "已锁定" if locked == gid else "默认"
+    lines = [f"📌 工作区：{label}（{state}）"]
+    pending = db.list_pending_publications(status="pending")
+    if pending:
+        ids = "、".join(f"#{item['id']}" for item in pending[:5])
+        more = "…" if len(pending) > 5 else ""
+        lines.append(f"🗂 待确认发布：{len(pending)} 条（{ids}{more}）→ /待确认列表")
+    else:
+        lines.append("🗂 待确认发布：无")
+    try:
+        upcoming = reminder_view.build_preview(gid, now=now, days=1)
+    except Exception:  # 面板不能因为提醒预览异常而整体失败
+        logger.warning("管理面板提醒预览失败 [%s]", AppErrorCode.INTERNAL.value)
+        upcoming = []
+    if upcoming:
+        lines.append(f"⏰ 未来 24 小时提醒（{len(upcoming)} 条）：")
+        for item in upcoming[:5]:
+            lines.append(f"   {_panel_time(item['scheduled_at'])} {item['name']}·{item['label']}")
+        if len(upcoming) > 5:
+            lines.append(f"   …另 {len(upcoming) - 5} 条，详见 /群提醒")
+    else:
+        lines.append("⏰ 未来 24 小时提醒：无")
+    lines.append("⌨️ 速查：/切换 集训队｜/绑老师 老师姓名｜/改 <id> 11-29 09:00｜/群提醒")
+    return "\n".join(lines)
+
+
+def cmd_admin_panel(group_id: str, sender: str, args: str, *, gid: str = "") -> list[dict]:
+    """/管理、/面板：超管一屏总览；群里只展示本群。"""
+    if not is_super_admin(sender):
+        return [{"group_id": group_id, "text": "仅超管可查看管理面板 [permission]",
+                 "error_code": AppErrorCode.PERMISSION.value}]
+    return [{"group_id": group_id, "text": render_admin_panel(sender, gid or group_id)}]
+
+
 def handle_session_command(cmd: str, args: str, uid: str) -> list[dict]:
-    """私聊会话指令统一入口：/选群 /切群 /当前群 /重置群。"""
+    """私聊会话指令统一入口：/选群 /切群 /切换 /当前群 /重置群 /管理。"""
     if cmd in ("选群", "切群"):
         return cmd_active_group(uid, args)
+    if cmd == "切换":
+        return cmd_switch_workspace(uid, args)
     if cmd == "当前群":
         return cmd_active_group_show(uid)
     if cmd == "重置群":
         return cmd_active_group_reset(uid)
+    if cmd in ("管理", "面板"):
+        from cdutetc import group_admin
+        return cmd_admin_panel("", uid, args, gid=group_admin.active_workspace(uid))
     return [{"group_id": "", "text": "没有这个命令，发送 /帮助 查看用法。"}]
 
 
@@ -1811,18 +1974,29 @@ async def _handle_command_impl(text: str, group_id: str, sender: str,
     if not text.startswith("/"):
         return None
     was_private = private
-    # 私聊绑定目标群时降维成「单群视角」：作用域按该群校验，展示范围也只到该群
-    if private and active_group and is_super_admin(sender) and active_group in config.ALLOWED_GROUPS:
-        group_id = active_group
-        private = False
     cmd, args = parse_command(text)
     if cmd is None:
         return [{"group_id": group_id, "text": "请写上命令名，例如 /帮助。"}]
-    # 超管私聊直接 /群配置 1 时顺手锁定工作区，下一步操作就不用再 /选群
+    cmd = canonical_command(cmd)
+    # 超管私聊 `/群配置 集训队`：先按名字/序号锁定工作区，再把参数清空，
+    # 这样后续统一按「本群视角」展示，用户不必记 group_openid。
     if was_private and is_super_admin(sender) and cmd == "群配置":
         tokens = (args or "").split()
-        if len(tokens) == 1:
-            _bind_active_group(sender, tokens[0])
+        if len(tokens) == 1 and tokens[0] != "全部":
+            bound = _bind_active_group(sender, tokens[0])
+            if bound:
+                active_group, args = bound, ""
+    # 私聊绑定目标群（或默认工作区）时降维成「单群视角」：作用域按该群校验，展示范围也只到该群
+    if (private and is_super_admin(sender) and cmd not in PRIVATE_SESSION_COMMANDS
+            and cmd not in GROUP_ADMIN_COMMANDS):
+        target = active_group
+        if not target and cmd in WORKSPACE_COMMANDS:
+            # 省略群标识：直接落到超管工作区（重启后按库恢复，未选定回落正式群）
+            from cdutetc import group_admin as _group_admin
+            target = _group_admin.active_workspace(sender)
+        if target and target in config.ALLOWED_GROUPS:
+            group_id = target
+            private = False
     if cmd in ("help", "帮助"):
         return [{"group_id": group_id, "text": build_help(sender, args)}]
     scoped_cmd = cmd if cmd in _STATUS_COMMANDS else next(
@@ -1832,11 +2006,16 @@ async def _handle_command_impl(text: str, group_id: str, sender: str,
                  "text": SCOPE_DENIED_PRIVATE if private else SCOPE_DENIED_GROUP}]
     from cdutetc import group_admin
     handlers = {
-        "群配置": lambda gid, uid, value: group_admin.handle_command("群配置", value, uid, gid),
-        "群提醒": lambda gid, uid, value: group_admin.handle_command("群提醒", value, uid, gid),
-        "周赛设置": lambda gid, uid, value: group_admin.handle_command("周赛设置", value, uid, gid),
-        "群老师": lambda gid, uid, value: group_admin.handle_command("群老师", value, uid, gid),
+        "群配置": lambda gid, uid, value: group_admin.handle_command(
+            "群配置", value, uid, gid, private=private),
+        "群提醒": lambda gid, uid, value: group_admin.handle_command(
+            "群提醒", value, uid, gid, private=private),
+        "周赛设置": lambda gid, uid, value: group_admin.handle_command(
+            "周赛设置", value, uid, gid, private=private),
+        "群老师": lambda gid, uid, value: group_admin.handle_command(
+            "群老师", value, uid, gid, private=private),
         "修正": cmd_amend,
+        "管理": lambda gid, uid, value: cmd_admin_panel(gid, uid, value),
         "待审列表": cmd_pending_list,
         "待审批准": cmd_pending_apply,
         "待审拒绝": cmd_pending_reject,

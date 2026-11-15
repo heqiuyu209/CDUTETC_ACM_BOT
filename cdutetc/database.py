@@ -414,6 +414,14 @@ CREATE TABLE IF NOT EXISTS audit_log (
 )
 """
 
+_ADMIN_WORKSPACES_DDL = """
+CREATE TABLE IF NOT EXISTS admin_workspaces (
+    user_openid   TEXT PRIMARY KEY,
+    group_openid  TEXT NOT NULL DEFAULT '',
+    updated_at    TEXT NOT NULL DEFAULT ''
+)
+"""
+
 _INDEX_DDL = (
     "CREATE INDEX IF NOT EXISTS idx_contests_group ON contests(group_id)",
     "CREATE INDEX IF NOT EXISTS idx_reminders_group ON reminders(group_id)",
@@ -453,6 +461,7 @@ _ALL_DDL = (
     _REMINDER_DELIVERIES_DDL, _REMINDER_SUCCESS_RECEIPTS_DDL,
     _GROUP_NOTIFICATION_BLOCKS_DDL, _GROUP_NOTIFICATION_SETTINGS_DDL,
     _GROUP_SETTINGS_DDL, _CUSTOM_REMINDERS_DDL, _AUDIT_LOG_DDL,
+    _ADMIN_WORKSPACES_DDL,
 )
 
 
@@ -4132,3 +4141,79 @@ def remove_entity_alias(entity_type: str, openid: str, operator: str = "") -> bo
             add_audit(operator, openid if entity_type == "group" else "",
                       "remove_alias", entity_type, openid, "", "", conn=conn)
         return bool(cur.rowcount)
+
+
+# =====================================================================
+# 超管私聊工作区（Active Group）持久化
+# =====================================================================
+# 内存版的 admin_session 重启即丢，会让重启后的私聊管理落到 ADMIN_GROUP（可能
+# 是测试群）。这里把「某个超管锁定的工作区」落库：重启后按 user_openid 恢复。
+# 语义约定：
+#   · 无记录            → 从未选定过，调用方可回落到默认正式群；
+#   · group_openid = '' → 用户显式 /重置群 清过，调用方不得再回落到默认群；
+#   · group_openid 非空 → 该超管上次锁定的工作区。
+
+
+def set_admin_workspace(user_openid: str, group_openid: str) -> None:
+    """写入/覆盖某超管的工作区；传空串表示「显式清空」而非删除记录。"""
+    uid = _as_str(user_openid)
+    if not uid:
+        raise ValueError("超管标识不能为空")
+    gid = _as_str(group_openid)
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO admin_workspaces (user_openid, group_openid, updated_at)"
+            " VALUES (?, ?, ?)"
+            " ON CONFLICT(user_openid) DO UPDATE SET group_openid = excluded.group_openid,"
+            " updated_at = excluded.updated_at",
+            (uid, gid, now_str()),
+        )
+
+
+def get_admin_workspace(user_openid: str) -> str | None:
+    """返回该超管上次锁定的工作区；无记录或已被显式清空都返回 None。"""
+    uid = _as_str(user_openid)
+    if not uid:
+        return None
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT group_openid FROM admin_workspaces WHERE user_openid = ?", (uid,)
+        ).fetchone()
+    if row is None or not (row[0] or "").strip():
+        return None
+    return row[0].strip()
+
+
+def has_admin_workspace(user_openid: str) -> bool:
+    """该超管是否有过工作区记录（含「显式清空」的空记录）。"""
+    uid = _as_str(user_openid)
+    if not uid:
+        return False
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM admin_workspaces WHERE user_openid = ?", (uid,)
+        ).fetchone()
+    return row is not None
+
+
+def clear_admin_workspace(user_openid: str) -> None:
+    """显式清空：保留一条空记录，防止重启后又自动回落到默认群。"""
+    set_admin_workspace(user_openid, "")
+
+
+def remove_admin_workspace(user_openid: str) -> None:
+    """物理删除记录（运维/测试用，删除后重新落入「无记录」语义）。"""
+    uid = _as_str(user_openid)
+    if not uid:
+        return
+    with _connect() as conn:
+        conn.execute("DELETE FROM admin_workspaces WHERE user_openid = ?", (uid,))
+
+
+def list_admin_workspaces() -> dict[str, str]:
+    """{user_openid: group_openid}；空串即「显式清空过」。"""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT user_openid, group_openid FROM admin_workspaces ORDER BY updated_at DESC"
+        ).fetchall()
+    return {r[0]: (r[1] or "") for r in rows}
