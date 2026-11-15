@@ -7,7 +7,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import commands, config, database as db, group_admin, llm, main, reminder_preflight, roles
+from cdutetc import commands, config, group_admin, llm, main, reminder_preflight, roles
+from cdutetc import database as db
 from cdutetc.clients.qqbot import QQBotClient, QQBotMessage
 
 NOW = datetime(2026, 11, 11, 18, tzinfo=ZoneInfo("Asia/Shanghai"))

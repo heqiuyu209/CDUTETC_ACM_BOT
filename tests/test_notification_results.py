@@ -5,8 +5,13 @@ import pytest
 
 from cdutetc import config
 from cdutetc.errors import (
-    AppErrorCode, DeliveryCode, DeliveryMode, classify_exception,
-    result_from_exception, result_from_onebot, safe_error_hint,
+    AppErrorCode,
+    DeliveryCode,
+    DeliveryMode,
+    classify_exception,
+    result_from_exception,
+    result_from_onebot,
+    safe_error_hint,
 )
 from cdutetc.notifications import send_group, send_private
 

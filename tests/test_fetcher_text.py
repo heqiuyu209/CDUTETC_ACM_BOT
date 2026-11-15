@@ -2,21 +2,17 @@
 
 import asyncio
 import codecs
-from datetime import datetime
 import socket
 import ssl
 import time
 import tracemalloc
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import crawler
-from cdutetc import database
-from cdutetc import fetcher
-from cdutetc import llm
+from cdutetc import crawler, database, fetcher, llm
 from cdutetc.fetcher import FetchError
-
 
 URL = "https://contest.example.com/news"
 

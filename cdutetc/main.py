@@ -33,23 +33,30 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from cdutetc import (
+    admin_session,
+    commands,
+    config,
+    content_filter,
+    crawler,
+    daily_digest,
+    llm,
+    notifications,
+    roles,
+)
+from cdutetc import database as db
+from cdutetc.alias_helper import format_group_name
 from cdutetc.clients.base import BaseBotClient, capabilities_of
 from cdutetc.clients.onebot import OneBotClient, OneBotMessage
-
-from cdutetc import admin_session
-from cdutetc import commands
-from cdutetc import config
-from cdutetc.alias_helper import format_group_name, format_user_name
-from cdutetc import content_filter
-from cdutetc import crawler
-from cdutetc import daily_digest
-from cdutetc import database as db
-from cdutetc import llm
-from cdutetc import roles
-from cdutetc import notifications
-from cdutetc.errors import AppErrorCode, DeliveryMode, DeliveryResult, result_from_exception, safe_error_hint
 from cdutetc.contest_fields import map_competition_info
 from cdutetc.database import create_published_competition_once, init_db
+from cdutetc.errors import (
+    AppErrorCode,
+    DeliveryMode,
+    DeliveryResult,
+    result_from_exception,
+    safe_error_hint,
+)
 from cdutetc.fetcher import FetchError, fetch_text
 from cdutetc.llm import extract_contest, normalize_time
 from cdutetc.publish_text import (
@@ -69,10 +76,9 @@ from cdutetc.utils import (
     extract_url,
     is_addressed_to_bot,
     is_allowed_group,
+    is_super_admin,
     match_publish_command,
     message_mentions,
-    is_super_admin,
-    mentioned_user_ids,
     parse_command,
     strip_at,
 )
@@ -455,6 +461,19 @@ class ACMBot:
             max_instances=1,
             coalesce=True,
         )
+        if config.AUTO_CONTEST_CRAWL_ENABLED:
+            # 外部赛程同步单独成 job：启动即同步一次（重启后不必干等到第二天），
+            # 之后每天同一时刻再拉；否则机器人重启当天会一直缺赛程。
+            sched.add_job(
+                self._contest_crawl_job,
+                "cron",
+                hour=config.CONTEST_CRAWL_HOUR,
+                minute=config.CONTEST_CRAWL_MINUTE,
+                id="contest-crawl",
+                next_run_time=now,
+                max_instances=1,
+                coalesce=True,
+            )
         if config.DAILY_DIGEST_ENABLED:
             # 每日固定时刻推送一次聚合晨报；coalesce 保证服务重启/休眠后只补一次。
             sched.add_job(
@@ -528,6 +547,8 @@ class ACMBot:
             if content.strip().startswith("/") and is_super_admin(uid):
                 cmd, args = parse_command(content)
                 from cdutetc import group_admin
+                # 短别名归一：/面板→/管理、/绑老师→/群老师、/改→/修正
+                cmd = commands.canonical_command(cmd)
                 # 目标群会话指令最先处理：它们决定后续业务指令作用到哪个群
                 if cmd in commands.PRIVATE_SESSION_COMMANDS:
                     for reply in commands.handle_session_command(cmd, args, str(uid)) or []:
@@ -535,19 +556,18 @@ class ACMBot:
                             await self._send_private_result(uid, reply["text"])
                     return
                 if cmd in group_admin.COMMANDS:
+                    # /群配置 <序号|群名> 等价于切换工作区：先落库，再直接展示该群面板，
+                    # 这样不带 group_openid 也能一步完成「选群 + 看配置」。
+                    tokens = (args or "").split()
+                    if cmd == "群配置" and len(tokens) == 1 and tokens[0] != "全部":
+                        if commands.bind_active_group(str(uid), tokens[0]):
+                            args = ""
                     # 已绑定目标群时，群配置类指令默认落到该群（不带参数的 /群配置 即查该群）；
                     # 显式 /群配置 全部 属于跨群查询，仍按全局视角处理。
                     bound = admin_session.get_active_group(str(uid)) or ""
                     if "全部" in (args or ""):
                         bound = ""
-                    # 私聊 /群配置 <序号> 解析成功后顺手锁定工作区（C5），后续业务指令
-                    # 无需再 /选群。仅处理候选列表序号，避免与「按群查询」只读语义混淆；
-                    # 且在本条指令执行之后绑定，保证本条查询仍按原作用域解析。
-                    replies = group_admin.handle_command(cmd, args, uid, bound)
-                    if cmd == "群配置":
-                        tokens = (args or "").split()
-                        if len(tokens) == 1 and tokens[0].isdigit():
-                            commands.bind_active_group(str(uid), tokens[0])
+                    replies = group_admin.handle_command(cmd, args, uid, bound, private=True)
                     if any(reply.get("refresh_weekly") for reply in replies or []):
                         await self._weekly_contest_job()
                     # 私聊管理回执同样带工作区标牌，与业务指令出口保持一致
@@ -1345,6 +1365,8 @@ class ACMBot:
         设计要点：
         - 只对授权群（运行时白名单）逐个生成，某群内容为空则整群跳过，
           不发空消息浪费额度；
+        - 今日无比赛（且当天没有其它可报事务）时静默跳过，只记 INFO 日志，
+          绝不发送「今日暂无比赛」这类空通知占用主动额度；
         - 单群失败不影响其他群：配额耗尽（11253/11263）已在
           ``_send_group_result`` 内持久熔断，这里只记告警并继续下一个群；
         - now 供离线验证注入，无时区按北京时间处理。
@@ -1357,13 +1379,22 @@ class ACMBot:
             logger.info("主动群消息未启用，暂停晨报投递")
             return 0
         sent = 0
+        skipped = 0
         try:
             for group_id in sorted(config.ALLOWED_GROUPS):
                 try:
                     if not db.group_switch_enabled(group_id, "daily_digest_enabled"):
                         continue
-                    text = daily_digest.build_daily_digest(group_id, now=now)
+                    detail = daily_digest.collect_daily_digest(group_id, now=now)
+                    text = detail["text"]
                     if not text:
+                        # 硬性跳过规则：全天无赛即静默跳过；即便群开关关闭导致
+                        # 赛事段为空，也不会发出任何「今日暂无比赛」字样。
+                        if detail["contest_enabled"] and detail["today_contest_count"] == 0:
+                            logger.info("[晨报] 群 %s 今日无比赛，已跳过发送", group_id)
+                        else:
+                            logger.info("[晨报] 群 %s 今日无可推送内容，已跳过发送", group_id)
+                        skipped += 1
                         continue
                     result = await self._send_group_result(group_id, text)
                 except Exception:  # noqa: BLE001 - 单群异常不得中断其余群
@@ -1384,6 +1415,8 @@ class ACMBot:
             logger.exception("[晨报] 本次调度执行异常，跳过本轮等待下次触发")
         if sent:
             logger.info("[晨报] 本次成功推送 %d 个群的事务总览", sent)
+        if skipped:
+            logger.info("[晨报] 本次跳过 %d 个无可推送内容的群", skipped)
         return sent
 
     async def _weekly_contest_job(self, now: datetime | None = None):
@@ -1440,13 +1473,18 @@ class ACMBot:
     async def _crawl_job(self):
         """周期抓取公共来源（默认关闭）：变化检测 → 待审更新，不自动广播。
 
-        来源抓取之后，若开启了赛程自动抓取，再顺带抓 CF / 牛客赛程；
-        两段各自兜底，任一段异常都不影响另一段，也不会让调度器崩掉。
+        外部赛程抓取已拆到 ``_contest_crawl_job``，两者互不影响。
         """
         try:
             await crawler.run_fetch(send_group=self._send_group_result)
         except Exception:  # noqa: BLE001 - 网络/解析/DB 异常统一兜底，不逸出调度器
             logger.exception("[抓取] 本轮调度执行异常，跳过本轮等待下次触发")
+
+    async def _contest_crawl_job(self):
+        """抓取 CF / 牛客外部赛程：启动时与每日固定时刻各调一次。
+
+        赛程抓取失败只记日志，任何异常都不逸出调度器。
+        """
         if not config.AUTO_CONTEST_CRAWL_ENABLED:
             return
         try:

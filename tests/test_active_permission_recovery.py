@@ -1,7 +1,7 @@
 """复现40034105：不刷重试，持久暂停，真实主动探测成功后恢复未来提醒。"""
 
-from datetime import datetime, timedelta
 import sqlite3
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo

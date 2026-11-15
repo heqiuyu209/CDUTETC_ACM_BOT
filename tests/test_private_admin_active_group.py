@@ -15,9 +15,16 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import admin_session, commands, config, daily_digest
+from cdutetc import (
+    admin_session,
+    commands,
+    config,
+    daily_digest,
+    llm,
+    main,
+    reminder_preflight,
+)
 from cdutetc import database as db
-from cdutetc import llm, main, reminder_preflight
 from cdutetc.clients.qqbot import QQBotClient, QQBotMessage
 
 NOW = datetime(2026, 11, 11, 18, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -205,11 +212,20 @@ async def test_group_config_by_index_auto_binds_and_marks_header(env):
     env.api.post_group_message.assert_not_awaited()
 
 
-async def test_help_without_binding_shows_global_mode_header(env):
-    """C5：未绑定工作区时 /帮助 首行为全局模式标牌。"""
+async def test_help_header_shows_resolved_workspace_until_reset(env):
+    """C5：未显式切群时横幅直接显示解析出的工作区，只有 /重置群 后才回全局模式。"""
     assert admin_session.get_active_group("admin") is None
     text = await env.send_private("/帮助")
-    assert text.splitlines()[0] == "🌐【当前模式：全局模式 (未选群)】"
+    first = text.splitlines()[0]
+    assert first.startswith("📌【当前工作区：") and "集训队" in first
+    assert "全局模式" not in first
+    # 超管私聊默认页给出超管快捷命令区
+    assert "【超管快捷命令】" in text and "/切换 集训队" in text
     # 标牌不影响正文帮助内容
     assert "/帮助 课程" in text
     env.api.post_group_message.assert_not_awaited()
+
+    # 主动 /重置群：库里留下显式清空标记，横幅回到全局模式
+    await env.send_private("/重置群")
+    text = await env.send_private("/帮助")
+    assert text.splitlines()[0] == "🌐【当前模式：全局模式 (未选群)】"

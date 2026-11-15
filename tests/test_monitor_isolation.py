@@ -6,13 +6,10 @@ import sqlite3
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import pytest
 import httpx
+import pytest
 
-from cdutetc import crawler
-from cdutetc import database
-from cdutetc import llm
-
+from cdutetc import crawler, database, llm
 
 NOW = datetime(2026, 11, 1, 8, tzinfo=ZoneInfo("Asia/Shanghai"))
 

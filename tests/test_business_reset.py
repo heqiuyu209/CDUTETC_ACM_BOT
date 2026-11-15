@@ -1,10 +1,10 @@
 """仅用隔离 SQLite 验证正式启用前清理，不读写实际云端数据库。"""
 
-from contextlib import closing
 import os
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 
 import pytest

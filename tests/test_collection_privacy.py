@@ -3,20 +3,16 @@
 import csv
 import json
 import os
-from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
+
+from cdutetc import commands, config, database, main
 from cdutetc.clients.onebot import OneBotMessage
-
-from cdutetc import commands
-from cdutetc import config
-from cdutetc import database
-from cdutetc import main
 from scripts.export_collection import export_collection
-
 
 PERSONAL = ("private-member-1", "private-member-2", "张三", "李四", "2026123456", "姓名", "学号")
 

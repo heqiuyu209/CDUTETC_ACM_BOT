@@ -24,18 +24,18 @@ from cdutetc.database import (
     claim_delivery,
     delivery_dedup_key,
     finish_delivery,
+    get_competition_target_groups,
+    get_group_notification_block,
+    group_course_remind_enabled,
+    group_switch_enabled,
     list_competitions,
     list_training_sessions,
-    record_delivery_success,
     reconcile_deliveries,
+    record_delivery_success,
     training_occurrence_times,
     validate_delivery_claim,
 )
 from cdutetc.database import list_collections_all as _list_collections_all
-from cdutetc.database import get_competition_target_groups
-from cdutetc.database import get_group_notification_block
-from cdutetc.database import group_course_remind_enabled
-from cdutetc.database import group_switch_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,12 @@ _TIME_FORMATS = ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M")
 _DELIVERY_MAX_ATTEMPTS = 3
 _DELIVERY_LEASE_SECONDS = 120
 _DELIVERY_SEND_TIMEOUT_SECONDS = 60
+
+
+def _resolved_now(now: datetime | None = None) -> datetime:
+    """把 ``now``（缺省取系统当前时间）统一成带北京时区的 datetime。"""
+    value = now if now is not None else datetime.now(TZ)
+    return value.replace(tzinfo=TZ) if value.tzinfo is None else value.astimezone(TZ)
 
 
 def _parse_time(text: str) -> datetime | None:
@@ -115,8 +121,7 @@ async def check_contest_start_reminders(send_group, now: datetime | None = None,
         raise ValueError("提醒尝试次数必须大于零")
 
     def clock():
-        value = now if now is not None else datetime.now(TZ)
-        return value.replace(tzinfo=TZ) if value.tzinfo is None else value.astimezone(TZ)
+        return _resolved_now(now)
 
     current = clock()
     allowed = set(config.ALLOWED_GROUPS)
@@ -189,7 +194,7 @@ async def _send_reminder_result(send_group, group_id: str, text: str) -> tuple[b
             return ok, "" if ok else str(getattr(result, "user_hint", "") or ""), str(getattr(code, "value", code) or "")
         ok = bool(result)
         return ok, "" if ok else "[unknown] 发送结果未确认", "" if ok else "unknown"
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return False, "[timeout_unknown] 发送等待超时，平台是否已接受无法确认", "timeout_unknown"
     except Exception as error:
         logger.warning("提醒发送异常 [%s]", type(error).__name__)
@@ -348,8 +353,7 @@ async def check_general_reminders(send_group, now: datetime | None = None,
     fixed_now = now
 
     def current_time():
-        current = fixed_now if fixed_now is not None else datetime.now(TZ)
-        return current.replace(tzinfo=TZ) if current.tzinfo is None else current.astimezone(TZ)
+        return _resolved_now(fixed_now)
 
     reconcile_deliveries(current_time(), max_attempts=max_attempts,
                          allowed_groups=set(config.ALLOWED_GROUPS))
@@ -530,8 +534,7 @@ async def check_custom_reminders(send_group, now: datetime | None = None,
         raise ValueError("提醒尝试次数必须大于零")
 
     def clock():
-        value = now if now is not None else datetime.now(TZ)
-        return value.replace(tzinfo=TZ) if value.tzinfo is None else value.astimezone(TZ)
+        return _resolved_now(now)
 
     sent = 0
     allowed = set(config.ALLOWED_GROUPS)

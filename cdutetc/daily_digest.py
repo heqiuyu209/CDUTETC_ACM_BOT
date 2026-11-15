@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -37,9 +38,22 @@ CONTEST_SOON_HOURS = 24.0
 PIGGYBACK_COLLECTION_HOURS = 12.0
 PIGGYBACK_CONTEST_HOURS = 2.0
 
-DIGEST_TITLE = "【CDUTETC ACM 今日事务总览】"
-DIGEST_RULE = "-" * 24
-DIGEST_FOOTER = "发送对应命令（如 /课程列表、/报名 <id>）查看详情"
+DIGEST_TITLE = "☀️ CDUTETC ACM 今日早报"
+CONTEST_HEADER = "🏆 今日赛事"
+
+# 赛事按平台分组展示：固定顺序，未命中的归「其他赛事」。
+PLATFORM_CDUTETC = "CDUTETC_ACM"
+PLATFORM_OTHER = "其他赛事"
+PLATFORM_ORDER = (PLATFORM_CDUTETC, "牛客", "Codeforces", "AtCoder", PLATFORM_OTHER)
+# 关键词在 edition / official_site / name / summary 拼串里做小写包含匹配。
+_PLATFORM_RULES = (
+    ("牛客", ("nowcoder", "nowcoder.com", "牛客")),
+    ("Codeforces", ("codeforces", "codeforces.com")),
+    ("AtCoder", ("atcoder", "atcoder.jp")),
+)
+# 名称里「CF 1900」这类简称也算 Codeforces，但不认 "CFP"/"CFO" 等词。
+_CF_NAME_RE = re.compile(r"(?i)(?<![a-z])cf\d*(?![a-z])")
+_CDUTETC_HINTS = ("cdutetc", "集训队", "校内", "周赛")
 
 _WEEKDAY_NAMES = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
 
@@ -271,7 +285,11 @@ def today_competitions(group_id: str, now: datetime | None = None) -> list[dict]
             "start": contest.get("official_time") or "",
             "start_dt": start,
             "site": (contest.get("official_site") or "").strip(),
-            "weekly": weekly,
+            # 平台归类依据：爬虫写入的 edition（nowcoder / codeforces）、官网链接与名称。
+            "edition": (contest.get("edition") or "").strip(),
+            "url": (contest.get("official_site") or "").strip(),
+            "summary": (contest.get("summary") or "").strip(),
+            "weekly": bool(weekly),
         })
     out.sort(key=lambda item: item["start_dt"])
     return out
@@ -337,13 +355,54 @@ def _load_fields(raw) -> list[str]:
 # 排版
 # ---------------------------------------------------------------------
 
+def _platform_of(item: dict) -> str:
+    """把一场比赛归到展示用的平台分组（CDUTETC_ACM / 牛客 / Codeforces / AtCoder / 其他赛事）。"""
+    if item.get("weekly"):
+        return PLATFORM_CDUTETC
+    haystack = " ".join(
+        str(item.get(key) or "")
+        for key in ("edition", "official_site", "url", "name", "summary")
+    ).lower()
+    for label, keywords in _PLATFORM_RULES:
+        if any(word in haystack for word in keywords):
+            return label
+    if _CF_NAME_RE.search(str(item.get("name") or "")):
+        return "Codeforces"
+    if any(word in haystack for word in _CDUTETC_HINTS):
+        return PLATFORM_CDUTETC
+    return PLATFORM_OTHER
+
+
+def _render_competitions(competitions: list[dict], current: datetime) -> list[str]:
+    """按平台分组渲染今日赛事：固定分组顺序、组内按开赛时间升序、有链接才输出链接行。"""
+    lines = [f"{CONTEST_HEADER}（{len(competitions)} 场）"]
+    grouped: dict[str, list[dict]] = {}
+    for item in competitions:
+        grouped.setdefault(_platform_of(item), []).append(item)
+    for label in PLATFORM_ORDER:
+        items = sorted(grouped.get(label) or [], key=lambda row: row["start_dt"])
+        if not items:
+            continue
+        lines.append(f"-------{label}-------")
+        for item in items:
+            delta = item["start_dt"] - current
+            countdown = "进行中" if delta <= timedelta(0) else f"{_remaining_label(delta)}后"
+            lines.append(f"- {item['start_dt'].strftime('%H:%M')}（{countdown}）")
+            lines.append(f"  {item['name']}")
+            link = (item.get("url") or item.get("site") or "").strip()
+            if link:  # 没有链接的场次（如队内 ACM 周赛）不输出空的「链接：」行
+                lines.append(f"  链接：{link}")
+    return lines
+
+
 def render_digest(sessions: list[dict], reminders: list[dict], competitions: list[dict],
                   now: datetime | None = None) -> str | None:
     """把当日三段（课程 / 赛事 / 其他安排）渲染成单条纯文本晨报；全空返回 None。"""
     if not (sessions or reminders or competitions):
         return None
     current = _now(now)
-    lines = [DIGEST_TITLE]
+    weekday = "周" + "一二三四五六日"[current.weekday()]
+    lines = [f"{DIGEST_TITLE}（{current.strftime('%m-%d')} {weekday}）"]
 
     if sessions:
         lines.append("📚 今日课程/训练：")
@@ -368,12 +427,7 @@ def render_digest(sessions: list[dict], reminders: list[dict], competitions: lis
             lines.append(line)
 
     if competitions:
-        lines.append("🏆 今日赛事：")
-        for item in competitions:
-            delta = item["start_dt"] - current
-            when = ("进行中" if delta <= timedelta(0)
-                    else f"{_remaining_label(delta)}后开赛")
-            lines.append(f"- {item['name']}（{item['start']} 开赛，{when}）")
+        lines.extend(_render_competitions(competitions, current))
 
     if reminders:
         lines.append("🗓 今日其他安排：")
@@ -381,9 +435,51 @@ def render_digest(sessions: list[dict], reminders: list[dict], competitions: lis
             suffix = "（每周）" if item.get("repeat") == "weekly" else ""
             lines.append(f"- {item['time_text']} {item['content']}{suffix}")
 
-    lines.append(DIGEST_RULE)
-    lines.append(DIGEST_FOOTER)
     return "\n".join(lines)
+
+
+def collect_daily_digest(group_id: str, now: datetime | None = None) -> dict:
+    """收集某群当日晨报素材，并给出「是否今日无赛」等判定信息。
+
+    晨报筛选严格按北京时间当天（00:00:00–23:59:59）开赛：
+    ``today_competitions`` 只保留 ``official_time`` 日期恰好等于今天、且
+    已关联到本群、状态为 confirmed 的比赛；时间未定（无法解析）、草稿、
+    已取消（状态非 confirmed）的场次一律不进晨报。
+
+    返回值供定时任务区分「今日无比赛静默跳过」与「其它原因无可推送内容」，
+    ``text`` 与 :func:`build_daily_digest` 完全一致（三段皆空时为 None）。
+
+    Returns:
+        字典，包含 ``text`` / ``sessions`` / ``reminders`` / ``competitions``
+        / ``today_contest_count`` / ``course_enabled`` / ``contest_enabled``。
+    """
+    current = _now(now)
+    gid = (group_id or "").strip()
+    detail = {
+        "group_id": gid,
+        "text": None,
+        "sessions": [],
+        "reminders": [],
+        "competitions": [],
+        "today_contest_count": 0,
+        "course_enabled": False,
+        "contest_enabled": False,
+    }
+    if not gid:
+        return detail
+    detail["course_enabled"] = db.group_switch_enabled(gid, "course_remind_enabled")
+    detail["contest_enabled"] = db.group_switch_enabled(gid, "contest_remind_enabled")
+    if detail["course_enabled"]:
+        detail["sessions"] = today_sessions(gid, current)
+    if detail["contest_enabled"]:
+        detail["competitions"] = today_competitions(gid, current)
+    # 自定义提醒属于老师手工维护的事务，不受上面两个群开关约束。
+    detail["reminders"] = today_reminders(gid, current)
+    detail["today_contest_count"] = len(detail["competitions"])
+    detail["text"] = render_digest(
+        detail["sessions"], detail["reminders"], detail["competitions"], current
+    )
+    return detail
 
 
 def build_daily_digest(group_id: str, now: datetime | None = None) -> str | None:
@@ -400,19 +496,7 @@ def build_daily_digest(group_id: str, now: datetime | None = None) -> str | None
     Returns:
         纯文本晨报正文，或 None。
     """
-    current = _now(now)
-    gid = (group_id or "").strip()
-    if not gid:
-        return None
-    sessions: list[dict] = []
-    competitions: list[dict] = []
-    if db.group_switch_enabled(gid, "course_remind_enabled"):
-        sessions = today_sessions(gid, current)
-    if db.group_switch_enabled(gid, "contest_remind_enabled"):
-        competitions = today_competitions(gid, current)
-    # 自定义提醒属于老师手工维护的事务，不受上面两个群开关约束。
-    reminders = today_reminders(gid, current)
-    return render_digest(sessions, reminders, competitions, current)
+    return collect_daily_digest(group_id, now)["text"]
 
 
 def build_piggyback_notice(group_id: str, now: datetime | None = None) -> str | None:

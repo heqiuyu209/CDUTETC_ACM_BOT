@@ -87,7 +87,7 @@ def main() -> int:
         if args.secret:
             updates["ACM_QQBOT_SECRET"] = args.secret
 
-    new_lines, appended = _set(lines, updates)
+    new_lines, _appended = _set(lines, updates)
 
     # 需要真正写入时才备份
     changed = [k for k in updates if _get(lines, k) != updates[k]]

@@ -4,9 +4,9 @@ import argparse
 import csv
 import json
 import os
-from pathlib import Path
 import sqlite3
 import sys
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cdutetc import config

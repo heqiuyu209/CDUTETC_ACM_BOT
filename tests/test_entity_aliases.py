@@ -13,9 +13,17 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from cdutetc import alias_helper, commands, config, database, group_admin, main, notifications
-from cdutetc.clients.qqbot import QQBotClient, QQBotMessage
+from cdutetc import (
+    alias_helper,
+    commands,
+    config,
+    database,
+    group_admin,
+    main,
+    notifications,
+)
 from cdutetc.clients.onebot import OneBotMessage
+from cdutetc.clients.qqbot import QQBotClient, QQBotMessage
 
 
 @pytest.fixture()
@@ -230,7 +238,7 @@ def test_group_admin_choices_and_index_selector(memory_db, monkeypatch):
     database.set_entity_alias("group", GROUP, "集训队群", "123456789")
     names = group_admin._choices()
     assert "1. " in names and "2. " in names
-    assert "/群配置 " in names
+    assert "/切换 " in names
     assert "集训队群 (123456789)" in names
     ordered = sorted(config.ALLOWED_GROUPS)
     assert group_admin.resolve_group("1") == ordered[0]

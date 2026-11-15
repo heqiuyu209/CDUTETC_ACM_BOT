@@ -1,8 +1,8 @@
 """明确比赛发布语句的本地解析；复杂公告仍交给受校验的提取器。"""
 
-from datetime import datetime, timedelta
 import re
 import unicodedata
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from cdutetc import config

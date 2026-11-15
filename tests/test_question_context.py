@@ -7,10 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from cdutetc import config
-from cdutetc import database
-from cdutetc import llm
-from cdutetc import main
+from cdutetc import config, database, llm, main
 from cdutetc.clients.onebot import OneBotMessage
 
 

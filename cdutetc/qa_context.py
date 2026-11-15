@@ -185,14 +185,6 @@ def faq_pairs(group_id: str, limit: int = MAX_FAQ_ITEMS) -> list[dict]:
 # 文本结构化
 # ---------------------------------------------------------------------
 
-def _session_line(item: dict) -> str:
-    span = item["start_text"] if not item["end_text"] else f'{item["start_text"]}-{item["end_text"]}'
-    line = f'- {item["date_label"]} {span} {item["title"]}'
-    if item["location"]:
-        line += f'（{item["location"]}）'
-    return line
-
-
 def _normalized_clocks(start_raw: str, end_raw: str) -> tuple[time | None, time | None]:
     """把脏时间（如 ``19-21点``）先归一化再解析，归一化失败退回原始写法。"""
     packed = " ".join(x for x in ((start_raw or "").strip(), (end_raw or "").strip()) if x)

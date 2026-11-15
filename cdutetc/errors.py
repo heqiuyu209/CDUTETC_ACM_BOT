@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum
 import json
 import re
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 
@@ -115,7 +115,7 @@ class DeliveryResult:
         return _SAFE_HINTS[self.code]
 
     @classmethod
-    def sent(cls, protocol: str, mode: DeliveryMode, message_id: str = "") -> "DeliveryResult":
+    def sent(cls, protocol: str, mode: DeliveryMode, message_id: str = "") -> DeliveryResult:
         return cls(True, DeliveryCode.SENT, protocol, mode, message_id=message_id)
 
 

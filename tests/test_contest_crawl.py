@@ -11,7 +11,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import config, crawler, database as db
+from cdutetc import config, crawler
+from cdutetc import database as db
 
 TZ = ZoneInfo("Asia/Shanghai")
 NOW = datetime(2026, 11, 12, 10, 0, tzinfo=TZ)  # 周四上午

@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import admin_session, config, llm, main, reminder_preflight, daily_digest
+from cdutetc import admin_session, config, daily_digest, llm, main, reminder_preflight
 from cdutetc import database as db
 from cdutetc.clients.qqbot import QQBotClient, QQBotMessage
 

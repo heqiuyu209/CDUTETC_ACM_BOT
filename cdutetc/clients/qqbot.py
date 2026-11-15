@@ -20,12 +20,12 @@ botpy 采用延迟导入：未安装时本模块仍可被导入，只有真正�
 """
 
 import asyncio
-from collections import OrderedDict
-from dataclasses import dataclass
 import logging
 import secrets
 import time
-from typing import Awaitable, Callable
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 from cdutetc.clients.base import BaseBotClient
 
@@ -268,7 +268,9 @@ class QQBotClient(BaseBotClient):
 
     async def _post_result(self, action: str, *, mode, **params):
         from cdutetc.errors import (
-            DeliveryCode, DeliveryResult, result_from_exception,
+            DeliveryCode,
+            DeliveryResult,
+            result_from_exception,
         )
 
         protocol = "qqbot"

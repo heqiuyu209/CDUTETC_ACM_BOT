@@ -8,12 +8,12 @@
 5) 私聊标牌优先展示认领到的真实群号，逐级降级。
 """
 
-from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import admin_session, commands, config, database as db
+from cdutetc import admin_session, commands, config
+from cdutetc import database as db
 
 TZ = ZoneInfo("Asia/Shanghai")
 GID = "123456"

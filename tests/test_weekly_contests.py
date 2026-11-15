@@ -3,18 +3,15 @@
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from cdutetc import config
-from cdutetc import database
-from cdutetc import main
+from cdutetc import config, database, main
 from cdutetc.errors import DeliveryMode, DeliveryResult
-
 
 BEIJING = ZoneInfo("Asia/Shanghai")
 
@@ -120,7 +117,7 @@ async def test_utc_clock_crosses_into_beijing_week_and_honors_weekday(bot, memor
     monkeypatch.setattr(config, "WEEKLY_CONTEST_START", "18:30")
     monkeypatch.setattr(config, "WEEKLY_CONTEST_END", "20:30")
     # UTC 周日 16:30 已是北京时间周一 00:30，应使用新一周的周三。
-    await bot._weekly_contest_job(now=datetime(2026, 11, 1, 16, 30, tzinfo=timezone.utc))
+    await bot._weekly_contest_job(now=datetime(2026, 11, 1, 16, 30, tzinfo=UTC))
 
     competition = database.list_competitions()[0]
     assert competition["official_time"] == "2026-11-04 18:30"
