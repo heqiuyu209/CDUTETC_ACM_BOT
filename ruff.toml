@@ -1,0 +1,24 @@
+# ruff lint 口径（固定，避免不同机器/版本扫出不同结果）
+#
+# 只启用两类规则，与项目历史验收口径（ruff check --select E4,E7,E9,F）一致：
+#   E4/E7/E9  pycodestyle 的导入排版、语句级错误、语法级错误
+#   F         pyflakes 的未使用导入/变量、重定义、未定义名
+# 想要收紧（加 E5 行长、I 排序、UP 升级等）先单独一轮全量收敛，再改这里。
+
+target-version = "py312"
+line-length = 100
+
+[lint]
+select = ["E4", "E7", "E9", "F"]
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[lint.per-file-ignores]
+# Facade 门面只做重导出，未使用的导入正是它的职责。
+"cdutetc/database.py" = ["F401"]
+"cdutetc/commands.py" = ["F401"]
+"cdutetc/main.py" = ["F401"]
+"cdutetc/memes.py" = ["F401"]
+"cdutetc/db/__init__.py" = ["F401"]
+
+[lint.isort]
+known-first-party = ["cdutetc"]

@@ -347,13 +347,21 @@ def list_memory_facts(group_openid: str, user_openid: str, *,
     if not group or not user or not count or count <= 0:
         return []
     with _conn._connect() as conn:
+        # 取出该用户的全部标签（每人最多 MEMORY_FACTS_KEEP 条，代价可忽略）：
+        # 先 LIMIT 再去重会让重复脏行占掉名额，把真正有效的旧标签挤出去。
         rows = conn.execute(
             "SELECT fact FROM bot_memory_facts"
             " WHERE group_openid = ? AND user_openid = ?"
-            " ORDER BY updated_at DESC, id DESC LIMIT ?",
-            (group, user, count),
+            " ORDER BY updated_at DESC, id DESC",
+            (group, user),
         ).fetchall()
-    return [str(row[0]) for row in rows if row and row[0]]
+    facts: list[str] = []
+    for row in rows:
+        value = str(row[0]) if row and row[0] else ""
+        # 写入侧已保证同标签只留一条，这里再兜一层：历史脏数据不至于挤占 Prompt 预算。
+        if value and value not in facts:
+            facts.append(value)
+    return facts[:count]
 
 
 def clear_memory_facts(*, group_openid: str = "", user_openid: str = "") -> int:

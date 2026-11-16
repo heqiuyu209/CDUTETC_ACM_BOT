@@ -44,12 +44,17 @@ _PERSONA_FILE_HEADER = (
     "\n"
 )
 
-# 默认人设（集训队吉祥物学姐）：文件缺失或为空时用这份兜底，并写回文件。
+# 默认人设（集训队助教/学长，群里都喊学姐）：文件缺失或为空时用这份兜底，并写回文件。
+# 一句话定位：队务与算法上像靠谱助教，闲聊里像混熟的老队员——专业务实 + 短促风趣。
 DEFAULT_PERSONA = (
-    "你是成理工程 ACM 集训队的吉祥物学姐，群里都喊你学姐。\n"
-    "说话像划水的老队员：短、口语、带自嘲，每次只回 1~2 句。\n"
-    "黑话：WA、TLE、AK、大模拟、DP、线段树、补题、红温。\n"
-    "禁止客服腔：不说「作为AI助手」「有什么可以帮您」「很高兴为您服务」。\n"
+    "你是成理工程 ACM 集训队的助教，带训练的老队员，群里都喊你学姐。\n"
+    "答算法和队务：专业、务实、先给结论，逻辑说清就停，不铺垫不客套。\n"
+    "日常闲聊：短、口语、偶尔自嘲和损两句，接得住梗，像真实群友而不是客服。\n"
+    "口头习惯：一次只说 1~2 句，能一句说完绝不说三句，不写小作文、不列清单、不做总结。\n"
+    "黑话随手用：AC、WA、TLE、RE、AK、爆零、补题、大模拟、DP、线段树、红温、榜单。\n"
+    "绝对不要客服腔和 AI 味：不说「您好」「很高兴为您服务」「有什么可以帮您」"
+    "「综上所述」「希望对你有帮助」。\n"
+    "你对群友的印象只在接话时自然带出来，绝不提「记忆」「数据库」「记录显示」这类词。\n"
     "你现在的生活状态：{status}\n"
     "若适合配图，分类只能从 ac、wa_tle、question、slacking、interrupt 里选一个，"
     "在回复末尾附标签，例如 [MEME:ac]，最多一个。\n"
@@ -70,6 +75,8 @@ _persona_cache: dict[str, tuple[tuple[int, int], str]] = {}
 DAILY_STATE_SLOTS = ((12, 30), (18, 30), (23, 0))
 
 # 内置语料：集训队日常，全部一句话、没有客服腔，随机取一条写库。
+# 只写「此刻在干嘛」，不写自我介绍、不提机器人身份——状态是给别人看的背景，
+# 被问到再顺口带一句，绝不在每句话里自报家门。
 DAILY_STATUS_POOL = (
     "刚点完外卖，正在B站看算法区UP主整活",
     "刚被一道区间DP卡红温，正刷抖音回血",
@@ -79,6 +86,10 @@ DAILY_STATUS_POOL = (
     "在食堂排队，脑子里还在想线段树怎么写",
     "刚睡醒，正在把昨晚没写出来的题再抄一遍",
     "在宿舍抱着笔记本调了一小时TLE，准备去洗把脸",
+    "在翻上个月的训练赛榜单，找几道该补没补的题",
+    "正在看周末那场ICPC的区域赛回放",
+    "刚给新生讲完并查集，嗓子有点干",
+    "在写这周的题单，顺手把两道水题踢出去",
 )
 
 # ---------------- Prompt 预算 ----------------
@@ -119,15 +130,28 @@ MEMORY_PATTERNS = (
     re.compile(r"我退役了?[^\s，,。.!！?？~～]{0,12}"),
 )
 
-# 客服腔标记：出现任意一个就整条丢弃，宁可不说也不装客服。
+# 客服腔 / AI 味标记：出现任意一个就整条丢弃，宁可不说也不装客服。
+# 覆盖三类：敬语开场（您好）、服务承诺（很高兴为您服务）、公文总结（综上所述），
+# 以及「出戏」的记忆表述（根据我的记忆库……）——这类话一出现，人设就塌了。
 _SERVICE_TONE_MARKERS = (
-    "作为ai", "作为一个ai", "作为人工智能", "有什么可以帮", "有什么能帮",
+    "作为ai", "作为一个ai", "作为人工智能", "作为语言模型", "有什么可以帮", "有什么能帮",
     "很高兴为您", "很高兴为你", "请问还有什么", "希望对您有帮助", "希望对你有帮助",
-    "我是ai助手", "ai助手",
+    "我是ai助手", "ai助手", "您好", "为您服务", "如有疑问", "感谢您的咨询",
+    "综上所述", "总的来说", "根据我的记忆", "记忆数据库", "根据记录显示", "据我记录",
 )
+
+# 记忆噪声：这些短语不是稳定的个人特征，而是一次性提问或水聊，落了库只会污染印象。
+# 命中任意一条就整条不收（宁可漏记，也不要让「我是不是该退役了」变成永久标签）。
+_MEMORY_NOISE_RE = re.compile(
+    r"[吗呢嘛么啥？?]|什么|怎么|如何|是不是|要不要|有没有|在不在|我是来|我是在想"
+)
+# 标签最短长度：一个字的信息量约等于零（「我叫A」除外——那也留不住人）。
+MEMORY_FACT_MIN_CHARS = 2
 
 # 模型爱加的角色前缀，剥离掉更自然。
 _PREFIX_RE = re.compile(r"^(?:学姐|我|回复|答)\s*[:：]\s*")
+# 句子边界：中英文句号、感叹号、问号、省略号、换行。用于压缩插话语数。
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?…\n])")
 
 # ---------------- 主动插话闸门 ----------------
 
@@ -138,6 +162,14 @@ INTERJECT_MIN_MESSAGES = 12
 INTERJECT_COOLDOWN_SECONDS = 3600.0
 # 满足条数条件后真正插话的概率（5%）。
 INTERJECT_PROBABILITY = 0.05
+# 机器人自己刚发过言后的静默窗：这段时间内不再主动插话。
+# 复读（+1）、表情包顺风车、拟人回复共用同一条时间线——刚发完话就接着插一句，
+# 在群里就是刷屏，宁可少说。
+INTERJECT_QUIET_SECONDS = 90.0
+# 主动插话的字数上限：只接一句话，比普通回复（80 字）更短，永远不写小作文。
+INTERJECT_MAX_CHARS = 40
+# 一次插话最多带的句子数：超过就整条丢弃，不做半句裁切（裁过的句子最假）。
+INTERJECT_MAX_SENTENCES = 2
 
 # 冷却表超过该规模时做一次惰性清理，防止长期运行后无界增长。
 _COOLDOWN_PRUNE_SIZE = 2000
@@ -160,6 +192,8 @@ def extract_memory_fact(text: str, *, max_chars: int = db.MEMORY_FACT_MAX_CHARS)
 
     只认内置模板（我叫/我是/我擅长/我卡在/我喜欢/我讨厌/我AC了/我退役），
     取到的短语超过 max_chars 直接截断——标签是给人速览的，不是原话存档。
+    带疑问语气或明显是「来问一句」的表述一律不收：这类话是一次性噪声，
+    沉淀下来只会让「印象」越记越脏。
     """
     if not isinstance(text, str):
         return ""
@@ -168,7 +202,9 @@ def extract_memory_fact(text: str, *, max_chars: int = db.MEMORY_FACT_MAX_CHARS)
         if not match:
             continue
         fact = " ".join(match.group(0).split())
-        if not fact:
+        if not fact or len(fact) < MEMORY_FACT_MIN_CHARS:
+            continue
+        if _MEMORY_NOISE_RE.search(fact):
             continue
         return fact[:max_chars]
     return ""
@@ -204,6 +240,24 @@ def clean_reply(text: str) -> str:
     if any(marker in lowered for marker in _SERVICE_TONE_MARKERS):
         return ""
     return line[:REPLY_MAX_CHARS]
+
+
+def clamp_reply(text: str, *, max_chars: int = 0, max_sentences: int = 0) -> str:
+    """把回复压进句数/字数上限：先按句子截，再按字数截。
+
+    主动插话只该接一句：模型偶尔会一次吐三四句，整条丢掉等于白调一次模型，
+    所以先按句读切、多余的句子舍掉；仍超字数再硬截并去掉尾部标点。
+    """
+    body = (text or "").strip()
+    if not body:
+        return ""
+    if max_sentences > 0:
+        pieces = [item for item in _SENTENCE_SPLIT_RE.split(body) if item.strip()]
+        if len(pieces) > max_sentences:
+            body = "".join(pieces[:max_sentences]).strip()
+    if max_chars > 0 and len(body) > max_chars:
+        body = body[:max_chars].rstrip("，,、；;：: ")
+    return body
 
 
 def persona_path(path: Path | str | None = None) -> Path:
@@ -314,14 +368,20 @@ def _system_prompt(status_text: str) -> str:
 
 def _user_prompt(*, nickname: str, text: str, facts: list[str],
                  context: list[str]) -> str:
-    """动态部分：最近上下文 + 对说话人的印象 + 本次要回的话。"""
+    """动态部分：最近上下文 + 对这个人的印象 + 本次要回的话。
+
+    印象写成「你记得这个人」，而不是「记忆库显示」：模型照着这个句式输出，
+    才不会在群里把内部结构念出来。结尾指令同时收紧语风（1~2 句、不客套、不总结）。
+    """
     parts: list[str] = []
     if context:
         parts.append("群聊最近几句：\n" + "\n".join(context))
     if facts:
-        parts.append(f"你对「{nickname}」的印象：{'；'.join(facts)}")
+        parts.append(f"你记得这个群友（{nickname}）：{'；'.join(facts)}"
+                     "——合适就顺口带一句，别用「我记得」「根据记录」这种说法。")
     parts.append(f"现在跟你说话的群友：「{nickname}」：{text}")
-    parts.append("用学姐的口吻回 1~2 句，30 字内，直接说话，不要旁白。")
+    parts.append("用助教/学长的口吻接一句：1~2 句、30 字内，直接说话，"
+                 "不铺垫、不客套、不列清单、不总结。")
     return "\n".join(parts)
 
 
@@ -434,7 +494,7 @@ class PersonaMemory:
 
 
 class InterjectionGate:
-    """群体高潮插话闸门：条数、冷却、概率三重校验，时钟与随机源可注入。"""
+    """群体高潮插话闸门：条数、冷却、他人发言静默窗、概率四重校验，时钟与随机源可注入。"""
 
     def __init__(
         self,
@@ -443,6 +503,7 @@ class InterjectionGate:
         min_messages: int = INTERJECT_MIN_MESSAGES,
         cooldown_seconds: float = INTERJECT_COOLDOWN_SECONDS,
         probability: float = INTERJECT_PROBABILITY,
+        quiet_seconds: float = INTERJECT_QUIET_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         rng: Callable[[], float] = random.random,
     ) -> None:
@@ -450,16 +511,19 @@ class InterjectionGate:
         self.min_messages = min_messages
         self.cooldown_seconds = cooldown_seconds
         self.probability = probability
+        self.quiet_seconds = quiet_seconds
         self._clock = clock
         self._rng = rng
         self._windows: dict[str, deque] = {}
         self._last_at: dict[str, float] = {}
+        self._spoke_at: dict[str, float] = {}
 
     def observe(self, group_id: str, *, now: float | None = None) -> bool:
         """记录一条群消息；返回 True 表示这一次该主动插话。
 
         冷却先于概率：冷却期内的消息既不掷骰子也不刷新冷却；未达条数阈值同样
-        不掷骰子——否则每条消息都在赌，5% 会被放大成必然事件。
+        不掷骰子——否则每条消息都在赌，5% 会被放大成必然事件。机器人自己刚
+        发过言（复读、表情包、上一句回复）时同样直接安静，先让群里说。
         """
         group = str(group_id or "").strip()
         if not group:
@@ -478,13 +542,30 @@ class InterjectionGate:
         last = self._last_at.get(group)
         if last is not None and moment - last < self.cooldown_seconds:
             return False
+        spoke = self._spoke_at.get(group)
+        if spoke is not None and moment - spoke < self.quiet_seconds:
+            return False
         if self._rng() >= self.probability:
             return False
         self._last_at[group] = moment
+        self._spoke_at[group] = moment
         # 命中后清空窗口：同一波高潮只插一次，后续重新积累。
         window.clear()
         self._prune(moment)
         return True
+
+    def note_bot_spoke(self, group_id: str, *, now: float | None = None) -> None:
+        """登记「机器人刚在本群说过话」，用于与复读、表情包共用节奏。
+
+        娱乐三件套（复读 / 表情包 / 拟人插话）各自有触发条件，但对外是一个
+        说话主体：任意一个刚发过言，其余两个就该让路，否则一条消息能引出好几句。
+        """
+        group = str(group_id or "").strip()
+        if not group:
+            return
+        moment = self._clock() if now is None else now
+        self._spoke_at[group] = moment
+        self._prune(moment)
 
     def _prune(self, moment: float) -> None:
         if len(self._last_at) <= _COOLDOWN_PRUNE_SIZE:
@@ -492,15 +573,20 @@ class InterjectionGate:
         deadline = moment - self.cooldown_seconds
         for stale in [key for key, at in self._last_at.items() if at < deadline]:
             self._last_at.pop(stale, None)
+        quiet_deadline = moment - self.quiet_seconds
+        for stale in [key for key, at in self._spoke_at.items() if at < quiet_deadline]:
+            self._spoke_at.pop(stale, None)
 
     def reset(self, group_id: str | None = None) -> None:
         if group_id is None:
             self._windows.clear()
             self._last_at.clear()
+            self._spoke_at.clear()
             return
         group = str(group_id)
         self._windows.pop(group, None)
         self._last_at.pop(group, None)
+        self._spoke_at.pop(group, None)
 
 
 _default_memory: PersonaMemory | None = None

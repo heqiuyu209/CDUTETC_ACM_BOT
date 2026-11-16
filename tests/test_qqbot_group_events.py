@@ -98,7 +98,12 @@ async def test_new_event_reaches_real_hello_route_with_passive_receipt(app, sdk,
         sent = client.api.post_group_message.call_args.kwargs
         assert sent["group_openid"] == "group-openid"
         assert sent["msg_id"] == "incoming-id"  # 不是外层 event-id，也不能转主动发送。
-        assert "你好" in sent["content"] or "嗨" in sent["content"]
+        # 只要求真的回了一句短话，且没有客服腔（具体措辞属于人设调优范围，不锁死文案）。
+        content = sent["content"]
+        assert content.strip()
+        assert len(content) <= 40
+        for tone in ("您好", "很高兴为您服务", "有什么可以帮您", "综上所述"):
+            assert tone not in content
         assert database.list_unanswered("group-openid") == []
     await sdk(adapter, scenario, native=native)
 

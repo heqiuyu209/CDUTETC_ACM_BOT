@@ -127,10 +127,14 @@ class PersonaMixin:
         if action is not None:
             if action.kind == "echo":
                 # 原样复读，不调模型、不拼接任何文案。
-                return await self._safe_reply(message, action.text)
+                sent = await self._safe_reply(message, action.text)
+                if sent:
+                    self._note_bot_spoke(group_id)
+                return sent
             if action.kind == "interrupt":
                 # 已进入打断分支：无论图有没有发出去，都不再叠加关键词表情包。
-                await self._send_meme(message, group_id, action.category)
+                if await self._send_meme(message, group_id, action.category):
+                    self._note_bot_spoke(group_id)
                 return True
         if not _main.config.MEME_ENABLED:
             return False
@@ -142,8 +146,11 @@ class PersonaMixin:
             logger.exception("场景表情判定失败，跳过")
             scene = ""
         if scene:
-            return await self._send_meme(message, group_id, scene, text=text,
+            sent = await self._send_meme(message, group_id, scene, text=text,
                                          proactive=True)
+            if sent:
+                self._note_bot_spoke(group_id)
+            return sent
         try:
             category = _main.memes.get_engine().should_trigger(group_id, text)
         except Exception:
@@ -151,7 +158,18 @@ class PersonaMixin:
             return False
         if not category:
             return False
-        return await self._send_meme(message, group_id, category, text=text)
+        sent = await self._send_meme(message, group_id, category, text=text)
+        if sent:
+            self._note_bot_spoke(group_id)
+        return sent
+
+    def _note_bot_spoke(self, group_id: str) -> None:
+        """告诉插话闸门「机器人刚说过话」，让复读/表情包/插话共享同一节奏。"""
+        try:
+            _main.persona_chat.get_gate().note_bot_spoke(group_id)
+        except Exception:
+            # 节奏登记失败只是可能多说一句，绝不能影响已发出的这条消息。
+            logger.warning("插话节奏登记失败，忽略", exc_info=True)
 
     def _schedule_meme_collect(self, message: _main.QQBotMessage, group_id: str,
                                text: str) -> None:
@@ -271,7 +289,9 @@ class PersonaMixin:
 
     async def _handle_persona_chat(self, message: _main.QQBotMessage, text: str,
                                    group_id: str, member_id: str,
-                                   *, remember: bool = True) -> bool:
+                                   *, remember: bool = True,
+                                   max_chars: int = 0,
+                                   max_sentences: int = 0) -> bool:
         """@机器人 的日常闲聊/接梗：低 Token 拟人回复 + 记忆积累 + 表情包顺风车。
 
         Returns:
@@ -329,6 +349,10 @@ class PersonaMixin:
             max_link_length=_main.config.QA_OUTPUT_MAX_LINK_LENGTH,
         )
         reply, category = _main.persona_chat.split_meme_tag(filtered_reply)
+        if reply and (max_chars or max_sentences):
+            # 主动插话走这条路径：句数先压到 1~2 句，再压字数，绝不整段小作文。
+            reply = _main.persona_chat.clamp_reply(
+                reply, max_chars=max_chars, max_sentences=max_sentences)
         if not reply and not category:
             return False
         text_sent = False
@@ -343,14 +367,17 @@ class PersonaMixin:
         image_sent = False
         if category and _main.config.MEME_ENABLED:
             image_sent = await self._send_meme(message, group_id, category, text=body)
+        if text_sent or image_sent:
+            self._note_bot_spoke(group_id)
         return bool(text_sent or image_sent)
 
     async def _maybe_persona_interject(self, message: _main.QQBotMessage, text: str,
                                        group_id: str) -> bool:
-        """群聊高潮时的低频主动插话：条数、冷却、概率三重闸门全过才说话。
+        """群聊高潮时的低频主动插话：条数、冷却、静默窗、概率四重闸门全过才说话。
 
         普通群消息先入滑窗（作为后续上下文），再交给闸门判定；闸门不通过就
-        完全安静，绝不让机器人变成刷屏源头。
+        完全安静，绝不让机器人变成刷屏源头。机器人刚发过言（复读、表情包、
+        上一句回复）时闸门直接拦住，与娱乐模块共用同一条说话节奏。
         """
         if not (_main.config.PERSONA_CHAT_ENABLED and _main.config.QA_SOCIAL_CHAT_ENABLED
                 and _main.db.group_switch_enabled(group_id, "qa_enabled")):
@@ -371,4 +398,9 @@ class PersonaMixin:
         if not self._qa_gate(member_id, text)[0]:
             return False
         # 命中的这句由 handler 在截取历史之后记录，避免它在 prompt 出现两遍。
-        return await self._handle_persona_chat(message, text, group_id, member_id)
+        # 插话不比正对话：只接 1~2 句、40 字内，多了就是刷屏。
+        return await self._handle_persona_chat(
+            message, text, group_id, member_id,
+            max_chars=_main.persona_chat.INTERJECT_MAX_CHARS,
+            max_sentences=_main.persona_chat.INTERJECT_MAX_SENTENCES,
+        )
