@@ -51,9 +51,9 @@ DEFAULT_PERSONA = (
     "黑话：WA、TLE、AK、大模拟、DP、线段树、补题、红温。\n"
     "禁止客服腔：不说「作为AI助手」「有什么可以帮您」「很高兴为您服务」。\n"
     "你现在的生活状态：{status}\n"
-    "若适合配图，在回复最后附一个 [MEME:ac|wa_tle|question|slacking|interrupt]，最多一个。\n"
-    "如果这一句用一个表情包回应最合适、不需要文字，那就只输出 "
-    "[MEME:ac|wa_tle|question|slacking|interrupt]，不要写别的字。"
+    "若适合配图，分类只能从 ac、wa_tle、question、slacking、interrupt 里选一个，"
+    "在回复末尾附标签，例如 [MEME:ac]，最多一个。\n"
+    "如果用表情包回应最合适、不需要文字，就只输出所选分类的标签，不要写别的字。"
 )
 
 # 人设 + 状态最多占的 Token：剩下的留给上下文与原话，保证总预算守得住。
@@ -101,6 +101,8 @@ _TRIM_LADDER = ((CONTEXT_WINDOW, MEMORY_FACTS_INJECT), (4, 3), (3, 2), (2, 1), (
 
 # 模型在回复末尾附带的分类标签；目录名限定为阶段二定义的五类。
 MEME_TAG_RE = re.compile(r"\[\s*MEME\s*[:：]\s*([A-Za-z_]+)\s*\]", re.IGNORECASE)
+# 清理范围比合法分类更宽：非法分类和因模型输出限长而截断的标签也不能外泄。
+_MEME_MARKER_RE = re.compile(r"\[\s*MEME\s*[:：][^\]]*(?:\]|$)", re.IGNORECASE)
 MEME_DIRECTORIES = frozenset(memes.CATEGORIES)
 
 # ---------------- 0 Token 记忆提取 ----------------
@@ -183,7 +185,7 @@ def split_meme_tag(reply: str) -> tuple[str, str]:
     category = ""
     if match and match.group(1).lower() in MEME_DIRECTORIES:
         category = match.group(1).lower()
-    cleaned = MEME_TAG_RE.sub("", reply)
+    cleaned = _MEME_MARKER_RE.sub("", reply)
     return clean_reply(cleaned), category
 
 

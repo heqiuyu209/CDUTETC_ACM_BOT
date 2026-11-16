@@ -921,7 +921,7 @@ class ACMBot:
                 # 拟人化闲聊兜底：非问句、FAQ 未命中时 commands 只会回一句「我在呢」，
                 # 这类接梗更适合走 persona（更省 token 也更像人）。模型不可用时
                 # _handle_persona_chat 返回 False，原兜底回复照常发出，功能不退化。
-                if (config.PERSONA_CHAT_ENABLED
+                if (config.PERSONA_CHAT_ENABLED and config.QA_SOCIAL_CHAT_ENABLED
                         and commands.is_social_fallback(replies)
                         and not content_filter.is_information_request(text)
                         and await self._handle_persona_chat(
@@ -1048,7 +1048,8 @@ class ACMBot:
         """
         return str(getattr(message, "user_id", "") or "")
 
-    def _qa_gate(self, member_id: str, text: str) -> tuple[bool, str | None]:
+    def _qa_gate(self, member_id: str, text: str, *,
+                 check_rate_limit: bool = True) -> tuple[bool, str | None]:
         """非命令消息进入问答链路前的输入侧闸门（五层防护中的 3/2/2.5/4 层）。
 
         Returns:
@@ -1079,7 +1080,8 @@ class ACMBot:
             return False, config.QA_SENSITIVE_REPLY
 
         # 五层防护-4：频率防刷（单用户滑动窗口限流）
-        if config.QA_RATE_LIMIT_ENABLED and not self._qa_rate_limiter.allow(member_id):
+        if (check_rate_limit and config.QA_RATE_LIMIT_ENABLED
+                and not self._qa_rate_limiter.allow(member_id)):
             logger.info("问答已限流（成员 %s）", member_id)
             return False, config.QA_RATE_LIMIT_REPLY
 
@@ -1209,18 +1211,6 @@ class ACMBot:
         self._meme_tasks.add(task)
         task.add_done_callback(self._meme_tasks.discard)
 
-    async def _send_meme_local(self, group_id: str, relative_path: str, *,
-                               reply_to: str | None = None) -> bool:
-        """把素材目录里的本机文件直接发到群里；协议不支持就安静返回 False。"""
-        sender = getattr(self.client, "send_group_image_result", None)
-        if sender is None:
-            return False
-        path = memes.meme_path(relative_path)
-        if path is None:
-            return False
-        result = await sender(group_id, str(path), reply_to=reply_to)
-        return bool(result)
-
     async def _send_meme(self, message: OneBotMessage, group_id: str,
                          category: str, *, text: str = "",
                          proactive: bool = False) -> bool:
@@ -1228,48 +1218,64 @@ class ACMBot:
 
         Args:
             text: 当前聊天文本，用于优先抽中文件名标签命中的那张图。
-            proactive: 主动插图（无入站消息可挂靠），走主动发送而非被动回复。
+            proactive: 显式主动插图，共用主动通知的开关、熔断和成功回执。
         """
+        from cdutetc.errors import DeliveryCode
+
         if not config.MEME_ENABLED:
             return False
         if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
             return False
+        msg_id = str(getattr(message, "id", "") or "")
+        if not proactive and not msg_id:
+            # 缺失被动回复凭证不擅自转主动发送。
+            return False
         engine = memes.get_engine()
-        # 官方协议必须拿到公网地址；OneBot 直接发本机文件，不需要公网地址。
+        local = capabilities_of(self.client).supports_local_image
         trigger = engine.resolve(category, group_id=group_id, text=text,
-                                 require_url=self.protocol == "qqbot")
+                                  require_url=not local)
         if trigger is None:
             # 素材目录缺失/为空，或未拼出公网地址：安静跳过，不报错也不阻塞。
             return False
-        msg_id = str(getattr(message, "id", "") or "")
-        if proactive or not msg_id:
-            sent = await self._send_meme_local(group_id, trigger.relative_path)
-            if sent:
-                engine.record_sent(group_id, trigger.relative_path)
-            return sent
-        try:
-            if self.protocol != "qqbot":
-                sent = await self._send_meme_local(group_id, trigger.relative_path,
-                                                   reply_to=msg_id)
-                if sent:
-                    engine.record_sent(group_id, trigger.relative_path)
-                return sent
-            file_info = db.get_meme_file_cache(group_id, trigger.relative_path)
-            if not file_info:
-                uploaded = await self.client.upload_group_media(group_id, trigger.url)
-                if not uploaded:
-                    return False
-                file_info, ttl_seconds = uploaded
+        mode = DeliveryMode.ACTIVE if proactive else DeliveryMode.PASSIVE
+
+        async def send_image(_message_format=None):
+            if local:
+                path = memes.meme_path(trigger.relative_path)
+                if path is None:
+                    return DeliveryResult(False, DeliveryCode.NOT_FOUND, self.protocol, mode)
+                image = str(path)
+            else:
                 try:
-                    db.save_meme_file_cache(group_id, trigger.relative_path, file_info,
-                                            ttl_seconds=ttl_seconds)
-                except Exception:
-                    logger.warning("表情包 file_info 缓存写入失败，本次仍继续发送")
-            seq = _clamp_reply_seq(_reply_sequence.get() + 1)
-            _reply_sequence.set(seq)
-            result = await self.client.send_group_media_result(
-                group_id, file_info, reply_to=msg_id, reply_seq=seq,
+                    image = db.get_meme_file_cache(group_id, trigger.relative_path)
+                except sqlite3.Error:
+                    image = ""
+                if not image:
+                    uploaded = await asyncio.wait_for(
+                        self.client.upload_group_media(group_id, trigger.url),
+                        timeout=notifications.SEND_TIMEOUT_SECONDS,
+                    )
+                    if not uploaded:
+                        return DeliveryResult(False, DeliveryCode.PLATFORM_ERROR,
+                                              self.protocol, mode, detail="media_upload_failed")
+                    image, ttl_seconds = uploaded
+                    try:
+                        db.save_meme_file_cache(group_id, trigger.relative_path, image,
+                                                ttl_seconds=ttl_seconds)
+                    except sqlite3.Error:
+                        logger.warning("表情包 file_info 缓存写入失败，本次仍继续发送")
+            seq = 1
+            if not proactive:
+                seq = _clamp_reply_seq(_reply_sequence.get() + 1)
+                _reply_sequence.set(seq)
+            return await notifications.send_group_image(
+                self.client, group_id, image, local=local,
+                reply_to=None if proactive else msg_id, reply_seq=seq,
             )
+
+        try:
+            result = (await self._deliver_active_group(group_id, send_image)
+                      if proactive else await send_image())
             if result:
                 engine.record_sent(group_id, trigger.relative_path)
             return bool(result)
@@ -1318,10 +1324,14 @@ class ACMBot:
             False → 没发出任何东西（未配模型 / 模型失败 / 回复被过滤），
                     调用方继续原有兜底逻辑，关掉开关或没配 Key 时功能不退化。
         """
-        if not config.PERSONA_CHAT_ENABLED:
+        if not (config.PERSONA_CHAT_ENABLED and config.QA_SOCIAL_CHAT_ENABLED
+                and db.group_switch_enabled(group_id, "qa_enabled")):
             return False
         body = (text or "").strip()
         if not body or body.startswith("/"):
+            return False
+        # 入口已经扣过调用额度；这里重查身份和内容，不重复消耗限流额度。
+        if not self._qa_gate(member_id, body, check_rate_limit=False)[0]:
             return False
         memory = persona_chat.get_memory()
         nickname = self._nickname_of(message, member_id)
@@ -1357,21 +1367,28 @@ class ACMBot:
             # 闲聊失败一律回退原有回复链路：不能因为模型抖一下就整条消息无人应。
             logger.exception("拟人聊天调用失败，回退原有回复链路")
             return False
-        reply, category = persona_chat.split_meme_tag(raw_reply)
+        # 先过滤完整输出，再拆标签/截短，避免截断掩盖敏感内容。
+        filtered_reply = content_filter.sanitize_output(
+            raw_reply if isinstance(raw_reply, str) else "",
+            max_length=config.QA_OUTPUT_MAX_LENGTH,
+            max_link_length=config.QA_OUTPUT_MAX_LINK_LENGTH,
+        )
+        reply, category = persona_chat.split_meme_tag(filtered_reply)
         if not reply and not category:
             return False
+        text_sent = False
         if reply:
-            await self._safe_reply(message, reply)
+            text_sent = await self._safe_reply(message, reply)
             # 机器人自己那句也进滑窗，后续几轮才不会答非所问。
-            memory.observe(group_id, "学姐", reply)
+            if text_sent:
+                memory.observe(group_id, "学姐", reply)
         # 表情包顺风车：分类由本条回复明确指定，直接复用阶段二链路，
         # 不走关键词判定（因此天然跳过关键词冷却），任一前置条件缺失即安静不发。
         # 模型也可能只给一个 [MEME:xx]、不写字，这时只发图、不发空文本。
+        image_sent = False
         if category and config.MEME_ENABLED:
-            sent = await self._send_meme(message, group_id, category, text=body)
-            if not reply:
-                return sent
-        return bool(reply)
+            image_sent = await self._send_meme(message, group_id, category, text=body)
+        return bool(text_sent or image_sent)
 
     async def _maybe_persona_interject(self, message: OneBotMessage, text: str,
                                        group_id: str) -> bool:
@@ -1380,19 +1397,26 @@ class ACMBot:
         普通群消息先入滑窗（作为后续上下文），再交给闸门判定；闸门不通过就
         完全安静，绝不让机器人变成刷屏源头。
         """
-        if not config.PERSONA_CHAT_ENABLED:
+        if not (config.PERSONA_CHAT_ENABLED and config.QA_SOCIAL_CHAT_ENABLED
+                and db.group_switch_enabled(group_id, "qa_enabled")):
             return False
         member_id = self._extract_member_id(message)
+        # 不合格的输入连上下文也不记录，避免借下一位群友的回复绕过过滤。
+        if not self._qa_gate(member_id, text, check_rate_limit=False)[0]:
+            return False
         try:
-            persona_chat.get_memory().observe(
-                group_id, self._nickname_of(message, member_id), text)
             if not persona_chat.get_gate().observe(group_id):
+                persona_chat.get_memory().observe(
+                    group_id, self._nickname_of(message, member_id), text)
                 return False
         except Exception:
             logger.exception("插话闸门判定失败，保持安静")
             return False
-        return await self._handle_persona_chat(message, text, group_id, member_id,
-                                              remember=False)
+        # 普通聊天不扣问答额度，只有实际准备调模型时才计一次。
+        if not self._qa_gate(member_id, text)[0]:
+            return False
+        # 命中的这句由 handler 在截取历史之后记录，避免它在 prompt 出现两遍。
+        return await self._handle_persona_chat(message, text, group_id, member_id)
 
     async def _handle_publish(self, message: OneBotMessage, text: str,
                               group_id: str, member_id: str):
@@ -1680,7 +1704,18 @@ class ACMBot:
 
     async def _send_group_result(self, group_id: str, text: str, *, permission_probe: bool = False,
                                  message_format: str | None = None):
-        """主动通知唯一业务入口，返回可审计的结构化结果。"""
+        """主动文本通知入口，返回可审计的结构化结果。"""
+        async def send(selected_format):
+            kwargs = {"message_format": selected_format} if selected_format == "markdown" else {}
+            return await notifications.send_group(self.client, group_id, text, **kwargs)
+
+        return await self._deliver_active_group(
+            group_id, send, permission_probe=permission_probe, message_format=message_format)
+
+    async def _deliver_active_group(self, group_id: str, send, *,
+                                    permission_probe: bool = False,
+                                    message_format: str | None = None):
+        """主动文本/图片共用开关、原子恢复领取、超时与投递结果处理。"""
         from cdutetc.errors import DeliveryCode, DeliveryResult
         if not is_allowed_group(group_id, config.ALLOWED_GROUPS):
             return DeliveryResult(False, DeliveryCode.TARGET_NOT_ALLOWED, self.protocol)
@@ -1702,9 +1737,8 @@ class ACMBot:
         else:
             message_format = "text"
         try:
-            kwargs = {"message_format": message_format} if message_format == "markdown" else {}
             result = await asyncio.wait_for(
-                notifications.send_group(self.client, group_id, text, **kwargs),
+                send(message_format),
                 timeout=_ACTIVE_SEND_TIMEOUT_SECONDS,
             )
         except Exception as error:

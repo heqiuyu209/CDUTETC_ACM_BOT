@@ -95,6 +95,22 @@ async def send_group(client, group_id: str, text: str, *, reply_to: str | None =
     return await _send_with_timeout(client, detailed(group_id, text, reply_to=reply_to), mode)
 
 
+async def send_group_image(client, group_id: str, image: str, *,
+                           local: bool, reply_to: str | None = None,
+                           reply_seq: int = 1) -> DeliveryResult:
+    """本地图片或已上传的 file_info，共用文本发送的超时和回复参数校验。"""
+    mode = DeliveryMode.PASSIVE if reply_to is not None else DeliveryMode.ACTIVE
+    if reply_to == "":
+        return DeliveryResult(False, DeliveryCode.INVALID_REQUEST, _protocol(client), mode,
+                              detail="empty_reply_to")
+    method = "send_group_image_result" if local else "send_group_media_result"
+    detailed = getattr(client, method, None)
+    if not callable(detailed):
+        return _unsupported(client, mode)
+    return await _send_with_timeout(
+        client, detailed(group_id, image, reply_to=reply_to, reply_seq=reply_seq), mode)
+
+
 async def send_private(client, user_id: str, text: str, *, reply_to: str | None = None,
                        reply_seq: int = 1) -> DeliveryResult:
     """Send actively by default; supply reply_to only for a deliberate reply."""

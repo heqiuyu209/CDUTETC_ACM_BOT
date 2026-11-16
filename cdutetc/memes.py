@@ -591,6 +591,12 @@ def strip_cq_codes(text: str) -> str:
     return " ".join(_CQ_RE.sub(" ", str(text or "")).split())
 
 
+def _decode_cq_parameter(value) -> str:
+    """CQ 实体只还原一层；URL 自身的百分号编码必须保持不变。"""
+    return (str(value or "").replace("&#91;", "[").replace("&#93;", "]")
+            .replace("&#44;", ",").replace("&amp;", "&"))
+
+
 _URL_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
 
 
@@ -627,7 +633,7 @@ def _attachment_refs(items) -> list[dict]:
     if not isinstance(items, (list, tuple)):
         return refs
     for item in items:
-        content_type = str(_read_field(item, "content_type", "") or "")
+        content_type = str(_read_field(item, "content_type", "") or "").lower()
         if content_type and not content_type.startswith("image/"):
             continue
         url = normalize_image_url(_read_field(item, "url", "") or "")
@@ -653,6 +659,8 @@ def extract_image_refs(message) -> list[dict]:
                 if not isinstance(seg, dict) or seg.get("type") != "image":
                     continue
                 data = seg.get("data") or {}
+                if not isinstance(data, dict):
+                    continue
                 url = str(data.get("url") or "")
                 name = str(data.get("file") or "")
                 if url or name:
@@ -671,8 +679,9 @@ def extract_image_refs(message) -> list[dict]:
         params = dict(
             part.split("=", 1) for part in match.group(1).split(",") if "=" in part
         )
-        url = unquote(str(params.get("url") or ""))
-        name = unquote(str(params.get("file") or ""))
+        # CQ 参数使用实体转义，不能 URL-decode，否则会破坏签名与查询参数。
+        url = _decode_cq_parameter(params.get("url"))
+        name = _decode_cq_parameter(params.get("file"))
         if url or name:
             refs.append({"url": url, "file": name})
     return refs
@@ -1008,7 +1017,8 @@ async def collect_one_image(ref: dict, *, group_id: str, text: str = "",
     except Exception as exc:  # noqa: BLE001 - 台账读不到时宁可不收
         logger.info("收图去重查询失败：%s", exc)
         return None
-    suffix = file_suffix(name, url)
+    # QQ 下载地址可能只有 fileid，没有扩展名；GIF 必须按内容识别以保留动画。
+    suffix = GIF_SUFFIX if data[:6] in (b"GIF87a", b"GIF89a") else file_suffix(name, url)
     accepted, reason = should_collect(data, suffix=suffix)
     if not accepted:
         logger.info("收图跳过（%s）：%s", reason, (name or url)[:80])

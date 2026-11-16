@@ -7,6 +7,6 @@ APScheduler>=3.10.0,<4.0.0
 python-dotenv>=1.0.0,<2.0.0
 tzdata>=2024.1; platform_system == "Windows"
 # 收图链路（尺寸过滤 / 压缩 / dHash 相似去重）依赖 Pillow；缺了会拒收所有静态图。
-Pillow>=10.0.0,<13.0.0
+Pillow>=10.4.0,<13.0.0
 
 # 可选：自动收图的截图拦截需要本地 OCR，见 requirements-ocr.txt（不装则该项自动跳过）。

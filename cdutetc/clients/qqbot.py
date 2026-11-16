@@ -97,6 +97,10 @@ class QQBotMessage:
         attachments = _normalize_attachments(data)
         if attachments:
             self.raw["attachments"] = attachments
+        author = _field(data, "author")
+        names = {key: _field(author, key, "") for key in ("username", "nickname")}
+        if any(names.values()):
+            self.raw["author"] = names
         self.source = data
         self.id = str(msg_id or "")
         self.message_type = message_type
