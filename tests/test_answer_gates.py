@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cdutetc import commands, config, content_filter, database, llm, main
-from cdutetc.clients.onebot import OneBotMessage
+from conftest import official_message
 
 
 @pytest.fixture
@@ -24,11 +24,7 @@ def memory_db(monkeypatch):
 
 
 def _message(content, group_id="g1", member_id="m1"):
-    return OneBotMessage({
-        "post_type": "message", "message_type": "group", "message_id": 1,
-        "raw_message": f"[CQ:at,qq=30001] {content}",
-        "group_id": group_id, "user_id": member_id, "self_id": 30001,
-    })
+    return official_message(message_type="group", msg_id=1, content=f"<@30001> {content}", group_id=group_id, user_id=member_id, bot_id=30001)
 
 
 @pytest.fixture

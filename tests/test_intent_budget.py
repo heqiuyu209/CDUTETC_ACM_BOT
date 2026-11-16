@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cdutetc import config, llm, main
-from cdutetc.clients.onebot import OneBotMessage
+from conftest import official_message
 
 
 @pytest.mark.parametrize("text", ["周赛什么时候", "周赛在哪报名", "你能自动提醒吗", "你好", "如何报名？"])
@@ -24,20 +24,16 @@ async def test_publication_statement_keeps_small_classification_budget(monkeypat
     assert chat.await_args.kwargs == {"json_mode": True, "max_tokens": 32}
 
 
-async def test_blacklisted_staff_never_reaches_implicit_publish_classifier(monkeypatch, onebot_client):
+async def test_blacklisted_staff_never_reaches_implicit_publish_classifier(monkeypatch, official_client):
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
     monkeypatch.setattr(config, "SUPER_ADMIN", {"teacher"})
     monkeypatch.setattr(config, "QA_BLACKLIST", {"teacher"})
     monkeypatch.setattr(config, "NL_INTENT_ENABLED", True)
     classifier = AsyncMock(return_value="add_contest")
     monkeypatch.setattr(llm, "classify_intent", classifier)
-    bot = main.ACMBot(onebot_client)
+    bot = main.ACMBot(official_client)
     publish = AsyncMock()
     monkeypatch.setattr(bot, "_handle_publish", publish)
-    await bot.on_group_at_message_create(OneBotMessage({
-        "post_type": "message", "message_type": "group", "message_id": 1,
-        "group_id": "g1", "user_id": "teacher", "self_id": 30001,
-        "raw_message": "[CQ:at,qq=30001] 本周日19:00进行ACM周赛",
-    }))
+    await bot.on_group_at_message_create(official_message(message_type="group", msg_id=1, group_id="g1", user_id="teacher", bot_id=30001, content="<@30001> 本周日19:00进行ACM周赛"))
     classifier.assert_not_awaited()
     publish.assert_not_awaited()

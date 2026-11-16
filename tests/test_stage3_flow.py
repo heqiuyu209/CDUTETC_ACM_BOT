@@ -10,18 +10,15 @@ import sqlite3
 
 import pytest
 
-from cdutetc import chat_fun, commands, config, database, main, memes, persona_chat
-from cdutetc.clients.onebot import OneBotMessage
+from cdutetc import chat_fun, config, database, main, memes, persona_chat
+from conftest import official_message
 from cdutetc.errors import DeliveryResult
 
 
 def _msg(content="在吗", group="G-OPENID", member="m1", message_id=12345, at=True):
-    """组一条群消息；at=True 时带上 @本机器人 的 CQ 码（client.self_id）。"""
-    prefix = "[CQ:at,qq=BOT-OPENID] " if at else ""
-    return OneBotMessage({"post_type": "message", "message_type": "group",
-                          "raw_message": prefix + content, "group_id": group,
-                          "user_id": member, "message_id": message_id,
-                          "self_id": "BOT-OPENID"})
+    """构造官方群消息；at=True 时生成正文 @ 与平台 is_you 标记。"""
+    prefix = "<@BOT-OPENID> " if at else ""
+    return official_message(message_type="group", content=prefix + content, group_id=group, user_id=member, msg_id=message_id, bot_id="BOT-OPENID")
 
 
 class FakeQQBotClient:
@@ -31,7 +28,6 @@ class FakeQQBotClient:
     supports_passive_reply = True
     supports_numeric_group_id = False
     supports_markdown = True
-    self_id = "BOT-OPENID"
 
     def __init__(self):
         from unittest.mock import AsyncMock
@@ -67,7 +63,6 @@ def bot(monkeypatch, db_conn):
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"G-OPENID"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"m1"})
     monkeypatch.setattr(config, "PUBLISH_CMD", "发布")
-    monkeypatch.setattr(config, "BOT_QQ", "")
     monkeypatch.setattr(config, "GROUP_REQUIRE_AT", True)
     monkeypatch.setattr(config, "NL_INTENT_ENABLED", False)
     monkeypatch.setattr(config, "QA_RATE_LIMIT_ENABLED", False)

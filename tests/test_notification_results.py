@@ -10,7 +10,6 @@ from cdutetc.errors import (
     DeliveryMode,
     classify_exception,
     result_from_exception,
-    result_from_onebot,
     safe_error_hint,
 )
 from cdutetc.notifications import send_group, send_private
@@ -78,15 +77,6 @@ def test_official_rate_limit_is_separate_from_permission_denial():
     assert classify_exception(ServerError("未知服务异常")) == DeliveryCode.PLATFORM_ERROR
 
 
-def test_onebot_receipt_requires_status_retcode_and_message_id():
-    assert result_from_onebot(
-        {"status": "ok", "retcode": 0, "data": {"message_id": 3}},
-        action="send_group_msg",
-    )
-    assert result_from_onebot(None, action="send_group_msg").code == DeliveryCode.TIMEOUT_UNKNOWN
-    assert result_from_onebot(
-        {"status": "ok", "retcode": 0, "data": {}}, action="send_group_msg"
-    ).code == DeliveryCode.UNKNOWN
 
 
 async def test_notification_entry_routes_result_and_explicit_reply_seq(monkeypatch):
@@ -106,8 +96,8 @@ async def test_notification_entry_routes_result_and_explicit_reply_seq(monkeypat
 
 
 async def test_missing_detailed_api_returns_structured_unsupported(monkeypatch):
-    monkeypatch.setattr(config, "BOT_PROTOCOL", "onebot")
+    monkeypatch.setattr(config, "BOT_PROTOCOL", "qqbot")
     result = await send_group(object(), "g", "text")
     assert not result
     assert result.code == DeliveryCode.UNSUPPORTED
-    assert result.protocol == "onebot"
+    assert result.protocol == "qqbot"

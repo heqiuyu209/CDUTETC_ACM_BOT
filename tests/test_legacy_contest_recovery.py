@@ -16,7 +16,7 @@ TARGET = "2026-11-11 19:00"
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "legacy.sqlite"))
-    monkeypatch.setattr(config, "BOT_PROTOCOL", "onebot")
+    monkeypatch.setattr(config, "BOT_PROTOCOL", "qqbot")
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2"})
     monkeypatch.setattr(config, "REMIND_BEFORE_HOURS", 24)
     monkeypatch.setattr(config, "REMIND_OFFSET_HOURS", (24, 1))

@@ -6,7 +6,6 @@ import json
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
 
 
 class AppErrorCode(str, Enum):
@@ -193,37 +192,3 @@ def result_from_exception(error: BaseException, *, protocol: str,
     # Do not expose exception text: SDK errors may contain request data or identifiers.
     return DeliveryResult(False, classify_exception(error), protocol, mode,
                           detail=type(error).__name__, platform_code=_platform_error_code(error))
-
-
-def result_from_onebot(response: Any, *, action: str, connected: bool = True) -> DeliveryResult:
-    """Normalize OneBot action response using status/retcode/data contract."""
-    mode = DeliveryMode.ACTIVE
-    if not connected:
-        return DeliveryResult(False, DeliveryCode.NOT_CONNECTED, "onebot", mode)
-    if not isinstance(response, dict):
-        code = DeliveryCode.TIMEOUT_UNKNOWN if response is None else DeliveryCode.UNKNOWN
-        return DeliveryResult(False, code, "onebot", mode,
-                              detail="missing_response" if response is None else "invalid_response")
-    status = response.get("status")
-    retcode = response.get("retcode")
-    if status == "ok" and type(retcode) is int and retcode == 0:
-        if response.get("message") or response.get("wording"):
-            return DeliveryResult(False, DeliveryCode.UNKNOWN, "onebot", mode,
-                                  detail="error_message_in_success_response")
-        data = response.get("data")
-        if isinstance(data, dict) and (data.get("error") or data.get("wording")):
-            return DeliveryResult(False, DeliveryCode.UNKNOWN, "onebot", mode,
-                                  detail="error_message_in_data")
-        mid = data.get("message_id", "") if isinstance(data, dict) else ""
-        if action.startswith("send_"):
-            invalid_id = isinstance(mid, bool) or not str(mid).strip()
-            if isinstance(mid, (int, float)) and mid <= 0:
-                invalid_id = True
-            if isinstance(mid, str) and mid.strip().isdigit() and int(mid.strip()) <= 0:
-                invalid_id = True
-            if invalid_id:
-                return DeliveryResult(False, DeliveryCode.UNKNOWN, "onebot", mode,
-                                      detail="missing_message_id")
-        return DeliveryResult.sent("onebot", mode, str(mid or ""))
-    return DeliveryResult(False, DeliveryCode.UNKNOWN, "onebot", mode,
-                          detail=f"retcode:{retcode if retcode is not None else 'missing'}")

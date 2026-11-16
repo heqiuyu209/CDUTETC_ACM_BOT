@@ -131,34 +131,16 @@ def _drop_empty_env(environ=None) -> list[str]:
 # 启动时清掉值为空的 ACM_* 环境变量（必须保留该副作用，返回值无人使用）。
 _drop_empty_env()
 
-# ================= QQ 机器人接入（OneBot/NapCat，必填） =================
-# NapCatQQ 正向 WebSocket 地址，例如 ws://127.0.0.1:3001
-# ================= 接入协议（二选一） =================
-# onebot = 个人 QQ（NapCat 正向 WebSocket）；qqbot = QQ 开放平台官方机器人。
-# 业务逻辑完全一致，只是接入层不同。
-BOT_PROTOCOL = os.getenv("ACM_BOT_PROTOCOL", "onebot").strip().lower()
-if BOT_PROTOCOL not in ("onebot", "qqbot"):
-    raise RuntimeError(
-        f"ACM_BOT_PROTOCOL 只能是 onebot 或 qqbot，当前为 {BOT_PROTOCOL!r}"
-    )
+# ================= QQ 开放平台官方机器人 =================
+# 固定标识用于既有数据库记录和日志，不再从环境切换接入。
+BOT_PROTOCOL = "qqbot"
 
 # ---- 官方机器人（qqbot）凭证 ----
 # 在 QQ 开放平台创建机器人后获得；WebSocket 模式不需要公网 IP 或域名。
 QQBOT_APPID = os.getenv("ACM_QQBOT_APPID", "")
 QQBOT_SECRET = os.getenv("ACM_QQBOT_SECRET", "")
 
-# ================= QQ 机器人接入（OneBot/NapCat） =================
-# NapCatQQ 正向 WebSocket 地址，例如 ws://127.0.0.1:3001
-ONEBOT_WS_URL = os.getenv("ACM_ONEBOT_WS_URL", "")
-# 可选鉴权 token（与 NapCat 配置一致；未开启留空）
-ONEBOT_TOKEN = os.getenv("ACM_ONEBOT_TOKEN", "")
-# 机器人自身 QQ 号（用于识别群内 @ 目标；缺省使用 OneBot 事件的 self_id）
-BOT_QQ = os.getenv("ACM_BOT_QQ", "")
-# WebSocket 静默超时（秒）：超过该时长收不到任何事件（含 NapCat 心跳）就主动
-# 断开重连，用于兜住 TCP 半开连接导致的「机器人突然不回消息且不恢复」。
-# NapCat 默认心跳 5 秒左右，180 秒足够宽松；设 0 可关闭该看门狗。
-WS_IDLE_TIMEOUT_SECONDS = float(os.getenv("ACM_WS_IDLE_TIMEOUT_SECONDS", "180"))
-# 普通 QQ 无平台主动消息限制；保留开关以便在需要时暂停提醒投递。
+# 官方网关连接与心跳由 botpy 管理；主动发送仍受平台权限和配额限制。
 GROUP_ACTIVE_MESSAGES_ENABLED = os.getenv("ACM_GROUP_ACTIVE_MESSAGES_ENABLED", "1") == "1"
 
 # ================= 大模型（OpenAI 兼容接口，必填） =================
@@ -536,18 +518,11 @@ DB_PATH = os.getenv("ACM_DB_PATH", os.path.join(str(BASE_DIR), "contests.db"))
 
 # ================= 启动前配置检查 =================
 
-# 按所选协议决定必填项：OneBot 要 WS 地址，官方机器人要 AppID/AppSecret
-if BOT_PROTOCOL == "qqbot":
-    REQUIRED_CONFIG = {
-        "ACM_QQBOT_APPID": QQBOT_APPID,
-        "ACM_QQBOT_SECRET": QQBOT_SECRET,
-        "ACM_LLM_API_KEY": LLM_API_KEY,
-    }
-else:
-    REQUIRED_CONFIG = {
-        "ACM_ONEBOT_WS_URL": ONEBOT_WS_URL,
-        "ACM_LLM_API_KEY": LLM_API_KEY,
-    }
+REQUIRED_CONFIG = {
+    "ACM_QQBOT_APPID": QQBOT_APPID,
+    "ACM_QQBOT_SECRET": QQBOT_SECRET,
+    "ACM_LLM_API_KEY": LLM_API_KEY,
+}
 
 # 不影响启动、但不配就等于没有功能的配置项（启动时只告警）
 RECOMMENDED_CONFIG = {

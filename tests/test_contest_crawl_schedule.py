@@ -39,7 +39,7 @@ def memory_db(monkeypatch):
 
 def new_bot():
     return main.ACMBot(SimpleNamespace(send_group_msg_result=AsyncMock(
-        return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
+        return_value=DeliveryResult.sent("qqbot", DeliveryMode.ACTIVE, "sent")
     )))
 
 

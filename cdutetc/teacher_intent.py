@@ -72,7 +72,7 @@ EVENT_ANCHOR = re.compile(
     re.IGNORECASE,
 )
 
-# @ 段与表情在计数前一律剔除：官方协议是 <@!openid>，OneBot 是 CQ 码。
+# @ 段与用户粘贴的表情标记在计数前剔除。
 _MENTION_RE = re.compile(r"<@!?[^>\s]*>|\[CQ:[^\]]*\]|@\S+")
 _EMOJI_RE = re.compile(
     "[\U0001F000-\U0001FAFF\u2190-\u21FF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D]"

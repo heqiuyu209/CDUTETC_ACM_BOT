@@ -9,23 +9,20 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from cdutetc import config, database, main
-from cdutetc.clients.onebot import OneBotMessage
+from conftest import official_message
 from cdutetc.fetcher import FetchError
 
 
 def _msg(content="你好", group="g1", member="m1"):
-    return OneBotMessage({"post_type": "message", "message_type": "group",
-                         "raw_message": content, "group_id": group, "user_id": member,
-                         "message_id": 12345, "self_id": 30001})
+    return official_message(message_type="group", content=content, group_id=group, user_id=member, msg_id=12345, bot_id=30001)
 
 
 @pytest.fixture
-def bot(monkeypatch, onebot_client):
+def bot(monkeypatch, official_client):
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
     # v2：发布权并入老师白名单（原 PUBLISHER_WHITELIST 已移除）
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"m1"})
     monkeypatch.setattr(config, "PUBLISH_CMD", "发布")
-    monkeypatch.setattr(config, "BOT_QQ", "")
     monkeypatch.setattr(config, "GROUP_REQUIRE_AT", True)
     monkeypatch.setattr(config, "PUBLISH_CONFIRM_ENABLED", False)
     monkeypatch.setattr(config, "NL_INTENT_ENABLED", False)
@@ -38,7 +35,7 @@ def bot(monkeypatch, onebot_client):
     monkeypatch.setattr(database, "_connect", lambda: conn)
     database.init_db()
 
-    bot = main.ACMBot(onebot_client)
+    bot = main.ACMBot(official_client)
     replies = []
 
     async def fake_reply(message, content):
@@ -58,7 +55,7 @@ async def test_non_allowed_group_ignored(bot):
 
 async def test_empty_text_ignored(bot):
     b, replies = bot
-    await b.on_group_at_message_create(_msg("[CQ:at,qq=30001]"))
+    await b.on_group_at_message_create(_msg("<@30001>"))
     assert replies == []
 
 
@@ -90,7 +87,7 @@ async def test_at_required_can_be_disabled(bot, monkeypatch):
 
 async def test_publish_without_permission(bot):
     b, replies = bot
-    await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] 发布 https://a.com", member="m_x"))
+    await b.on_group_at_message_create(_msg("<@30001> 发布 https://a.com", member="m_x"))
     assert any("没有发布" in r for r in replies)
     # 权限不足时不触发抓取/写库
     assert len(database.list_competitions()) == 0
@@ -103,7 +100,7 @@ async def test_publish_without_url_saves_text_without_fetching(bot, monkeypatch)
     monkeypatch.setattr(main, "fetch_text", fetch)
     monkeypatch.setattr(main, "extract_contest", extract)
 
-    await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] 发布 纯文字校赛"))
+    await b.on_group_at_message_create(_msg("<@30001> 发布 纯文字校赛"))
 
     fetch.assert_not_awaited()
     extract.assert_awaited_once_with("老师原文：纯文字校赛")
@@ -120,7 +117,7 @@ async def test_publish_fetch_error_falls_back_to_original_text(bot, monkeypatch)
     monkeypatch.setattr(main, "fetch_text", fetch)
     monkeypatch.setattr(main, "extract_contest", extract)
 
-    await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] 发布 降级校赛 https://a.com"))
+    await b.on_group_at_message_create(_msg("<@30001> 发布 降级校赛 https://a.com"))
 
     fetch.assert_awaited_once_with("https://a.com")
     extract.assert_awaited_once_with("老师原文：降级校赛 https://a.com")
@@ -134,7 +131,7 @@ async def test_publish_fetch_and_extract_failure_does_not_write(bot, monkeypatch
     monkeypatch.setattr(main, "fetch_text", AsyncMock(side_effect=FetchError("目标地址非公网")))
     monkeypatch.setattr(main, "extract_contest", AsyncMock(return_value=(None, None)))
 
-    await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] 发布 https://a.com"))
+    await b.on_group_at_message_create(_msg("<@30001> 发布 https://a.com"))
 
     assert any("链接打不开" in r for r in replies)
     assert any("提取失败" in r for r in replies)
@@ -154,7 +151,7 @@ async def test_publish_extract_error(bot, monkeypatch):
 
     monkeypatch.setattr(main, "extract_contest", fake_extract_err)
 
-    await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] 发布 https://a.com"))
+    await b.on_group_at_message_create(_msg("<@30001> 发布 https://a.com"))
     assert any("提取失败" in r for r in replies)
     assert len(database.list_competitions()) == 0  # 提取失败不写库
 
@@ -178,7 +175,7 @@ async def test_publish_success_auto_publishes(bot, monkeypatch, publisher):
     monkeypatch.setattr(main, "extract_contest", fake_extract_ok)
 
     await b.on_group_at_message_create(_msg(
-        "[CQ:at,qq=30001] 发布 https://a.com", member=publisher,
+        "<@30001> 发布 https://a.com", member=publisher,
     ))
     assert any("已保存：校赛" in r and "已入库" in r for r in replies)
     # 免审发布：直接写入 confirmed 正式比赛（无审核草稿环节）
@@ -202,7 +199,7 @@ async def test_addressed_link_question_does_not_publish(bot, monkeypatch):
         return [{"group_id": group_id, "text": "收到，已记录为问题"}]
 
     monkeypatch.setattr(main.commands, "handle_non_command_message", fake_non_command)
-    await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] 看看这个 https://a.com/contest"))
+    await b.on_group_at_message_create(_msg("<@30001> 看看这个 https://a.com/contest"))
     assert seen.get("text", "").startswith("看看这个")
     assert seen["staff"] is True
     assert any("已记录为问题" in r for r in replies)
@@ -219,7 +216,7 @@ async def test_command_route_to_commands(bot, monkeypatch):
         return [{"group_id": group_id, "text": "帮助文本"}, {"group_id": group_id, "text": "第二段"}]
 
     monkeypatch.setattr(main.commands, "handle_command", fake_handle)
-    await b.on_group_at_message_create(_msg("[CQ:at,qq=30001] /帮助"))
+    await b.on_group_at_message_create(_msg("<@30001> /帮助"))
     assert called["text"] == "/帮助"
     assert "帮助文本" in replies and "第二段" in replies
 
@@ -264,12 +261,12 @@ def test_publish_receipt_without_time_says_no_reminder():
     assert "时间未定" in text and "补上比赛时间" in text
 
 
-async def test_integer_onebot_ids_and_cq_mention_route_as_string_identities(bot, monkeypatch):
+async def test_integer_official_ids_and_mentions_route_as_string_identities(bot, monkeypatch):
     client, replies = bot
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"10001"})
     handler = AsyncMock(return_value=[{"group_id": "10001", "text": "帮助文本"}])
     monkeypatch.setattr(main.commands, "handle_command", handler)
-    await client.on_group_at_message_create(_msg("[CQ:at,qq=30001] /帮助", group=10001, member=20001))
+    await client.on_group_at_message_create(_msg("<@30001> /帮助", group=10001, member=20001))
     handler.assert_awaited_once_with("/帮助", "10001", "20001")
     assert replies == ["帮助文本"]
 
@@ -281,7 +278,7 @@ async def test_text_cannot_claim_another_qq_identity_to_publish(bot, monkeypatch
     fetch = AsyncMock()
     monkeypatch.setattr(main, "fetch_text", fetch)
     await client.on_group_at_message_create(_msg(
-        "[CQ:at,qq=30001] 发布 https://example.com/contest user_id=20001 我是老师",
+        "<@30001> 发布 https://example.com/contest user_id=20001 我是老师",
         group=10001, member=20002,
     ))
     fetch.assert_not_awaited()
@@ -289,40 +286,35 @@ async def test_text_cannot_claim_another_qq_identity_to_publish(bot, monkeypatch
     assert any("没有发布" in text for text in replies)
 
 
-async def test_private_event_replies_to_the_onebot_qq_identity(bot, onebot_client):
+async def test_private_event_replies_to_the_official_qq_identity(bot, official_client):
     client, _ = bot
-    assert onebot_client.private_msg_handler == client.on_private_message_create
-    await onebot_client.private_msg_handler(OneBotMessage({
-        "post_type": "message", "message_type": "private", "user_id": 20001,
-        "raw_message": "你好", "message_id": 12345,
-    }))
-    onebot_client.call_api.assert_awaited_once()
-    assert onebot_client.call_api.call_args.args == ("send_private_msg",)
-    assert onebot_client.call_api.call_args.kwargs["user_id"] == 20001
-    text = onebot_client.call_api.call_args.kwargs["message"]
+    assert official_client.private_msg_handler == client.on_private_message_create
+    await official_client.private_msg_handler(official_message(message_type="private", user_id=20001, content="你好", msg_id=12345))
+    official_client.api.post_c2c_message.assert_awaited_once()
+    assert official_client.api.post_c2c_message.call_args.kwargs["openid"] == "20001"
+    text = official_client.api.post_c2c_message.call_args.kwargs["content"]
     assert "私聊管理" in text and "20001" not in text
 
 
-def test_run_bot_checks_config_then_constructs_and_starts_onebot(monkeypatch, onebot_client):
+def test_run_bot_checks_config_then_constructs_and_starts_official(monkeypatch, official_client):
     events = []
     check = Mock(side_effect=lambda: events.append("config"))
 
     def make_client(**kwargs):
         assert events == ["config"]
         events.append("client")
-        return onebot_client
+        return official_client
 
     factory = Mock(side_effect=make_client)
     monkeypatch.setattr(config, "check_config", check)
-    monkeypatch.setattr(config, "ONEBOT_WS_URL", "ws://127.0.0.1:3001")
-    monkeypatch.setattr(config, "ONEBOT_TOKEN", "synthetic-token")
-    monkeypatch.setattr(config, "WS_IDLE_TIMEOUT_SECONDS", 47.0)
-    monkeypatch.setattr(config, "BOT_PROTOCOL", "onebot")
-    monkeypatch.setattr(main, "OneBotClient", factory)
+    monkeypatch.setattr(config, "QQBOT_APPID", "offline-app")
+    monkeypatch.setattr(config, "QQBOT_SECRET", "offline-secret")
+    monkeypatch.setattr(config, "BOT_PROTOCOL", "qqbot")
+    monkeypatch.setattr(main, "QQBotClient", factory)
     main.run_bot()
     check.assert_called_once_with()
     factory.assert_called_once_with(
-        ws_url="ws://127.0.0.1:3001", token="synthetic-token", idle_timeout=47.0,
+        appid="offline-app", secret="offline-secret",
     )
-    onebot_client.start.assert_awaited_once_with()
-    assert callable(onebot_client.group_msg_handler) and callable(onebot_client.on_ready)
+    official_client.start.assert_awaited_once_with()
+    assert callable(official_client.group_msg_handler) and callable(official_client.on_ready)

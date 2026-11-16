@@ -56,28 +56,23 @@ async def test_social_output_filtered(monkeypatch):
     assert await llm.answer_social_chat("你好") == config.QA_OUTPUT_FILTERED_REPLY
 
 
-async def test_group_social_skips_publish_classifier_and_obeys_blacklist(monkeypatch, onebot_client):
+async def test_group_social_skips_publish_classifier_and_obeys_blacklist(monkeypatch, official_client):
     from cdutetc import main
-    from cdutetc.clients.onebot import OneBotMessage
+    from conftest import official_message
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
     monkeypatch.setattr(config, "SUPER_ADMIN", {"teacher"})
     monkeypatch.setattr(config, "QA_WHITELIST", set())
     monkeypatch.setattr(config, "QA_BLACKLIST", set())
     monkeypatch.setattr(config, "QA_SOCIAL_CHAT_ENABLED", True)
     monkeypatch.setattr(config, "NL_INTENT_ENABLED", True)
-    monkeypatch.setattr(config, "BOT_QQ", "")
     classifier = AsyncMock()
     social = AsyncMock(return_value="嗨！")
     monkeypatch.setattr(llm, "classify_intent", classifier)
     monkeypatch.setattr(llm, "answer_social_chat", social)
-    bot = main.ACMBot(onebot_client)
+    bot = main.ACMBot(official_client)
     reply = AsyncMock()
     monkeypatch.setattr(bot, "_safe_reply", reply)
-    msg = OneBotMessage({
-        "post_type": "message", "message_type": "group", "message_id": 1,
-        "group_id": "g1", "user_id": "teacher", "self_id": 30001,
-        "raw_message": "[CQ:at,qq=30001] 你好",
-    })
+    msg = official_message(message_type="group", msg_id=1, group_id="g1", user_id="teacher", bot_id=30001, content="<@30001> 你好")
     await bot.on_group_at_message_create(msg)
     classifier.assert_not_awaited()
     social.assert_awaited_once()
@@ -123,9 +118,9 @@ def test_statements_are_not_automatically_questions(text):
 
 @pytest.mark.parametrize("staff", [False, True])
 @pytest.mark.parametrize("text", ["还可爱呢", "今天好开心", "ACM太难了", "收到"])
-async def test_real_group_banter_has_no_question_or_model_cost(monkeypatch, onebot_client, tmp_path, staff, text):
+async def test_real_group_banter_has_no_question_or_model_cost(monkeypatch, official_client, tmp_path, staff, text):
     from cdutetc import main
-    from cdutetc.clients.onebot import OneBotMessage
+    from conftest import official_message
     monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "chat.sqlite"))
     database.init_db()
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
@@ -138,18 +133,13 @@ async def test_real_group_banter_has_no_question_or_model_cost(monkeypatch, oneb
     monkeypatch.setattr(config, "QA_SOCIAL_CHAT_USE_LLM", False)
     monkeypatch.setattr(config, "QA_FAQ_LLM_ENABLED", True)
     monkeypatch.setattr(config, "NL_INTENT_ENABLED", True)
-    monkeypatch.setattr(config, "BOT_QQ", "")
     database.add_faq("g1", "ACM怎么报名", "找老师报名")
     chat = AsyncMock(side_effect=AssertionError("闲聊不应调用模型"))
     monkeypatch.setattr(llm, "_chat_once", chat)
-    bot = main.ACMBot(onebot_client)
+    bot = main.ACMBot(official_client)
     reply = AsyncMock()
     monkeypatch.setattr(bot, "_safe_reply", reply)
-    message = OneBotMessage({
-        "post_type": "message", "message_type": "group", "message_id": 1,
-        "group_id": "g1", "user_id": "teacher" if staff else "member", "self_id": 30001,
-        "raw_message": f"[CQ:at,qq=30001] {text}",
-    })
+    message = official_message(message_type="group", msg_id=1, group_id="g1", user_id="teacher" if staff else "member", bot_id=30001, content=f"<@30001> {text}")
     await bot.on_group_at_message_create(message)
     chat.assert_not_awaited()
     assert database.list_unanswered("g1") == []

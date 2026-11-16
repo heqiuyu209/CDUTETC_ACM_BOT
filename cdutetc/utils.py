@@ -5,11 +5,9 @@ import re
 from cdutetc import config
 from cdutetc.publish_text import is_publication_question, is_timed_reminder_request
 
-# QQ 群消息中的 @ 片段：OneBot CQ 码 [CQ:at,qq=...] 与官方协议 <@id>。
-# 官方协议的 id 是 openid（非纯数字），因此不能按数字匹配；
-# 旧版 botpy 的 <@!id> 文本语法不会再产生，故不再兼容解析（(?!\!) 排除）。
-_AT_PATTERN = re.compile(r"\[CQ:at,qq=[^\]]*\]|<@(?!\!)[^>\s]+>")
-_AT_TARGET_PATTERN = re.compile(r"\[CQ:at,qq=([^,\]]+)(?:,[^\]]*)?\]|<@(?!\!)([^>\s]+)>")
+# 官方正文中的 @ 文本用于清理与识别目标；是否指向本机由平台标记决定。
+_AT_PATTERN = re.compile(r"<@(?!\!)[^>\s]+>")
+_AT_TARGET_PATTERN = re.compile(r"<@(?!\!)([^>\s]+)>")
 # 链接匹配
 _LINK_PATTERN = re.compile(r"https?://\S+")
 
@@ -20,8 +18,8 @@ def strip_at(content: str) -> str:
 
 
 def mentioned_user_ids(content: str) -> set[str]:
-    """读取 @ 目标（CQ 码或 <@id>），按完整账号标识匹配。"""
-    return {m.group(1) or m.group(2) for m in _AT_TARGET_PATTERN.finditer(content)}
+    """读取官方文本 @ 目标（<@id>），按完整账号标识匹配。"""
+    return {m.group(1) for m in _AT_TARGET_PATTERN.finditer(content)}
 
 
 def message_mentions(message) -> list[dict]:
@@ -45,19 +43,10 @@ def message_mentions(message) -> list[dict]:
     return normalized
 
 
-def is_addressed_to_bot(message, bot_identity: str = "") -> bool:
-    """判定本条消息是否 @ 到本机器人（协议无关）。
-
-    官方协议的 mention 带平台 is_you 标记，直接采信；OneBot 的 @ 目标是
-    QQ 号，用自身账号比对。两条路径统一走本函数，业务层不再自解析。
-    """
-    identity = str(bot_identity or "")
-    mentions = message_mentions(message)
-    if any(item["is_you"] for item in mentions):
-        return True
-    if identity and any(item["id"] == identity for item in mentions):
-        return True
-    return bool(getattr(message, "always_addressed", False))
+def is_addressed_to_bot(message) -> bool:
+    """只采信官方群 @ 事件或平台的 is_you 标记，正文不能冒充平台定向消息。"""
+    return (any(item["is_you"] for item in message_mentions(message))
+            or getattr(message, "always_addressed", False) is True)
 
 
 def extract_url(content: str) -> str | None:
@@ -110,10 +99,7 @@ def match_publish_command(text: str, cmd: str = "发布") -> str | None:
 def is_valid_account_id(value: str | None) -> bool:
     """群/人标识是否合法。
 
-    兼容两种接入协议：
-    - OneBot（NapCat）：QQ 群号 / QQ 号，纯数字；
-    - QQ 官方机器人：group_openid / member_openid，十六进制字母数字混排。
-    因此不能只判断 isdigit，否则官方机器人的 openid 会被误判为非法。
+    OpenID 为不透明字符串；此处只校验可存储格式，授权入口另行拒绝误填的短群号。
     """
     if not value:
         return False

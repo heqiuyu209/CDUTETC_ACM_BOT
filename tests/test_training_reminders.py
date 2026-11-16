@@ -51,7 +51,7 @@ async def test_course_command_enters_actual_main_reminder_job(db, monkeypatch):
             return NOW
     monkeypatch.setattr(reminder, "datetime", Clock)
     client = SimpleNamespace(send_group_msg_result=AsyncMock(
-        return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
+        return_value=DeliveryResult.sent("qqbot", DeliveryMode.ACTIVE, "sent")
     ))
     bot = main.ACMBot(client)
     await bot._general_remind_job()

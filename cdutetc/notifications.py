@@ -3,8 +3,7 @@
 Main code can call send_group/send_private and consume DeliveryResult; the active
 or passive mode is explicit. No passive-to-active fallback is performed.
 
-协议差异一律读 client 的能力位（见 ``clients/base.py``），本模块不再判断
-``config.BOT_PROTOCOL``。
+使用官方客户端契约（见 ``clients/base.py``）。
 """
 
 from __future__ import annotations
@@ -80,7 +79,7 @@ async def send_group(client, group_id: str, text: str, *, reply_to: str | None =
         return DeliveryResult(False, DeliveryCode.INVALID_REQUEST, _protocol(client), mode,
                               detail="invalid_message_format")
     if message_format == "markdown":
-        # markdown 是官方群通道的能力，OneBot 纯文本不提供该通道。
+        # 缺少 Markdown 接口的测试替身或扩展客户端返回明确的不可用结果。
         if not capabilities_of(client).supports_markdown:
             return _unsupported(client, mode)
         return await _send_with_timeout(
@@ -96,15 +95,14 @@ async def send_group(client, group_id: str, text: str, *, reply_to: str | None =
 
 
 async def send_group_image(client, group_id: str, image: str, *,
-                           local: bool, reply_to: str | None = None,
+                           reply_to: str | None = None,
                            reply_seq: int = 1) -> DeliveryResult:
-    """本地图片或已上传的 file_info，共用文本发送的超时和回复参数校验。"""
+    """发送已上传的 file_info，共用文本发送的超时和回复参数校验。"""
     mode = DeliveryMode.PASSIVE if reply_to is not None else DeliveryMode.ACTIVE
     if reply_to == "":
         return DeliveryResult(False, DeliveryCode.INVALID_REQUEST, _protocol(client), mode,
                               detail="empty_reply_to")
-    method = "send_group_image_result" if local else "send_group_media_result"
-    detailed = getattr(client, method, None)
+    detailed = getattr(client, "send_group_media_result", None)
     if not callable(detailed):
         return _unsupported(client, mode)
     return await _send_with_timeout(

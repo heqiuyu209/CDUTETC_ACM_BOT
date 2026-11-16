@@ -8,9 +8,9 @@
 
 成都理工大学工程技术学院 ACM 集训队 QQ 群机器人：老师发布比赛链接 → 抓取、提取、超管确认后存档；按群控制资料可见与通知范围；征集登记自动统计；主动提醒默认开启，公共来源自动抓取可选。
 
-技术栈：Python 3.10+ / 双接入协议（OneBot-NapCat 或个人 QQ ｜ QQ 开放平台官方机器人） / SQLite / OpenAI 兼容大模型 API / APScheduler。
+技术栈：Python 3.10+ / QQ 开放平台官方机器人（botpy） / SQLite / OpenAI 兼容大模型 API / APScheduler。
 
-> 接入协议由 `ACM_BOT_PROTOCOL` 切换：`onebot`（默认，功能完整，需偶尔扫码）或 `qqbot`（官方机器人，稳定不扫码，主动消息受平台配额限制）。业务逻辑完全一致。
+> 仅支持 QQ 官方机器人，使用 AppID 与 AppSecret 登录；主动消息受平台权限和配额限制。
 
 ## 功能总览
 
@@ -70,9 +70,9 @@
 
 发布和审批回执显示实际目标群及每群发送结果（最多展开10项），目标为空或范围读取失败会明确说明，不会显示“已发送0/0”。超管私聊 `/修正` 后，管理回执仍回私聊，修正通知主动发到该比赛的目标群，包括管理群；不会通知范围外的群。缺少比赛时间不阻止审批后的即时发布通知，但不会创建定时开赛提醒。
 
-### 双协议保持可切换
+### QQ 官方机器人接入
 
-`ACM_BOT_PROTOCOL=onebot` 使用 NapCat/OneBot；`qqbot` 使用 QQ 开放平台 botpy。配置协议后需重启，不会同时登录两个接入。两套身份标识不同：OneBot填QQ号/群号，官方填对应 openid，不能直接复用QQ号。
+默认安装已包含官方 SDK，无需选择协议。群授权使用 group_openid，老师与超管使用平台成员 OpenID，不能把 QQ 号或群号直接当作 OpenID。旧 `.env` 中的协议选择、WebSocket 地址、token 与机器人 QQ 号均不再读取，可用 `python scripts/check_env.py` 检查遗留配置。已有官方凭据、白名单、通知格式和权限暂停记录继续沿用。
 
 官方群同时兼容 `GROUP_AT_MESSAGE_CREATE` 与 `GROUP_MESSAGE_CREATE`。后者可能包含未 @ 机器人的群聊，只有平台 `mentions.is_you=true` 才标记喊话；默认普通群聊不回复、不调用模型。同一群内同一消息的新旧事件去重处理。botpy 缺少全量事件解析器时，本项目在登录后、网关连接前为当前连接补齐，保留原始 `mentions`；已原生支持时不覆盖，也不修改已安装的 SDK 文件。解析入口对照 [官方 ConnectionState](https://github.com/tencent-connect/botpy/blob/master/botpy/connection.py) 与 [网关分发](https://github.com/tencent-connect/botpy/blob/master/botpy/gateway.py)，全量消息的 @ 判断对照 [AstrBot 官方 QQ 适配](https://github.com/AstrBotDevs/AstrBot/blob/master/astrbot/core/platform/sources/qqofficial/qqofficial_platform_adapter.py)。
 
@@ -89,7 +89,7 @@
 - [NoneBot QQ 适配器](https://github.com/nonebot/adapter-qq/blob/master/nonebot/adapters/qq/bot.py) 和 [官方 botpy](https://github.com/tencent-connect/botpy/blob/master/botpy/api.py) 同样调用 `POST /v2/groups/{group_openid}/messages`，主动消息不依赖 `msg_id`。本项目沿用这一路径；换 SDK 预计不能解决服务端权限拒绝。botpy 的部分异常只保留中文消息，本项目兼容识别该形状并保留受控错误码。
 - [AstrBot 的同类实测讨论](https://github.com/AstrBotDevs/AstrBot/issues/10454) 也报告群主动消息返回 `40034105`。`is_wakeup` 属于单聊召回能力，当前群发送接口没有这个字段，不作为群定时提醒的替代方案。旧版文档与当前文档存在差异，以现行接口和目标机器人的真实回执为准。
 - 腾讯官方插件的 [同类问题讨论](https://github.com/tencent-connect/openclaw-qqbot/issues/43) 曾有平台限制的维护者回复，也有找不到配置入口的用户反馈。这些历史案例不能证明当前所有应用都不可用。应先完成目标群、发送格式、独立序号和实际群开关的对照测试；仍被拒绝时，再通过官方文档页底的开发者社区，提供应用信息、请求时间和 `trace_id` 请平台核查，不凭空假定后台必有自助开通入口。不要公开 AppSecret 或 access_token。
-- 群里开启“允许主动发送”后，先执行主动测试；返回“平台已接受”且群内收到独立测试消息，再用未来的比赛验证定时投递。如果仍是 `40034105`，应继续核实平台权限，或评估已有的 NapCat/OneBot 接入。后者使用登录中的普通 QQ 账号，需要维护登录和重连；提醒、FAQ 与审批逻辑可沿用，但白名单及既有按群数据需要显式映射，不能直接把 OpenID 当 QQ 号使用。当前不会自动切换协议。
+- 群主开启“允许主动发送”后，可执行主动测试；根据平台回执与目标群实际收信确认，再验证未来比赛的定时提醒。
 
 ## 消息指令
 
@@ -191,17 +191,12 @@ python scripts/export_collection.py --group-id '群openid' --collection-id 1 --o
 
 | 变量 | 必填 | 默认 | 说明 |
 |------|------|------|------|
-| `ACM_BOT_PROTOCOL` | 否 | `onebot` | 接入协议：`onebot`（NapCat）或 `qqbot`（QQ 开放平台官方机器人） |
-| `ACM_QQBOT_APPID` | qqbot 必填 | - | 官方机器人 AppID |
-| `ACM_QQBOT_SECRET` | qqbot 必填 | - | 官方机器人 AppSecret |
-| `ACM_ONEBOT_WS_URL` | **是** | - | OneBot/NapCat 正向 WebSocket 地址，如 `ws://127.0.0.1:3001` |
+| `ACM_QQBOT_APPID` | **是** | - | 官方机器人 AppID |
+| `ACM_QQBOT_SECRET` | **是** | - | 官方机器人 AppSecret |
 | `ACM_LLM_API_KEY` | **是** | - | 大模型 API Key（OpenAI 兼容） |
-| `ACM_ONEBOT_TOKEN` | 否 | 空 | OneBot 鉴权 token，与 NapCat 配置一致 |
-| `ACM_BOT_QQ` | 否 | 空 | 机器人自身 QQ 号；留空用 OneBot 事件 `self_id` |
-| `ACM_WS_IDLE_TIMEOUT_SECONDS` | 否 | `180` | WebSocket 静默超时（秒），超时主动重连，兜住 TCP 半开导致的「突然不回消息」；`0` 关闭 |
-| `ACM_ALLOWED_GROUPS` | 否 | 空 | 允许服务的群号（逗号分隔）。**未配置 = 不服务任何群** |
-| `ACM_SUPER_ADMIN` | 否 | 空 | 超管 QQ 号（逗号分隔）：`/修正`、审批发布、私聊管理命令。**未配置 = 无任何超管权限** |
-| `ACM_TEACHER_WHITELIST` | 否 | 空 | 老师 QQ 号（逗号分隔）：发布比赛、课程/FAQ/征集管理。**未配置 = 无任何老师权限** |
+| `ACM_ALLOWED_GROUPS` | 否 | 空 | 允许服务的 group_openid（逗号分隔）。**未配置 = 不服务任何群** |
+| `ACM_SUPER_ADMIN` | 否 | 空 | 超管成员 OpenID（逗号分隔）：`/修正`、审批发布、私聊管理命令。**未配置 = 无任何超管权限** |
+| `ACM_TEACHER_WHITELIST` | 否 | 空 | 老师 member_openid（逗号分隔）：发布比赛、课程/FAQ/征集管理。**未配置 = 无任何老师权限** |
 | `ACM_ADMIN_GROUP` | 否 | 空 | 超管私聊执行管理命令作用的群；留空取 `ALLOWED_GROUPS` 排序首个 |
 | `ACM_NOTICE_UNAUTHORIZED_GROUP` | 否 | `1` | 未授权群被 @ 或发命令时回一句带群号的提示，便于取号后 `/加群` |
 | `ACM_NOTICE_UNAUTHORIZED_INTERVAL` | 否 | `60` | 同一未授权群提示的最小间隔（秒） |
@@ -267,7 +262,7 @@ python scripts/export_collection.py --group-id '群openid' --collection-id 1 --o
 1. 拉取代码后**直接运行** `python scripts/check_env.py` 或 `python main.py`：
    若没有 `.env`，程序会按 `.env.example` 自动生成一份，然后把当前缺哪些必填项列出来。
 2. 新版本新增的配置项会**自动追加**到已有 `.env` 末尾（只补缺失键，绝不覆盖你已填的值）。
-3. 按提示填好 `ACM_ONEBOT_WS_URL`、`ACM_LLM_API_KEY`、`ACM_ALLOWED_GROUPS`、
+3. 按提示填好 `ACM_QQBOT_APPID`、`ACM_QQBOT_SECRET`、`ACM_LLM_API_KEY`、`ACM_ALLOWED_GROUPS`、
    `ACM_SUPER_ADMIN`、`ACM_TEACHER_WHITELIST`，再跑一次体检脚本确认即可启动。
 
 ```bash
@@ -336,14 +331,14 @@ python -m playwright install chromium
 - **主动通知待真实联调**：真实发送接口已接入，默认开启（`ACM_GROUP_ACTIVE_MESSAGES_ENABLED=0` 可关闭）；平台未授权、接收群拒绝、机器人离线或频控均可能导致发送失败，反馈以接口回执为准。
 - **模型提取可能幻觉**：字段可能不准确，默认先由超管确认，发布后可 `/修正`；部署时关闭发布确认会跳过人工把关。
 - **旧库记录归属为空**：旧版 `contests` 表迁移后旧记录不归属任何群、不参与提醒，需管理员人工按需迁移。
-- **老师身份手工配置**：老师白名单基于 OneBot 的成员 QQ 号（`user_id`），需部署时手工收集 QQ 号填入 `ACM_TEACHER_WHITELIST`，暂不支持自动识别群管理员。
+- **老师身份手工配置**：使用平台 member_openid 填入 `ACM_TEACHER_WHITELIST`，或由超管通过 `/加老师` 授权；暂不自动识别群管理员。
 
 ## 待平台授权 / 当前限制
 
-- **启用群主动消息**：设置 `ACM_GROUP_ACTIVE_MESSAGES_ENABLED=1`，并确认当前协议已连接。OneBot 通过 NapCat 的 `send_group_msg` 发送；官方 QQ 通过群消息接口发送，还受机器人权限与目标群“允许主动发送”设置控制。仅返回有效消息 ID 才确认平台接受；权限、频控、超时或空回执均不标记为已发送。已有权限暂停的群需由超管主动测试成功后恢复。
+- **启用群主动消息**：设置 `ACM_GROUP_ACTIVE_MESSAGES_ENABLED=1`，并确认官方客户端已连接。通过官方群消息接口发送，还受机器人权限与目标群“允许主动发送”设置控制。仅返回有效消息 ID 才确认平台接受；权限、频控、超时或空回执均不标记为已发送。已有权限暂停的群需由超管主动测试成功后恢复。
 - **关闭与失败反馈**：设置 `ACM_GROUP_ACTIVE_MESSAGES_ENABLED=0` 时，发布和修正仍保存资料并回复触发群，跨群通知明确显示未发送；定时提醒暂停，不消耗投递重试次数。老师可用 `/提醒状态` 查看启用状态。启用后每个目标群独立投递，一个群失败不阻止其他群，结果显示已确认发送的数量。
 - **群通知与 @全体**：本项目使用文本或本群已验证的原生 Markdown 发送普通通知，未实现全员提醒。参见 [官方群消息接口](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html) 与 [消息收发概述](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html)。
-- **老师身份来源**：目前老师白名单以 OneBot 的成员 QQ 号（`user_id`）为准，需在部署环境将老师 QQ 号配置进 `ACM_TEACHER_WHITELIST`；如 QQ 侧能提供群管理员角色字段，可进一步自动识别管理员。
+- **老师身份来源**：只采信官方事件中的成员 OpenID；QQ 号可用于认领后的显示与查找，不代替平台授权身份。
 - **个人信息日志**：默认不记录群号、QQ 号和消息内容；初次部署采集白名单时可临时设置 `ACM_DEBUG_LOG_IDENTITY=1` 开启调试日志，采集完成后请关闭。
 - **公共来源抓取**：`/抓取一次` 与周期抓取会真实调用抓取层（SSRF 防护生效）；无法访问目标站点时记录 error，可用 `/抓取状态` 查看。v2 自动抓取结果不自动通知群。
 - **模型提取质量**：比赛信息由大模型提取生成，可能包含幻觉；超管确认前不会入库、不会通知各群。
@@ -362,7 +357,7 @@ python -m playwright install chromium
 ├── requirements-dev.txt        开发与测试依赖
 ├── requirements-web-scraping.txt  独立抓取脚本 web_scraping.py 的额外依赖
 ├── cdutetc/                    机器人业务包
-│   ├── clients/                OneBot / QQ 官方机器人客户端
+│   ├── clients/                QQ 官方机器人客户端
 │   ├── config.py               配置与环境变量解析、启动前校验
 │   ├── commands.py             斜杠命令分发与帮助
 │   ├── database.py             SQLite 存取、数据模型与旧库迁移
@@ -377,7 +372,7 @@ python -m playwright install chromium
 │   ├── roles.py                运行时白名单与角色管理
 │   ├── utils.py                文本解析与权限判断
 │   └── main.py                 机器人客户端、消息路由、定时任务
-├── scripts/                    配置检查、协议切换与数据导出工具
+├── scripts/                    配置检查与数据导出工具
 ├── tests/                      离线测试（pytest + pytest-asyncio）
 ├── README.md                   项目说明
 ├── PRODUCT_SPEC.md             产品约束与验收边界

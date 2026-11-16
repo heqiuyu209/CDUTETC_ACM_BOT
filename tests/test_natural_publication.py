@@ -1,4 +1,4 @@
-"""复现真实发布语句：时间解析、双协议确认、批准与主动提醒全链路。"""
+"""复现真实发布语句：时间解析、官方协议确认、批准与主动提醒全链路。"""
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -8,7 +8,6 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from cdutetc import commands, config, database, llm, main, reminder
-from cdutetc.clients.onebot import OneBotClient, OneBotMessage
 from cdutetc.clients.qqbot import QQBotClient, QQBotMessage
 from cdutetc.errors import DeliveryCode, DeliveryMode, DeliveryResult
 from cdutetc.publish_text import parse_simple_publication
@@ -26,25 +25,18 @@ USER_PHRASES = [
 
 
 def group_message(protocol, text, member="admin"):
-    if protocol == "qqbot":
-        return QQBotMessage(None, message_type="group", group_id="g1", user_id=member,
-                            content=text, msg_id="group-inbound", always_addressed=True)
-    return OneBotMessage({"message_type": "group", "message_id": "group-inbound", "self_id": "bot",
-                          "group_id": "g1", "user_id": member, "raw_message": f"[CQ:at,qq=bot] {text}"})
+    return QQBotMessage(None, message_type="group", group_id="g1", user_id=member,
+                        content=text, msg_id="group-inbound", always_addressed=True)
 
 
 def private_message(protocol, text, msg_id="approve-inbound"):
-    if protocol == "qqbot":
-        return QQBotMessage(None, message_type="private", user_id="admin", content=text, msg_id=msg_id)
-    return OneBotMessage({"message_type": "private", "message_id": msg_id, "user_id": "admin", "raw_message": text})
+    return QQBotMessage(None, message_type="private", user_id="admin", content=text, msg_id=msg_id)
 
 
-@pytest.fixture(params=["onebot", "qqbot"])
-def app(request, monkeypatch, tmp_path):
-    protocol = request.param
+@pytest.fixture
+def app(monkeypatch, tmp_path):
+    protocol = "qqbot"
     monkeypatch.setattr(config, "BOT_PROTOCOL", protocol)
-    # 自身标识统一走配置：OneBot 用例的 @ 目标是 "bot"。
-    monkeypatch.setattr(config, "BOT_QQ", "bot")
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2"})
     monkeypatch.setattr(config, "SUPER_ADMIN", {"admin"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
@@ -73,24 +65,14 @@ def app(request, monkeypatch, tmp_path):
     monkeypatch.setattr(llm, "_chat_once", chat)
     monkeypatch.setattr(llm, "classify_intent", classifier)
     monkeypatch.setattr(commands, "handle_non_command_message", qa)
-    if protocol == "qqbot":
-        api = SimpleNamespace(post_group_message=AsyncMock(return_value={"id": "group-sent"}),
-                              post_c2c_message=AsyncMock(return_value={"id": "private-sent"}))
-        client = QQBotClient("offline-app", "offline-secret")
-        client._client = SimpleNamespace(api=api)
-        def private_calls():
-            return [call.kwargs for call in api.post_c2c_message.await_args_list]
-        def group_texts():
-            return [call.kwargs["content"] for call in api.post_group_message.await_args_list]
-    else:
-        client = OneBotClient("ws://127.0.0.1:3001")
-        client._ws = object()
-        client.call_api = AsyncMock(return_value={"status": "ok", "retcode": 0, "data": {"message_id": 123}})
-        def private_calls():
-            return [{"openid": call.kwargs["user_id"], "content": call.kwargs["message"]}
-                    for call in client.call_api.await_args_list if call.args[0] == "send_private_msg"]
-        def group_texts():
-            return [call.kwargs["message"] for call in client.call_api.await_args_list if call.args[0] == "send_group_msg"]
+    api = SimpleNamespace(post_group_message=AsyncMock(return_value={"id": "group-sent"}),
+                          post_c2c_message=AsyncMock(return_value={"id": "private-sent"}))
+    client = QQBotClient("offline-app", "offline-secret")
+    client._client = SimpleNamespace(api=api)
+    def private_calls():
+        return [call.kwargs for call in api.post_c2c_message.await_args_list]
+    def group_texts():
+        return [call.kwargs["content"] for call in api.post_group_message.await_args_list]
     return SimpleNamespace(bot=main.ACMBot(client), protocol=protocol, clock=clock, chat=chat, qa=qa,
                            classifier=classifier, private_calls=private_calls, group_texts=group_texts)
 

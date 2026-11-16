@@ -1,7 +1,7 @@
 """官方机器人适配层测试：消息映射与发送行为，不需要安装 botpy。
 
-重点验证：wrap_* 产出的对象字段与 OneBotMessage 对齐，且
-always_addressed=True —— 否则 main 的「必须 @才响应」判断会把消息丢掉。
+重点验证：wrap_* 正确映射平台字段，群 @ 事件带 always_addressed=True，
+使业务层保留平台已确认的定向消息标记。
 """
 
 from types import SimpleNamespace

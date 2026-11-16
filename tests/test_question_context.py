@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cdutetc import config, database, llm, main
-from cdutetc.clients.onebot import OneBotMessage
+from conftest import official_message
 
 
 @pytest.fixture
@@ -21,11 +21,10 @@ def memory_db(monkeypatch):
 
 
 @pytest.fixture
-def bot(memory_db, monkeypatch, onebot_client):
+def bot(memory_db, monkeypatch, official_client):
     monkeypatch.setattr(config, "PUBLISH_CONFIRM_ENABLED", False)
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
-    monkeypatch.setattr(config, "BOT_QQ", "")
     # 五层防护默认开启：本组用例聚焦旧问答链路，显式关闭白名单与限流
     # 以保持原有“普通成员可连续提问”的覆盖（两层的专门行为由 test_answer_gates 覆盖）
     monkeypatch.setattr(config, "QA_WHITELIST_ENABLED", False)
@@ -33,7 +32,7 @@ def bot(memory_db, monkeypatch, onebot_client):
     monkeypatch.setattr(config, "QA_MEMBER_KB_ONLY", True)
     monkeypatch.setattr(config, "GROUP_REQUIRE_AT", True)
     monkeypatch.setattr(config, "NL_INTENT_ENABLED", False)
-    client = main.ACMBot(onebot_client)
+    client = main.ACMBot(official_client)
     replies = []
 
     async def reply(message, content):
@@ -48,10 +47,7 @@ def bot(memory_db, monkeypatch, onebot_client):
 
 
 def _message(content, group_id="g1", member_id="teacher"):
-    return OneBotMessage({"post_type": "message", "message_type": "group",
-                         "raw_message": f"[CQ:at,qq=30001] {content}",
-                         "group_id": group_id, "user_id": member_id,
-                         "message_id": 12345, "self_id": 30001})
+    return official_message(message_type="group", content=f"<@30001> {content}", group_id=group_id, user_id=member_id, msg_id=12345, bot_id=30001)
 
 
 def _public(name="正式校赛", **overrides):
