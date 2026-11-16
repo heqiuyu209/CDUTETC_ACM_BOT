@@ -33,7 +33,7 @@ async def bot(memory_db, monkeypatch):
     monkeypatch.setattr(config, "WEEKLY_CONTEST_END", "21:00")
     monkeypatch.setattr(config, "WEEKLY_CONTEST_TEMPLATE", "ACM 周赛（本周）")
     client = main.ACMBot(SimpleNamespace(send_group_msg_result=AsyncMock(
-        return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
+        return_value=DeliveryResult.sent("qqbot", DeliveryMode.ACTIVE, "sent")
     )))
     monkeypatch.setattr(
         client, "_send_group_result",
@@ -84,7 +84,7 @@ async def test_same_week_remains_idempotent_after_restart_and_amendment(bot, mem
 
     await bot._weekly_contest_job(now=_now())
     restarted = main.ACMBot(SimpleNamespace(send_group_msg_result=AsyncMock(
-        return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
+        return_value=DeliveryResult.sent("qqbot", DeliveryMode.ACTIVE, "sent")
     )))
     await restarted._weekly_contest_job(now=_now())
 

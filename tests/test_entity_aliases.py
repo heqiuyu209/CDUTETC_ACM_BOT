@@ -22,7 +22,7 @@ from cdutetc import (
     main,
     notifications,
 )
-from cdutetc.clients.onebot import OneBotMessage
+from conftest import official_message
 from cdutetc.clients.qqbot import QQBotClient, QQBotMessage
 
 
@@ -193,15 +193,12 @@ async def test_claim_without_qq_message_id_never_sends_active_message(memory_db,
 
 
 @pytest.mark.parametrize("target,expected", [("30001", True), ("30002", False)])
-async def test_unauthorized_onebot_claim_checks_mention(memory_db, monkeypatch, target, expected):
-    monkeypatch.setattr(config, "BOT_PROTOCOL", "onebot")
-    monkeypatch.setattr(config, "BOT_QQ", "30001")
+async def test_unauthorized_official_claim_checks_mention(memory_db, monkeypatch, target, expected):
+    monkeypatch.setattr(config, "BOT_PROTOCOL", "qqbot")
     monkeypatch.setattr(config, "GROUP_REQUIRE_AT", True)
     monkeypatch.setattr(notifications, "send_group", AsyncMock(return_value=True))
     bot = main.ACMBot()
-    message = OneBotMessage({"post_type": "message", "message_type": "group",
-                             "raw_message": f"[CQ:at,qq={target}] /认领此群 123456789 集训队群",
-                             "group_id": GROUP, "user_id": "admin", "message_id": 123})
+    message = official_message(message_type="group", content=f"<@{target}> /认领此群 123456789 集训队群", group_id=GROUP, user_id="admin", msg_id=123)
     await bot.on_group_at_message_create(message)
     assert (GROUP in config.ALLOWED_GROUPS) is expected
 

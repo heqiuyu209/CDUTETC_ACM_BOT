@@ -40,8 +40,8 @@ class FakeMessage:
     """最小群消息替身：只提供 extract_image_refs 需要的两个属性。"""
 
     def __init__(self, urls, content="") -> None:
-        self.raw = {"message": [
-            {"type": "image", "data": {"url": url, "file": url.rsplit("/", 1)[-1]}}
+        self.raw = {"attachments": [
+            {"url": url, "filename": url.rsplit("/", 1)[-1], "content_type": "image/png"}
             for url in urls
         ]}
         self.content = content
@@ -443,15 +443,11 @@ def test_resolve_prefers_tag_matched_file(tmp_path, monkeypatch):
     assert trigger.relative_path.endswith("绝杀_12345678.png")
 
 
-def test_resolve_without_base_url_can_skip_url(tmp_path, monkeypatch):
-    """OneBot 直接发本机文件：没有公网地址也能解析出相对路径。"""
+def test_resolve_without_base_url_skips_official_upload(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "MEME_BASE_URL", "")
     engine = _engine(tmp_path)
     assert engine.resolve(memes.CATEGORY_AC) is None
-    trigger = engine.resolve(memes.CATEGORY_AC, require_url=False)
-    assert trigger is not None
-    assert trigger.url == ""
-    assert memes.meme_path(trigger.relative_path, root=tmp_path).is_file()
+
 
 
 def test_meme_path_rejects_escape(tmp_path):

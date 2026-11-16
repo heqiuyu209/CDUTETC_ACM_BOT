@@ -16,7 +16,7 @@ from cdutetc.utils import (
 
 
 def test_strip_at_removes_at_fragment():
-    assert strip_at("[CQ:at,qq=123456] 你好") == "你好"
+    assert strip_at("<@123456> 你好") == "你好"
     # legacy botpy 语法 <@!id> 已下线（P1 清理），不再剥离
     assert strip_at("<@!123456> 你好") == "<@!123456> 你好"
     assert strip_at("<@123456>发布 https://a.com/b") == "发布 https://a.com/b"

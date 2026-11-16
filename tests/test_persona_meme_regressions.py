@@ -1,4 +1,4 @@
-"""聊天开关、过滤与双协议收发图的入口回归；仅模拟外部 I/O。"""
+"""聊天开关、过滤与官方协议收发图的入口回归；仅模拟外部 I/O。"""
 import asyncio
 import io
 import sqlite3
@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cdutetc import config, content_filter, database as db, main, memes, notifications, persona_chat
-from cdutetc.clients.onebot import OneBotClient, OneBotMessage
+from conftest import official_message
 from cdutetc.clients.qqbot import QQBotClient, wrap_group_message, wrap_group_at_message
 from cdutetc.errors import DeliveryCode, DeliveryResult
 
@@ -22,7 +22,7 @@ def isolated(monkeypatch, tmp_path):
     memes.reset_collect_limits()
     monkeypatch.setattr(memes, "extract_image_text", lambda data: "")
     values = {
-        "ALLOWED_GROUPS": {"10001"}, "BOT_QQ": "30001",
+        "ALLOWED_GROUPS": {"10001"},
         "GROUP_REQUIRE_AT": True, "TEACHER_AUTO_INTENT_ENABLED": False,
         "TEACHER_WHITELIST": set(), "NL_INTENT_ENABLED": False,
         "QA_RATE_LIMIT_ENABLED": False, "QA_BLACKLIST": set(),
@@ -49,10 +49,8 @@ def isolated(monkeypatch, tmp_path):
 
 
 def message(text="在吗", *, at=True, member="u1", index=1):
-    prefix = "[CQ:at,qq=30001] " if at else ""
-    return OneBotMessage({"message_type": "group", "message_id": index,
-                          "group_id": "10001", "user_id": member,
-                          "raw_message": prefix + text})
+    prefix = "<@30001> " if at else ""
+    return official_message(message_type="group", msg_id=index, group_id="10001", user_id=member, content=prefix + text)
 
 
 def text_bot(monkeypatch, response="学姐来了"):
@@ -100,13 +98,14 @@ async def test_scene_image_obeys_active_messages_switch(monkeypatch):
     monkeypatch.setattr(config, "PERSONA_CHAT_ENABLED", False)
     monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", False)
     monkeypatch.setattr(memes.get_engine(), "_rng", lambda: 1.0)
-    client = OneBotClient("ws://127.0.0.1:1")
-    client.call_api = AsyncMock(return_value={"status": "ok", "retcode": 0,
-                                             "data": {"message_id": 10}})
+    client = QQBotClient("offline", "offline")
+    client.upload_group_media = AsyncMock(return_value=("file-info", 1800))
+    client.send_group_media_result = AsyncMock(return_value=DeliveryResult.sent("qqbot", main.DeliveryMode.ACTIVE, "accepted"))
     bot = main.ACMBot(client)
     for index in (1, 2):
         await bot.on_group_at_message_create(message("？", at=False, index=index))
-    client.call_api.assert_not_awaited()
+    client.upload_group_media.assert_not_awaited()
+    client.send_group_media_result.assert_not_awaited()
 
 
 async def test_addressed_chat_obeys_social_disabled(monkeypatch):
@@ -153,11 +152,6 @@ async def test_failed_persona_delivery_is_not_reported_or_remembered_as_sent(mon
         False, ["[群友u1]: 在吗"])
 
 
-def test_string_cq_image_url_preserves_signature():
-    raw_url = "https://example.invalid/a.png?appid=1&amp;token=abc%2Fdef"
-    wrapped = message(f"[CQ:image,file=a.png,url={raw_url}]", at=False)
-    assert memes.extract_image_refs(wrapped)[0]["url"] == (
-        "https://example.invalid/a.png?appid=1&token=abc%2Fdef")
 
 
 async def test_control_official_passive_media_sends(monkeypatch):
@@ -188,11 +182,6 @@ async def test_control_enabled_interjection_sends_once(monkeypatch):
     reply.assert_awaited_once()
 
 
-def test_control_segment_image_url_is_preserved():
-    url = "https://example.invalid/a.png?appid=1&token=abc%2Fdef"
-    wrapped = OneBotMessage({"message": [{"type": "image", "data": {
-        "url": url, "file": "a.png"}}]})
-    assert memes.extract_image_refs(wrapped) == [{"url": url, "file": "a.png"}]
 
 
 async def test_interjection_rate_limit_only_counts_actual_llm_calls(monkeypatch):
@@ -272,13 +261,6 @@ def test_non_image_official_attachment_is_ignored():
     assert memes.extract_image_refs(wrapped) == []
 
 
-@pytest.mark.parametrize("cq,expected", [
-    ("https://example.invalid/?a=1&amp;b=2&#44;3", "https://example.invalid/?a=1&b=2,3"),
-    ("https://example.invalid/?a=&#91;x&#93;", "https://example.invalid/?a=[x]"),
-    ("https://example.invalid/?a=&amp;#44;", "https://example.invalid/?a=&#44;"),
-])
-def test_cq_parameter_entities_are_decoded_once(cq, expected):
-    assert memes.extract_image_refs(message(f"[CQ:image,url={cq}]"))[0]["url"] == expected
 
 
 def official_media_bot(monkeypatch):
@@ -438,10 +420,11 @@ async def test_cancelling_media_send_cancels_network_task(monkeypatch, proactive
     assert memes.get_engine().recent_sent("10001") == []
 
 
-async def test_onebot_active_image_failure_stays_isolated(monkeypatch):
+async def test_official_active_image_failure_stays_isolated(monkeypatch):
     monkeypatch.setattr(config, "MEME_ENABLED", True)
-    client = OneBotClient("ws://127.0.0.1:1")
-    client.call_api = AsyncMock(side_effect=RuntimeError("offline send failed"))
+    client = QQBotClient("offline", "offline")
+    client.upload_group_media = AsyncMock(return_value=("file-info", 1800))
+    client.send_group_media_result = AsyncMock(side_effect=RuntimeError("offline send failed"))
     bot = main.ACMBot(client)
     assert not await bot._send_meme(message(), "10001", "question", proactive=True)
     assert memes.get_engine().recent_sent("10001") == []

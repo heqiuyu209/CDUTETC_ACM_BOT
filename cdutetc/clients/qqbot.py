@@ -1,22 +1,8 @@
-"""QQ 开放平台官方机器人适配层：把 botpy 事件包装成与 OneBotClient 相同的接口。
+"""QQ 开放平台官方客户端。
 
-设计目标：让 main.py 的业务逻辑一行都不用改，只换接入层。
-对外暴露的成员与 OneBotClient 完全一致：
-    start() / send_group_msg() / send_private_msg()
-    group_msg_handler / private_msg_handler / on_ready
-消息对象同样提供 group_id / user_id / content / raw / id 字段。
-
-与 OneBot 的关键差异（务必了解）：
-1. 官方机器人拿不到 QQ 号，只有 group_openid / member_openid。
-   因此 ACM_ALLOWED_GROUPS / ACM_TEACHER_WHITELIST / ACM_SUPER_ADMIN
-   里填的必须是 openid，不能填 QQ 号。
-2. 群 @ 事件直接标记已指向机器人；全量群消息事件根据 mentions.is_you
-   判断是否 @ 本机器人，普通群聊仍由业务入口按需忽略。
-3. 被动回复需要带 msg_id；主动推送（定时提醒）不带 msg_id，
-   受平台主动消息配额限制。
-
-botpy 采用延迟导入：未安装时本模块仍可被导入，只有真正启动才报错，
-这样纯 OneBot 部署和单元测试都不受影响。
+群和成员身份使用平台 OpenID；群 @ 事件与 mentions.is_you 用于识别定向消息。
+被动回复显式携带 msg_id / msg_seq，主动发送受平台权限和配额限制。
+botpy 延迟导入以支持离线测试，运行依赖在 requirements.txt 中统一声明。
 """
 
 import asyncio
@@ -48,7 +34,7 @@ def _import_botpy():
         import botpy
     except ImportError as error:  # pragma: no cover - 取决于运行环境
         raise RuntimeError(
-            "使用官方机器人需要安装 botpy：pip install -r requirements-qqbot.txt"
+            "使用官方机器人需要安装 botpy：pip install -r requirements.txt"
         ) from error
     return botpy
 
@@ -81,7 +67,7 @@ def build_group_intents(botpy):
 
 
 class QQBotMessage:
-    """与 OneBotMessage 字段对齐的消息封装。"""
+    """官方群消息与私聊事件的统一封装。"""
 
     __slots__ = ("raw", "source", "id", "message_type", "group_id", "user_id",
                  "content", "always_addressed", "mentions")
@@ -89,7 +75,7 @@ class QQBotMessage:
     def __init__(self, data, *, message_type: str, group_id: str = "",
                  user_id: str = "", content: str = "", msg_id: str = "",
                  always_addressed: bool = False, mentions=None):
-        # raw 保持「字典」形态，与 OneBotMessage 一致（main 里会调用 raw.get）。
+        # raw 保持字典形态，供业务层读取附件和昵称。
         # 原始 botpy 对象另存到 source，便于排查问题。
         self.raw = {}
         # 官方协议的图片只出现在 attachments 里（正文 content 为空串），
@@ -107,10 +93,10 @@ class QQBotMessage:
         self.group_id = str(group_id or "")
         self.user_id = str(user_id or "")
         self.content = content or ""
-        # 官方机器的群消息本身就是 @ 消息，无需再解析 CQ 码
+        # 仅群 @ 事件自带定向标记，全量群消息依赖平台 mentions
         self.always_addressed = always_addressed
         # 统一 @ 载体：把平台 mentions 规范成 [{"id": ..., "is_you": bool}]，
-        # 业务层只读本字段判定是否 @ 到本机器人（官方协议下 CQ 码不存在）。
+        # 业务层只读本字段判定是否 @ 到本机器人。
         self.mentions = [_normalize_mention(item) for item in (mentions or [])]
         if always_addressed and not any(item["is_you"] for item in self.mentions):
             # 事件类型本身即「群里 @ 机器人」，平台未下发 is_you 时按命中自身处理。
@@ -222,7 +208,7 @@ def wrap_c2c_message(message) -> QQBotMessage:
 
 
 class QQBotClient(BaseBotClient):
-    """官方机器人客户端，接口与 OneBotClient 对齐。"""
+    """官方机器人客户端。"""
 
     protocol = "qqbot"
     # 官方协议靠入站 msg_id + msg_seq 做被动回复。
@@ -232,11 +218,9 @@ class QQBotClient(BaseBotClient):
     # 主动群消息支持 markdown 消息体。
     supports_markdown = True
 
-    def __init__(self, appid: str, secret: str, idle_timeout: float = 180.0):
+    def __init__(self, appid: str, secret: str):
         self.appid = appid
         self.secret = secret
-        # 与 OneBot 客户端保持同名参数；官方网关自带心跳，这里仅用于告警
-        self.idle_timeout = idle_timeout
         self.group_msg_handler: MessageHandler | None = None
         self.private_msg_handler: MessageHandler | None = None
         self.on_ready: ReadyHandler | None = None

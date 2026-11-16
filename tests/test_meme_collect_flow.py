@@ -1,17 +1,16 @@
 """自动收图与场景化发图在 main 层的接缝测试。
 
-覆盖三件事：按群开关决定是否投递后台收图、OneBot 协议下用本机文件发图、
+覆盖三件事：按群开关决定是否投递后台收图、官方富媒体上传发图、
 模型只给 [MEME:分类] 时只发图不发空文本。全程不联网、不调模型。
 """
 
 import asyncio
 import sqlite3
-from types import SimpleNamespace
 
 import pytest
 
 from cdutetc import config, database, main, memes, persona_chat
-from cdutetc.clients.onebot import OneBotMessage
+from conftest import official_message
 
 
 @pytest.fixture(autouse=True)
@@ -29,11 +28,7 @@ def memory_db(monkeypatch):
 
 
 def _message(content="", group_id="g1", member_id="m1", message_id=1):
-    return OneBotMessage({
-        "post_type": "message", "message_type": "group", "message_id": message_id,
-        "raw_message": content, "group_id": group_id, "user_id": member_id,
-        "self_id": 30001,
-    })
+    return official_message(message_type="group", msg_id=message_id, content=content, group_id=group_id, user_id=member_id, bot_id=30001, attachments=[{"url": "https://example.invalid/a.png", "filename": "a.png", "content_type": "image/png"}])
 
 
 @pytest.fixture
@@ -62,7 +57,7 @@ async def test_collect_task_scheduled_when_group_enabled(bot, monkeypatch):
         return []
 
     monkeypatch.setattr(memes, "collect_from_message", fake_collect)
-    await bot.on_group_at_message_create(_message("今天这发 AC 稳了 [CQ:image,file=a.png]"))
+    await bot.on_group_at_message_create(_message("今天这发 AC 稳了"))
     await _drain(bot)
     assert calls == [{"group_id": "g1", "text": "今天这发 AC 稳了", "context": []}]
 
@@ -76,33 +71,32 @@ async def test_collect_skipped_when_group_disabled(bot, monkeypatch):
         return []
 
     monkeypatch.setattr(memes, "collect_from_message", fake_collect)
-    await bot.on_group_at_message_create(_message("[CQ:image,file=a.png]"))
+    await bot.on_group_at_message_create(_message(""))
     await _drain(bot)
     assert calls == []
     assert memes.get_engine().recent_texts("g1") == []
 
 
-async def test_send_meme_uses_local_file_on_onebot(bot, monkeypatch, tmp_path):
-    """OneBot 协议直接发本机文件，并把已发图记进防重队列。"""
+async def test_send_meme_uses_official_upload_and_file_info(bot, monkeypatch, tmp_path):
+    from unittest.mock import AsyncMock
+    from cdutetc.clients.qqbot import QQBotClient
     root = tmp_path / "memes"
     (root / "ac").mkdir(parents=True)
     (root / "ac" / "绝杀_abc12345.png").write_bytes(b"fake")
-    # 发图链路默认读模块级素材目录，测试里整体指向临时目录。
     monkeypatch.setattr(memes, "MEMES_DIR", root)
+    monkeypatch.setattr(config, "MEME_BASE_URL", "https://example.invalid/memes")
     engine = memes.get_engine()
     engine._root = root
-    sent = []
-
-    async def fake_image(group_id, image_path, *, reply_to=None, **_kwargs):
-        sent.append((group_id, str(image_path), reply_to))
-        return True
-
-    client = SimpleNamespace(protocol="onebot", send_group_image_result=fake_image)
-    onebot_bot = main.ACMBot(client)
-    message = _message("绝杀！", message_id=77)
-    assert await onebot_bot._send_meme(message, "g1", "ac", text="绝杀！") is True
-    assert sent and sent[0][0] == "g1" and sent[0][1].endswith("绝杀_abc12345.png")
+    client = QQBotClient("offline", "offline")
+    client.upload_group_media = AsyncMock(return_value=("uploaded-file-info", 1800))
+    client.send_group_media_result = AsyncMock(return_value=True)
+    instance = main.ACMBot(client)
+    assert await instance._send_meme(_message("绝杀！", message_id=77), "g1", "ac", text="绝杀！")
+    client.upload_group_media.assert_awaited_once()
+    args = client.send_group_media_result.await_args
+    assert args.args == ("g1", "uploaded-file-info") and args.kwargs["reply_to"] == "77"
     assert engine.recent_sent("g1") == ["ac/绝杀_abc12345.png"]
+
 
 
 async def test_persona_pure_meme_reply_sends_image_only(bot, monkeypatch):

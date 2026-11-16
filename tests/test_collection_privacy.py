@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from cdutetc import commands, config, database, main
-from cdutetc.clients.onebot import OneBotMessage
+from conftest import official_message
 from scripts.export_collection import export_collection
 
 PERSONAL = ("private-member-1", "private-member-2", "张三", "李四", "2026123456", "姓名", "学号")
@@ -43,18 +43,15 @@ def collection(file_db):
 
 
 @pytest.fixture
-async def bot(file_db, monkeypatch, onebot_client):
+async def bot(file_db, monkeypatch, official_client):
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
     monkeypatch.setattr(config, "SUPER_ADMIN", {"admin"})
-    return main.ACMBot(onebot_client), onebot_client
+    return main.ACMBot(official_client), official_client
 
 
 def _message(cid, member, group="g1"):
-    return OneBotMessage({
-        "post_type": "message", "message_type": "group", "message_id": 12345,
-        "raw_message": f"[CQ:at,qq=30001] /征集汇总 {cid}", "group_id": group, "user_id": member, "self_id": 30001,
-    })
+    return official_message(message_type="group", msg_id=12345, content=f"<@30001> /征集汇总 {cid}", group_id=group, user_id=member, bot_id=30001)
 
 
 @pytest.mark.parametrize("member", ["teacher", "admin", "student"])
@@ -67,30 +64,29 @@ async def test_actual_summary_reply_only_sends_aggregates_to_source_group(bot, c
     monkeypatch.setattr(database, "list_collection_responses", forbid_detail)
     await client.on_group_at_message_create(_message(collection, member))
 
-    api.call_api.assert_awaited_once()
-    assert api.call_api.await_args.args == ("send_group_msg",)
-    sent = api.call_api.await_args.kwargs
-    assert sent["group_id"] == "g1"
-    assert "msg_id" not in sent and "msg_seq" not in sent
-    assert "集训登记" in sent["message"] and "参加意向" in sent["message"]
-    assert "已报名：1 人" in sent["message"]
-    assert "已取消：1 人" in sent["message"]
-    assert "剩余名额：2" in sent["message"]
-    assert all(value not in sent["message"] for value in PERSONAL)
-    assert "明细" not in sent["message"]
-    api.send_private_msg.assert_not_awaited()
+    api.api.post_group_message.assert_awaited_once()
+    sent = api.api.post_group_message.await_args.kwargs
+    assert sent["group_openid"] == "g1"
+    assert sent["msg_id"] == "12345" and sent["msg_seq"] == 1
+    assert "集训登记" in sent["content"] and "参加意向" in sent["content"]
+    assert "已报名：1 人" in sent["content"]
+    assert "已取消：1 人" in sent["content"]
+    assert "剩余名额：2" in sent["content"]
+    assert all(value not in sent["content"] for value in PERSONAL)
+    assert "明细" not in sent["content"]
+    api.api.post_c2c_message.assert_not_awaited()
 
 
 @pytest.mark.parametrize("member", ["teacher", "admin", "student"])
 async def test_actual_summary_rejects_cross_group_queries(bot, collection, member):
     client, api = bot
     await client.on_group_at_message_create(_message(collection, member, group="g2"))
-    api.call_api.assert_awaited_once()
-    sent = api.call_api.await_args.kwargs
-    assert sent["group_id"] == "g2"
-    assert "msg_id" not in sent
-    assert sent["message"] == "征集不存在或不属于本群"
-    api.send_private_msg.assert_not_awaited()
+    api.api.post_group_message.assert_awaited_once()
+    sent = api.api.post_group_message.await_args.kwargs
+    assert sent["group_openid"] == "g2"
+    assert sent["msg_id"] == "12345"
+    assert sent["content"] == "征集不存在或不属于本群"
+    api.api.post_c2c_message.assert_not_awaited()
 
 
 def test_empty_unlimited_summary_has_no_detail(file_db):

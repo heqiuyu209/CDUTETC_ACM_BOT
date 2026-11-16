@@ -1,4 +1,4 @@
-"""OneBot 事件入口的发布边界与持久化回归。"""
+"""官方事件入口的发布边界与持久化回归。"""
 
 import sqlite3
 from types import SimpleNamespace
@@ -8,7 +8,7 @@ import pytest
 
 from cdutetc import commands, config, main
 from cdutetc import database as db
-from cdutetc.clients.onebot import OneBotMessage
+from conftest import official_message
 from cdutetc.errors import DeliveryMode, DeliveryResult
 from cdutetc.utils import match_publish_command
 
@@ -54,12 +54,9 @@ async def test_question_does_not_publish_or_fetch(monkeypatch, text):
     monkeypatch.setattr(main, "extract_contest", extract)
     monkeypatch.setattr(commands, "handle_non_command_message", question_handler)
     client = main.ACMBot(SimpleNamespace(send_group_msg_result=AsyncMock(
-        return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
+        return_value=DeliveryResult.sent("qqbot", DeliveryMode.ACTIVE, "sent")
     )))
-    message = OneBotMessage({
-        "message_id": 1, "raw_message": f"[CQ:at,qq=30001] {text}", "group_id": "g1",
-        "message_type": "group", "user_id": "teacher", "self_id": 30001,
-    })
+    message = official_message(msg_id=1, content=f"<@30001> {text}", group_id="g1", message_type="group", user_id="teacher", bot_id=30001)
     try:
         await client.on_group_at_message_create(message)
         question_handler.assert_awaited_once_with(text, "g1", "teacher", staff=True)
@@ -90,7 +87,7 @@ def test_custom_command_requires_its_own_boundary():
 
 
 @pytest.mark.parametrize("separator", ["", " ", "\n", "\u3000"])
-async def test_onebot_explicit_url_publication_keeps_documented_syntax(monkeypatch, separator):
+async def test_official_explicit_url_publication_keeps_documented_syntax(monkeypatch, separator):
     monkeypatch.setattr(config, "PUBLISH_CONFIRM_ENABLED", False)
     conn = sqlite3.connect(":memory:")
     monkeypatch.setattr(db, "_connect", lambda: conn)
@@ -106,12 +103,9 @@ async def test_onebot_explicit_url_publication_keeps_documented_syntax(monkeypat
     monkeypatch.setattr(main, "fetch_text", fetch)
     monkeypatch.setattr(main, "extract_contest", extract)
     client = main.ACMBot(SimpleNamespace(send_group_msg_result=AsyncMock(
-        return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
+        return_value=DeliveryResult.sent("qqbot", DeliveryMode.ACTIVE, "sent")
     )))
-    message = OneBotMessage({
-        "message_id": 1, "raw_message": f"[CQ:at,qq=30001] 发布{separator}https://contest.example.com", "group_id": "g1",
-        "message_type": "group", "user_id": "teacher", "self_id": 30001,
-    })
+    message = official_message(msg_id=1, content=f"<@30001> 发布{separator}https://contest.example.com", group_id="g1", message_type="group", user_id="teacher", bot_id=30001)
     try:
         await client.on_group_at_message_create(message)
         fetch.assert_awaited_once_with("https://contest.example.com")

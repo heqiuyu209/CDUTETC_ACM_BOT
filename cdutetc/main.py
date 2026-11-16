@@ -1,6 +1,6 @@
 """CDUTETC ACM 机器人主程序。
 
-职责：连接 OneBot 或 QQ 官方机器人，路由群消息：
+职责：连接 QQ 开放平台官方机器人，路由群消息：
   - 命令式操作（/修正、/征集、/报名、/征集汇总、/征集关闭 等）→ commands 模块分发
   - 「发布 <链接/信息>」→ 抓取 → 提取 → 默认私聊超管确认 → 按群通知
   - @ 本机器人的自然语言提问 → FAQ / 资料 / 受限模型；纯寒暄默认本地回复
@@ -51,7 +51,7 @@ from cdutetc import (
 from cdutetc import database as db
 from cdutetc.alias_helper import format_group_name
 from cdutetc.clients.base import BaseBotClient, capabilities_of
-from cdutetc.clients.onebot import OneBotClient, OneBotMessage
+from cdutetc.clients.qqbot import QQBotClient, QQBotMessage
 from cdutetc.contest_fields import map_competition_info
 from cdutetc.database import create_published_competition_once, init_db
 from cdutetc.errors import (
@@ -423,7 +423,7 @@ def _weekly_contest_window(now: datetime):
 
 
 class ACMBot:
-    """CDUTETC ACM 机器人：共用业务路由与双协议发送接口。"""
+    """CDUTETC ACM 机器人：业务路由与官方消息发送。"""
 
     def __init__(self, client: BaseBotClient | None = None):
         self.client = client
@@ -556,7 +556,7 @@ class ACMBot:
 
     # ---------- 私聊消息路由 ----------
 
-    async def on_private_message_create(self, message: OneBotMessage):
+    async def on_private_message_create(self, message: QQBotMessage):
         """私聊消息：超管可发 /命令 私聊管理（FAQ/课程/校安排等），其余回执验证链路。
         默认不记录私聊原文；初次部署采集白名单时设置 ACM_DEBUG_LOG_IDENTITY=1 临时开启。"""
         token = _private_reply_context.set((str(message.user_id), str(getattr(message, "id", "") or ""), 0))
@@ -775,7 +775,7 @@ class ACMBot:
 
     # ---------- 群消息路由 ----------
 
-    async def on_group_at_message_create(self, message: OneBotMessage):
+    async def on_group_at_message_create(self, message: QQBotMessage):
         reply_token = _reply_sequence.set(0)
         try:
             group_id = message.group_id
@@ -792,7 +792,7 @@ class ACMBot:
                 text = strip_at(message.content or "")
                 cmd, _ = parse_command(text)
                 member_id = self._extract_member_id(message)
-                addressed = is_addressed_to_bot(message, self.bot_identity)
+                addressed = is_addressed_to_bot(message)
                 targets = {item["id"] for item in message_mentions(message) if item["id"]}
                 if (cmd == "认领此群" and is_super_admin(member_id)
                         and (addressed or (not config.GROUP_REQUIRE_AT and not targets))):
@@ -811,18 +811,13 @@ class ACMBot:
                 logger.info("非授权群消息已忽略: %s", group_id)
                 await self._notice_unauthorized_group(message, group_id)
                 return
-            # 本机账号优先取客户端上报的真实标识，ACM_BOT_QQ 只作兜底。
-            # 顺序反了会导致配错 BOT_QQ 后所有 @ 都不被识别、普通提问被静默丢弃。
-            bot_qq = self.bot_identity
-            # 统一读适配层规范化的 message.mentions：官方协议采信平台 is_you，
-            # OneBot 用 CQ 码里的 QQ 号与自身上报账号比对。
-            addressed = is_addressed_to_bot(message, bot_qq)
+            addressed = is_addressed_to_bot(message)
             targets = {item["id"] for item in message_mentions(message) if item["id"]}
             # 带 @ 的消息只有指向本机器人时才受理，包括发给他人的命令。
             if targets and not addressed:
                 logger.info(
-                    "群消息 @ 的不是本机器人，已忽略（@目标=%s，本机=%s）",
-                    ",".join(sorted(targets)), bot_qq or "未知",
+                    "群消息 @ 的不是本机器人，已忽略（@目标=%s）",
+                    ",".join(sorted(targets)),
                 )
                 return
             text = strip_at(message.content)
@@ -866,9 +861,8 @@ class ACMBot:
                 )
             if not addressed and not allowed_without_at:
                 logger.info(
-                    "未 @ 本机器人，已忽略（消息含 @ 段：%s，本机=%s，文本长度 %d）",
-                    "[CQ:at" in (message.content or ""),
-                    bot_qq or "未知",
+                    "未 @ 本机器人，已忽略（消息含 @ 段：%s，文本长度 %d）",
+                    bool(message_mentions(message)),
                     len(text),
                 )
                 return
@@ -946,7 +940,6 @@ class ACMBot:
             ]
             # 官方协议被动回复最多 5 条：超出的同群文本先合并进最后一帧再发，
             # 严禁直接发起第 6 条 _safe_reply（会被拒为 INVALID_REQUEST）。
-            # OneBot 无此约束，保持原有逐条回复行为。
             if self.supports_passive_reply:
                 merged_texts = _merge_group_reply_texts(same_group_texts)
                 # 被动搭便车：只读查询的被动回复尾部追加一条最紧急待办，
@@ -1026,26 +1019,8 @@ class ACMBot:
         """接入协议标识，仅作数据库记录键与日志，不参与分支判断。"""
         return self.capabilities.protocol
 
-    @property
-    def bot_identity(self) -> str:
-        """本机器人自身账号，用于判断群里 @ 的是不是自己。
-
-        优先取客户端上报的自身标识（真实账号，最可信），其次用配置兜底；
-        不再读原始事件里的 self_id（适配层不保证保留该字段）。
-        """
-        return str(
-            getattr(self.client, "self_id", "")
-            or getattr(self.client, "bot_qq", "")
-            or config.BOT_QQ
-            or ""
-        )
-
-    def _extract_member_id(self, message: OneBotMessage) -> str:
-        """提取消息成员标识。
-
-        两套协议在适配层已把成员账号统一挂到 user_id 上（OneBot 即 QQ 号，
-        官方为 openid），无需再猜 member_openid / author_id 等旧字段。
-        """
+    def _extract_member_id(self, message: QQBotMessage) -> str:
+        """适配层把平台成员 OpenID 规范到 user_id。"""
         return str(getattr(message, "user_id", "") or "")
 
     def _qa_gate(self, member_id: str, text: str, *,
@@ -1108,7 +1083,7 @@ class ACMBot:
             logger.info("赛道按老师原文覆盖: %s", declared_tracks)
         return info
 
-    async def _handle_teacher_intent(self, message: OneBotMessage, text: str,
+    async def _handle_teacher_intent(self, message: QQBotMessage, text: str,
                                      group_id: str, member_id: str) -> bool:
         """老师在群里随口说安排时，识别意图并登记课程/比赛。
 
@@ -1137,7 +1112,7 @@ class ACMBot:
                 await self._send_private_result(str(uid), body)
         return True
 
-    async def _handle_chat_fun(self, message: OneBotMessage, text: str,
+    async def _handle_chat_fun(self, message: QQBotMessage, text: str,
                                group_id: str, member_id: str) -> bool:
         """群聊娱乐：跟风复读与高频词表情包，全程零 Token。
 
@@ -1184,7 +1159,7 @@ class ACMBot:
             return False
         return await self._send_meme(message, group_id, category, text=text)
 
-    def _schedule_meme_collect(self, message: OneBotMessage, group_id: str,
+    def _schedule_meme_collect(self, message: QQBotMessage, group_id: str,
                                text: str) -> None:
         """按群开关把收图丢进后台任务；开关关闭时只维护文本滑窗。"""
         try:
@@ -1211,10 +1186,10 @@ class ACMBot:
         self._meme_tasks.add(task)
         task.add_done_callback(self._meme_tasks.discard)
 
-    async def _send_meme(self, message: OneBotMessage, group_id: str,
+    async def _send_meme(self, message: QQBotMessage, group_id: str,
                          category: str, *, text: str = "",
                          proactive: bool = False) -> bool:
-        """发一张表情包：OneBot 直接发本机文件，官方协议走富媒体上传。
+        """通过官方富媒体上传和 file_info 缓存发送表情包。
 
         Args:
             text: 当前聊天文本，用于优先抽中文件名标签命中的那张图。
@@ -1231,45 +1206,37 @@ class ACMBot:
             # 缺失被动回复凭证不擅自转主动发送。
             return False
         engine = memes.get_engine()
-        local = capabilities_of(self.client).supports_local_image
-        trigger = engine.resolve(category, group_id=group_id, text=text,
-                                  require_url=not local)
+        trigger = engine.resolve(category, group_id=group_id, text=text)
         if trigger is None:
             # 素材目录缺失/为空，或未拼出公网地址：安静跳过，不报错也不阻塞。
             return False
         mode = DeliveryMode.ACTIVE if proactive else DeliveryMode.PASSIVE
 
         async def send_image(_message_format=None):
-            if local:
-                path = memes.meme_path(trigger.relative_path)
-                if path is None:
-                    return DeliveryResult(False, DeliveryCode.NOT_FOUND, self.protocol, mode)
-                image = str(path)
-            else:
+            try:
+                image = db.get_meme_file_cache(group_id, trigger.relative_path)
+            except sqlite3.Error:
+                image = ""
+            if not image:
+                uploaded = await asyncio.wait_for(
+                    self.client.upload_group_media(group_id, trigger.url),
+                    timeout=notifications.SEND_TIMEOUT_SECONDS,
+                )
+                if not uploaded:
+                    return DeliveryResult(False, DeliveryCode.PLATFORM_ERROR,
+                                          self.protocol, mode, detail="media_upload_failed")
+                image, ttl_seconds = uploaded
                 try:
-                    image = db.get_meme_file_cache(group_id, trigger.relative_path)
+                    db.save_meme_file_cache(group_id, trigger.relative_path, image,
+                                            ttl_seconds=ttl_seconds)
                 except sqlite3.Error:
-                    image = ""
-                if not image:
-                    uploaded = await asyncio.wait_for(
-                        self.client.upload_group_media(group_id, trigger.url),
-                        timeout=notifications.SEND_TIMEOUT_SECONDS,
-                    )
-                    if not uploaded:
-                        return DeliveryResult(False, DeliveryCode.PLATFORM_ERROR,
-                                              self.protocol, mode, detail="media_upload_failed")
-                    image, ttl_seconds = uploaded
-                    try:
-                        db.save_meme_file_cache(group_id, trigger.relative_path, image,
-                                                ttl_seconds=ttl_seconds)
-                    except sqlite3.Error:
-                        logger.warning("表情包 file_info 缓存写入失败，本次仍继续发送")
+                    logger.warning("表情包 file_info 缓存写入失败，本次仍继续发送")
             seq = 1
             if not proactive:
                 seq = _clamp_reply_seq(_reply_sequence.get() + 1)
                 _reply_sequence.set(seq)
             return await notifications.send_group_image(
-                self.client, group_id, image, local=local,
+                self.client, group_id, image,
                 reply_to=None if proactive else msg_id, reply_seq=seq,
             )
 
@@ -1292,19 +1259,13 @@ class ACMBot:
             # 状态机失败只是聊天少一句当下状态，不能影响其它定时任务。
             logger.exception("生活状态切换失败，保留原状态")
 
-    def _nickname_of(self, message: OneBotMessage, member_id: str) -> str:
-        """取发言人群昵称（OneBot sender.card/nickname、官方 author.username）。
+    def _nickname_of(self, message: QQBotMessage, member_id: str) -> str:
+        """取官方事件中可用的发言人昵称。
 
         取不到就退化成「群友+尾号」：拟人聊天需要称呼，但绝不能因此丢消息。
         """
         raw = getattr(message, "raw", None)
         if isinstance(raw, dict):
-            sender = raw.get("sender")
-            if isinstance(sender, dict):
-                for key in ("card", "nickname"):
-                    name = sender.get(key)
-                    if isinstance(name, str) and name.strip():
-                        return name.strip()[:16]
             author = raw.get("author")
             if isinstance(author, dict):
                 for key in ("username", "nickname"):
@@ -1314,7 +1275,7 @@ class ACMBot:
         tail = str(member_id or "")[-4:]
         return f"群友{tail}" if tail else "群友"
 
-    async def _handle_persona_chat(self, message: OneBotMessage, text: str,
+    async def _handle_persona_chat(self, message: QQBotMessage, text: str,
                                    group_id: str, member_id: str,
                                    *, remember: bool = True) -> bool:
         """@机器人 的日常闲聊/接梗：低 Token 拟人回复 + 记忆积累 + 表情包顺风车。
@@ -1390,7 +1351,7 @@ class ACMBot:
             image_sent = await self._send_meme(message, group_id, category, text=body)
         return bool(text_sent or image_sent)
 
-    async def _maybe_persona_interject(self, message: OneBotMessage, text: str,
+    async def _maybe_persona_interject(self, message: QQBotMessage, text: str,
                                        group_id: str) -> bool:
         """群聊高潮时的低频主动插话：条数、冷却、概率三重闸门全过才说话。
 
@@ -1418,7 +1379,7 @@ class ACMBot:
         # 命中的这句由 handler 在截取历史之后记录，避免它在 prompt 出现两遍。
         return await self._handle_persona_chat(message, text, group_id, member_id)
 
-    async def _handle_publish(self, message: OneBotMessage, text: str,
+    async def _handle_publish(self, message: QQBotMessage, text: str,
                               group_id: str, member_id: str):
         """发布命令：老师/超管权限校验 → 抓取 → 提取 → 校验 → 私聊超管确认。"""
         # 超管继承老师全部权限（含发布），无需再额外加入老师白名单
@@ -1650,7 +1611,7 @@ class ACMBot:
             mode = DeliveryMode.PASSIVE if self.supports_passive_reply and kwargs else DeliveryMode.ACTIVE
             return result_from_exception(error, protocol=self.protocol, mode=mode)
 
-    async def _safe_reply(self, message: OneBotMessage, content: str) -> bool:
+    async def _safe_reply(self, message: QQBotMessage, content: str) -> bool:
         """只回复当前入站群消息，官方适配不得复用历史ID或转主动重发。"""
         # 超管私聊录入比赛时，入参是 SimpleNamespace 轻量消息：没有真实群上下文，
         # 一律走私聊回执，避免落进 send_group 的群白名单校验。
@@ -1669,7 +1630,7 @@ class ACMBot:
         )
         return bool(result)
 
-    async def _notice_unauthorized_group(self, message: OneBotMessage,
+    async def _notice_unauthorized_group(self, message: QQBotMessage,
                                          group_id: str) -> None:
         """未授权群被明确喊话时，回一句带群号的提示，方便管理员取号后授权。
 
@@ -1679,8 +1640,7 @@ class ACMBot:
         if not config.NOTICE_UNAUTHORIZED_GROUP:
             return
         raw = message.content or ""
-        bot_qq = self.bot_identity
-        addressed = is_addressed_to_bot(message, bot_qq)
+        addressed = is_addressed_to_bot(message)
         text = strip_at(raw)
         if not (addressed or text.startswith("/")):
             return
@@ -1919,27 +1879,14 @@ class ACMBot:
 
 
 def _build_client():
-    """按 ACM_BOT_PROTOCOL 创建接入客户端；两种协议接口完全一致。"""
-    if config.BOT_PROTOCOL == "qqbot":
-        from cdutetc.clients.qqbot import QQBotClient
-
-        return QQBotClient(
-            appid=config.QQBOT_APPID,
-            secret=config.QQBOT_SECRET,
-            idle_timeout=config.WS_IDLE_TIMEOUT_SECONDS,
-        )
-    return OneBotClient(
-        ws_url=config.ONEBOT_WS_URL,
-        token=config.ONEBOT_TOKEN,
-        idle_timeout=config.WS_IDLE_TIMEOUT_SECONDS,
-    )
+    """创建唯一的 QQ 官方客户端。"""
+    return QQBotClient(appid=config.QQBOT_APPID, secret=config.QQBOT_SECRET)
 
 
 def run_bot() -> None:
-    """启动入口：配置检查 → 按协议创建客户端 → 常驻连接。"""
+    """启动入口：配置检查 → 创建官方客户端 → 常驻连接。"""
     if config.ENV_CREATED:
-        need = ("ACM_QQBOT_APPID、ACM_QQBOT_SECRET"
-                if config.BOT_PROTOCOL == "qqbot" else "ACM_ONEBOT_WS_URL")
+        need = "ACM_QQBOT_APPID、ACM_QQBOT_SECRET"
         logger.warning(
             "未找到 .env，已按 .env.example 生成：%s\n"
             "请填写 %s、ACM_LLM_API_KEY、ACM_ALLOWED_GROUPS、"

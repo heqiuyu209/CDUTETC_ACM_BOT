@@ -5,15 +5,12 @@ import sqlite3
 import pytest
 
 from cdutetc import chat_fun, config, database, main, memes
-from cdutetc.clients.onebot import OneBotMessage
+from conftest import official_message
 from cdutetc.errors import DeliveryResult
 
 
 def _msg(content="破防了", group="g1", member="m1", message_id=12345):
-    return OneBotMessage({"post_type": "message", "message_type": "group",
-                          "raw_message": content, "group_id": group,
-                          "user_id": member, "message_id": message_id,
-                          "self_id": 30001})
+    return official_message(message_type="group", content=content, group_id=group, user_id=member, msg_id=message_id, bot_id=30001)
 
 
 @pytest.fixture(autouse=True)
@@ -36,12 +33,11 @@ def db_conn(monkeypatch):
 
 
 @pytest.fixture
-def bot(monkeypatch, onebot_client, db_conn):
-    """OneBot 协议下的机器人：复读走被动回复，发图一律降级。"""
+def bot(monkeypatch, official_client, db_conn):
+    """官方客户端：复读走被动回复，未配置图片公网地址时跳过发图。"""
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"m1"})
     monkeypatch.setattr(config, "PUBLISH_CMD", "发布")
-    monkeypatch.setattr(config, "BOT_QQ", "")
     monkeypatch.setattr(config, "GROUP_REQUIRE_AT", True)
     monkeypatch.setattr(config, "NL_INTENT_ENABLED", False)
     monkeypatch.setattr(config, "TEACHER_AUTO_INTENT_ENABLED", False)
@@ -49,7 +45,7 @@ def bot(monkeypatch, onebot_client, db_conn):
     monkeypatch.setattr(config, "MEME_ENABLED", True)
     monkeypatch.setattr(config, "MEME_BASE_URL", "")
 
-    instance = main.ACMBot(onebot_client)
+    instance = main.ACMBot(official_client)
     replies = []
 
     async def fake_reply(message, content):
@@ -67,7 +63,6 @@ class FakeQQBotClient:
     supports_passive_reply = True
     supports_numeric_group_id = False
     supports_markdown = True
-    self_id = "BOT-OPENID"
 
     def __init__(self):
         from unittest.mock import AsyncMock
@@ -150,8 +145,8 @@ async def test_teacher_consumed_message_never_echoes(bot, monkeypatch):
 # ---------- 表情包降级 ----------
 
 
-async def test_meme_skipped_on_onebot_protocol(bot):
-    """OneBot 拼不出 file_info：完全不发图，也不影响主流程。"""
+async def test_meme_skipped_with_unconfigured_media(bot):
+    """未配置图片公网地址时跳过发图，不影响主流程。"""
     b, replies = bot
     assert await b._send_meme(_msg("WA了"), "g1", memes.CATEGORY_WA_TLE) is False
     assert replies == []

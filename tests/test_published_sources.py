@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from cdutetc import config, crawler, database, main
-from cdutetc.clients.onebot import OneBotMessage
+from conftest import official_message
 from cdutetc.errors import DeliveryMode, DeliveryResult
 from cdutetc.fetcher import FetchError
 
@@ -46,7 +46,7 @@ def db_file(monkeypatch, tmp_path):
 
 
 @pytest.fixture
-async def bot(monkeypatch, db_file, onebot_client):
+async def bot(monkeypatch, db_file, official_client):
     monkeypatch.setattr(config, "PUBLISH_CONFIRM_ENABLED", False)
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
@@ -55,7 +55,7 @@ async def bot(monkeypatch, db_file, onebot_client):
     monkeypatch.setattr(config, "GROUP_REQUIRE_AT", True)
     monkeypatch.setattr(crawler, "AUTO_FETCH_ENABLED", False)
     state = SimpleNamespace(
-        client=main.ACMBot(onebot_client), replies=[], sent=[], fetched=[], extracted=[]
+        client=main.ACMBot(official_client), replies=[], sent=[], fetched=[], extracted=[]
     )
 
     async def reply(message, content):
@@ -64,7 +64,7 @@ async def bot(monkeypatch, db_file, onebot_client):
 
     async def send(group_id, content):
         state.sent.append((group_id, content))
-        return DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent-id")
+        return DeliveryResult.sent("qqbot", DeliveryMode.ACTIVE, "sent-id")
 
     async def fetch(url):
         state.fetched.append(url)
@@ -82,10 +82,7 @@ async def bot(monkeypatch, db_file, onebot_client):
 
 
 def _message(group="g1", member="teacher"):
-    return OneBotMessage({"post_type": "message", "message_type": "group",
-                         "raw_message": f"[CQ:at,qq=30001] 发布 {URL} 补充：校内截止提前一天",
-                         "group_id": group, "user_id": member, "message_id": 12345,
-                         "self_id": 30001})
+    return official_message(message_type="group", content=f"<@30001> 发布 {URL} 补充：校内截止提前一天", group_id=group, user_id=member, msg_id=12345, bot_id=30001)
 
 
 def _now(hour=9, minute=0):

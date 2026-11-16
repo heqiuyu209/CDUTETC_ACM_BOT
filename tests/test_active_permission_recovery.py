@@ -9,7 +9,6 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from cdutetc import config, database, main, reminder
-from cdutetc.clients.onebot import OneBotClient
 from cdutetc.clients.qqbot import GroupActivePermission, QQBotClient, QQBotMessage
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -143,14 +142,14 @@ async def test_non_admin_or_disabled_switch_cannot_bypass_pause(app, monkeypatch
     query.assert_not_awaited()
 
 
-async def test_qq_permission_pause_is_not_reused_by_onebot(app, monkeypatch):
+async def test_official_permission_pause_survives_client_recreation(app):
     await app.bot._contest_remind_job()
-    monkeypatch.setattr(config, "BOT_PROTOCOL", "onebot")
-    client = OneBotClient("ws://127.0.0.1:3001")
-    client._ws = object()
-    client.call_api = AsyncMock(return_value={"status": "ok", "retcode": 0, "data": {"message_id": 1}})
-    assert await main.ACMBot(client)._send_group_result("g1", "切换协议后正常发送")
-    client.call_api.assert_awaited_once()
+    client = QQBotClient("offline", "offline")
+    client._client = SimpleNamespace(api=app.api)
+    app.api.post_group_message.reset_mock()
+    assert not await main.ACMBot(client)._send_group_result("g1", "重启后仍暂停")
+    app.api.post_group_message.assert_not_awaited()
+
 
 
 async def test_transient_platform_failure_still_retries_and_is_not_permission_block(app):

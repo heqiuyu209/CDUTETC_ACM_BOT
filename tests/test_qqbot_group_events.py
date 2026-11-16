@@ -82,7 +82,6 @@ def app(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "NL_INTENT_ENABLED", False)
     monkeypatch.setattr(config, "NOTICE_UNAUTHORIZED_GROUP", True)
     monkeypatch.setattr(config, "GROUP_REQUIRE_AT", True)
-    monkeypatch.setattr(config, "BOT_QQ", "")
     monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "events.sqlite3"))
     database.init_db()
     monkeypatch.setattr(llm, "_chat_once", AsyncMock(side_effect=AssertionError("不得调用模型")))
@@ -162,7 +161,6 @@ async def test_blacklisted_member_stays_silent_for_new_event(app, sdk, monkeypat
     ("qqbot", "662657785", False),
     ("qqbot", "A" * 32, True),
     ("qqbot", "1" * 32, True),
-    ("onebot", "662657785", True),
 ])
 def test_add_group_rejects_qq_number_only_for_official_protocol(app, monkeypatch, protocol, target, accepted):
     monkeypatch.setattr(config, "BOT_PROTOCOL", protocol)

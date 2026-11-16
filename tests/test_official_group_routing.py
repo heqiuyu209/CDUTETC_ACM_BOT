@@ -1,4 +1,4 @@
-"""OneBot 群消息触发范围：命令与定向提问，拒绝闲聊和发给他人的消息。"""
+"""官方群消息触发范围：命令与定向提问，拒绝闲聊和发给他人的消息。"""
 
 import logging
 import sqlite3
@@ -8,23 +8,24 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cdutetc import config, database, main
-from cdutetc.clients.onebot import OneBotMessage
+from conftest import official_message
 from cdutetc.errors import DeliveryMode, DeliveryResult
 from cdutetc.utils import mentioned_user_ids
 
 
-def message(content, *, group=123456, user=654321, self_id=111111):
-    return OneBotMessage({
-        "post_type": "message", "message_type": "group", "message_id": 1,
-        "group_id": group, "user_id": user, "self_id": self_id,
-        "raw_message": content,
-    })
+def message(content, *, group=123456, user=654321, bot_id=111111):
+    return official_message(
+        message_type="group", msg_id=1, group_id=group,
+        user_id=user, bot_id=bot_id, content=content,
+    )
 
 
 @pytest.fixture
 def bot(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    monkeypatch.setattr(database, "_connect", lambda: conn)
+    database.init_db()
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"123456", "234567"})
-    monkeypatch.setattr(config, "BOT_QQ", "111111")
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"654321"})
     monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
     monkeypatch.setattr(config, "GROUP_REQUIRE_AT", True)
@@ -34,16 +35,17 @@ def bot(monkeypatch):
     monkeypatch.setattr(config, "QA_BLACKLIST", set())
     monkeypatch.setattr(config, "QA_RATE_LIMIT_ENABLED", False)
     client = SimpleNamespace(
-        send_group_msg_result=AsyncMock(return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")),
-        send_private_msg_result=AsyncMock(return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")),
+        send_group_msg_result=AsyncMock(return_value=DeliveryResult.sent("qqbot", DeliveryMode.ACTIVE, "sent")),
+        send_private_msg_result=AsyncMock(return_value=DeliveryResult.sent("qqbot", DeliveryMode.ACTIVE, "sent")),
     )
-    return main.ACMBot(client)
+    yield main.ACMBot(client)
+    conn.close()
 
 
 @pytest.mark.parametrize("content", [
     "今天食堂有什么菜", "看看这个 https://example.com/contest",
-    "[CQ:at,qq=999999] 下课了吗", "[CQ:at,qq=999999] /帮助",
-    "[CQ:at,qq=all] 近期比赛是什么", "[CQ:at,qq=1111110] 近期比赛是什么",
+    "<@999999> 下课了吗", "<@999999> /帮助",
+    "<@all> 近期比赛是什么", "<@1111110> 近期比赛是什么",
 ])
 async def test_unaddressed_messages_have_no_side_effects(bot, monkeypatch, content):
     command = AsyncMock()
@@ -61,13 +63,13 @@ async def test_unaddressed_messages_have_no_side_effects(bot, monkeypatch, conte
     bot.client.send_group_msg_result.assert_not_awaited()
 
 
-@pytest.mark.parametrize("content", ["[CQ:at,qq=111111] /帮助", "<@111111> /帮助"])
+@pytest.mark.parametrize("content", ["<@111111> /帮助", "<@111111> <@999999> /帮助"])
 async def test_addressed_explicit_commands_preserve_group_and_sender(bot, monkeypatch, content):
     command = AsyncMock(return_value=[{"group_id": "123456", "text": "帮助文本"}])
     monkeypatch.setattr(main.commands, "handle_command", command)
     await bot.on_group_at_message_create(message(content))
     command.assert_awaited_once_with("/帮助", "123456", "654321")
-    bot.client.send_group_msg_result.assert_awaited_once_with("123456", "帮助文本", reply_to="1")
+    bot.client.send_group_msg_result.assert_awaited_once_with("123456", "帮助文本", reply_to="1", reply_seq=1)
 
 
 async def test_default_group_gate_rejects_unmentioned_explicit_command(bot, monkeypatch):
@@ -88,7 +90,7 @@ async def test_disabled_group_gate_allows_unmentioned_explicit_command_with_repl
     await bot.on_group_at_message_create(message("/帮助"))
 
     command.assert_awaited_once_with("/帮助", "123456", "654321")
-    bot.client.send_group_msg_result.assert_awaited_once_with("123456", "帮助文本", reply_to="1")
+    bot.client.send_group_msg_result.assert_awaited_once_with("123456", "帮助文本", reply_to="1", reply_seq=1)
 
 
 async def test_disabled_group_gate_does_not_allow_unmentioned_question(bot, monkeypatch):
@@ -108,10 +110,10 @@ async def test_question_handler_receives_staff_permission_keyword(bot, monkeypat
     monkeypatch.setattr(main.commands, "handle_command", command)
     monkeypatch.setattr(main.commands, "handle_non_command_message", question)
 
-    await bot.on_group_at_message_create(message("[CQ:at,qq=111111] 近期比赛是什么"))
+    await bot.on_group_at_message_create(message("<@111111> 近期比赛是什么"))
 
     question.assert_awaited_once_with("近期比赛是什么", "123456", "654321", staff=True)
-    bot.client.send_group_msg_result.assert_awaited_once_with("123456", "答复", reply_to="1")
+    bot.client.send_group_msg_result.assert_awaited_once_with("123456", "答复", reply_to="1", reply_seq=1)
 
 
 async def test_only_addressed_questions_reach_model_and_question_storage(bot, monkeypatch):
@@ -122,8 +124,8 @@ async def test_only_addressed_questions_reach_model_and_question_storage(bot, mo
     monkeypatch.setattr(main.commands.llm, "answer_question", answer)
     try:
         await bot.on_group_at_message_create(message("今天食堂有什么菜"))
-        await bot.on_group_at_message_create(message("[CQ:at,qq=999999] 下课了吗"))
-        await bot.on_group_at_message_create(message("[CQ:at,qq=111111] 近期比赛是什么"))
+        await bot.on_group_at_message_create(message("<@999999> 下课了吗"))
+        await bot.on_group_at_message_create(message("<@111111> 近期比赛是什么"))
         answer.assert_awaited_once()
         assert answer.await_args.args[0] == "近期比赛是什么"
         questions = database.list_unanswered("123456")
@@ -133,26 +135,28 @@ async def test_only_addressed_questions_reach_model_and_question_storage(bot, mo
         conn.close()
 
 
-async def test_missing_configured_id_uses_client_self_id(bot, monkeypatch):
-    monkeypatch.setattr(config, "BOT_QQ", "")
-    bot.client.self_id = "111111"
-    command = AsyncMock(return_value=None)
+async def test_platform_is_you_works_without_configured_identity(bot, monkeypatch):
     question = AsyncMock(return_value=[{"group_id": "123456", "text": "回答"}])
-    monkeypatch.setattr(main.commands, "handle_command", command)
     monkeypatch.setattr(main.commands, "handle_non_command_message", question)
-    await bot.on_group_at_message_create(message("[CQ:at,qq=111111] 时间是什么"))
+    await bot.on_group_at_message_create(official_message(
+        group_id="123456", user_id="654321", msg_id="m1", content="时间是什么",
+        mentions=[{"id": "opaque-bot-openid", "is_you": True}],
+    ))
     question.assert_awaited_once_with("时间是什么", "123456", "654321", staff=True)
 
 
-async def test_missing_bot_identity_ignores_mentions_but_allows_unmentioned_commands(bot, monkeypatch):
-    monkeypatch.setattr(config, "BOT_QQ", "")
+
+async def test_missing_platform_self_mention_ignores_question_but_allows_unmentioned_commands(bot, monkeypatch):
     command = AsyncMock(return_value=[])
     question = AsyncMock()
     monkeypatch.setattr(main.commands, "handle_command", command)
     monkeypatch.setattr(main.commands, "handle_non_command_message", question)
 
-    # 客户端与配置都给不出自身标识时，无法判断 @ 的是不是自己，问答链路沉默
-    await bot.on_group_at_message_create(message("[CQ:at,qq=111111] 时间是什么"))
+    # 平台未标记 @ 本机器人时，正文中的账号不能触发定向问答。
+    await bot.on_group_at_message_create(official_message(
+        group_id="123456", user_id="654321", msg_id="m1", content="<@111111> 时间是什么",
+        mentions=[{"id": "111111", "is_you": False}],
+    ))
     command.assert_not_awaited()
     question.assert_not_awaited()
 
@@ -172,7 +176,7 @@ async def test_unallowed_group_only_receives_optional_authorization_notice(
     monkeypatch.setattr(main.commands, "handle_command", command)
     monkeypatch.setattr(main.commands, "handle_non_command_message", question)
 
-    await bot.on_group_at_message_create(message("[CQ:at,qq=111111] /帮助", group=345678))
+    await bot.on_group_at_message_create(message("<@111111> /帮助", group=345678))
 
     command.assert_not_awaited()
     question.assert_not_awaited()
@@ -222,8 +226,8 @@ async def test_original_group_and_private_content_not_logged(bot, caplog):
     assert "[身份采集]" not in caplog.text
 
 
-def test_mentions_match_exact_ids_and_allow_cq_extra_parameters():
-    assert mentioned_user_ids("[CQ:at,qq=111111,name=老师] <@222222>") == {"111111", "222222"}
+def test_mentions_match_exact_official_ids_and_ignore_legacy_markup():
+    assert mentioned_user_ids("<@111111> <@222222>") == {"111111", "222222"}
     # legacy <@!id> 语法已下线（P1 清理），不再识别
     assert mentioned_user_ids("<@!222222>") == set()
     assert mentioned_user_ids("&#91;CQ:at,qq=111111&#93;") == set()

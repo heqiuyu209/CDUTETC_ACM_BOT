@@ -7,7 +7,7 @@
     cdutetc/database.py  数据访问
     cdutetc/commands.py  命令处理
     cdutetc/main.py      消息路由与启动
-    cdutetc/clients/     OneBot / 官方机器人两种接入
+    cdutetc/clients/     QQ 开放平台官方客户端
 """
 
 from cdutetc.main import run_bot

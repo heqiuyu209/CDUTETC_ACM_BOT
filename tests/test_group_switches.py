@@ -9,18 +9,14 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from cdutetc import commands, config, daily_digest, database, main
-from cdutetc.clients.onebot import OneBotMessage
+from conftest import official_message
 
 TZ = ZoneInfo("Asia/Shanghai")
 NOW = datetime(2026, 11, 12, 10, 0, tzinfo=TZ)  # 周四
 
 
 def _msg(content="你好", group="g1", member="m1"):
-    return OneBotMessage({
-        "post_type": "message", "message_type": "group",
-        "raw_message": content, "group_id": group, "user_id": member,
-        "message_id": 12345, "self_id": 30001,
-    })
+    return official_message(message_type="group", content=content, group_id=group, user_id=member, msg_id=12345, bot_id=30001)
 
 
 @pytest.fixture
@@ -110,7 +106,7 @@ def test_invalid_switch_arguments_raise_usage_error(group_db, args):
 # ---------------------------------------------------------------- 问答门控
 
 @pytest.fixture
-def gate_bot(monkeypatch, onebot_client):
+def gate_bot(monkeypatch, official_client):
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
     monkeypatch.setattr(config, "SUPER_ADMIN", {"admin"})
@@ -119,7 +115,7 @@ def gate_bot(monkeypatch, onebot_client):
     conn = sqlite3.connect(":memory:")
     monkeypatch.setattr(database, "_connect", lambda: conn)
     database.init_db()
-    bot = main.ACMBot(onebot_client)
+    bot = main.ACMBot(official_client)
     replies = []
 
     async def fake_reply(message, content):
@@ -136,7 +132,7 @@ async def test_qa_switch_off_silently_blocks_member_free_text(gate_bot, monkeypa
     monkeypatch.setattr(commands, "handle_non_command_message", handler)
     database.set_group_switch("g1", "qa_enabled", False, "teacher")
 
-    await bot.on_group_at_message_create(_msg("[CQ:at,qq=30001] 今天有什么比赛"))
+    await bot.on_group_at_message_create(_msg("<@30001> 今天有什么比赛"))
 
     handler.assert_not_awaited()
     assert replies == []
@@ -147,7 +143,7 @@ async def test_qa_switch_on_answers_member_free_text(gate_bot, monkeypatch):
     handler = AsyncMock(return_value=[{"group_id": "g1", "text": "自动回答"}])
     monkeypatch.setattr(commands, "handle_non_command_message", handler)
 
-    await bot.on_group_at_message_create(_msg("[CQ:at,qq=30001] 今天有什么比赛"))
+    await bot.on_group_at_message_create(_msg("<@30001> 今天有什么比赛"))
 
     handler.assert_awaited_once()
     assert replies == ["自动回答"]
@@ -159,7 +155,7 @@ async def test_qa_switch_off_still_allows_teacher_commands(gate_bot, monkeypatch
     monkeypatch.setattr(commands, "handle_non_command_message", handler)
     database.set_group_switch("g1", "qa_enabled", False, "teacher")
 
-    await bot.on_group_at_message_create(_msg("[CQ:at,qq=30001] /群开关", member="teacher"))
+    await bot.on_group_at_message_create(_msg("<@30001> /群开关", member="teacher"))
 
     handler.assert_not_awaited()
     assert any("本群主动能力开关" in text for text in replies)

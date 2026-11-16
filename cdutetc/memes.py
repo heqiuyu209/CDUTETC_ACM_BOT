@@ -550,7 +550,7 @@ def save_meme_file(data: bytes, *, category: str, md5: str, tag: str,
 def meme_path(relative_path: str, *, root: Path | None = None) -> Path | None:
     """把素材相对路径解析成绝对路径；越界或为空时返回 None。
 
-    OneBot 发图需要本机绝对路径，官方协议走 public_url，两条链路共用这一层。
+    本地文件用于收图和删除校验，发图通过 public_url 上传至官方接口。
     """
     relative = str(relative_path or "").strip().lstrip("/")
     if not relative or ".." in relative:
@@ -585,16 +585,9 @@ _CQ_RE = re.compile(r"\[CQ:[^\]]*\]")
 def strip_cq_codes(text: str) -> str:
     """去掉 CQ 码并压缩空白。
 
-    OneBot 的图片消息正文就是 ``[CQ:image,file=xxx]``，若原样进滑窗，
-    归类关键词、连问判定与文件名标签都会被这串码污染。
+    清理用户粘贴的旧消息标记，避免污染分类上下文；不会据此下载图片。
     """
     return " ".join(_CQ_RE.sub(" ", str(text or "")).split())
-
-
-def _decode_cq_parameter(value) -> str:
-    """CQ 实体只还原一层；URL 自身的百分号编码必须保持不变。"""
-    return (str(value or "").replace("&#91;", "[").replace("&#93;", "]")
-            .replace("&#44;", ",").replace("&amp;", "&"))
 
 
 _URL_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
@@ -646,44 +639,19 @@ def _attachment_refs(items) -> list[dict]:
 
 
 def extract_image_refs(message) -> list[dict]:
-    """从群消息里抠出图片引用：兼容 OneBot 段数组与官方附件两种结构。
+    """从群消息里抠出图片引用：读取官方附件及 SDK 原始事件兜底。
 
     返回 ``[{"url": ..., "file": ...}]``，两者都可能为空，取到哪个用哪个。
     """
     refs: list[dict] = []
     raw = getattr(message, "raw", None)
     if isinstance(raw, dict):
-        segments = raw.get("message")
-        if isinstance(segments, list):
-            for seg in segments:
-                if not isinstance(seg, dict) or seg.get("type") != "image":
-                    continue
-                data = seg.get("data") or {}
-                if not isinstance(data, dict):
-                    continue
-                url = str(data.get("url") or "")
-                name = str(data.get("file") or "")
-                if url or name:
-                    refs.append({"url": url, "file": name})
         refs.extend(_attachment_refs(raw.get("attachments")))
     if not refs:
         # 兜底：QQBotMessage 未把 attachments 同步进 raw 时，直接读原始事件对象
         source = getattr(message, "source", None)
         if source is not None:
             refs.extend(_attachment_refs(_read_field(source, "attachments", None)))
-    if refs:
-        return refs
-    # 兜底：raw_message 里的 CQ 码（NapCat 某些配置只给字符串）
-    content = getattr(message, "content", "") or ""
-    for match in re.finditer(r"\[CQ:image,([^\]]*)\]", content):
-        params = dict(
-            part.split("=", 1) for part in match.group(1).split(",") if "=" in part
-        )
-        # CQ 参数使用实体转义，不能 URL-decode，否则会破坏签名与查询参数。
-        url = _decode_cq_parameter(params.get("url"))
-        name = _decode_cq_parameter(params.get("file"))
-        if url or name:
-            refs.append({"url": url, "file": name})
     return refs
 
 
@@ -929,11 +897,10 @@ class MemeEngine:
         self._recent[str(group_id).strip()] = deque(remaining, maxlen=self.recent_limit)
 
     def resolve(self, category: str, *, group_id: str = "",
-                text: str = "", require_url: bool = True) -> MemeTrigger | None:
+                text: str = "") -> MemeTrigger | None:
         """把分类解析成可发送的（相对路径, 公网地址）；任一步缺失即返回 None。
 
         ``group_id`` 用于避开该群最近发过的图，``text`` 用于优先命中标签前缀。
-        ``require_url=False`` 供 OneBot 使用：直接发本机文件，不需要公网地址。
         """
         group = str(group_id or "").strip()
         exclude = self.recent_sent(group) if group else ()
@@ -942,7 +909,7 @@ class MemeEngine:
         if not relative:
             return None
         url = public_url(relative)
-        if not url and require_url:
+        if not url:
             return None
         return MemeTrigger(category=category, relative_path=relative, url=url)
 
@@ -1088,10 +1055,10 @@ async def collect_from_message(message, *, group_id: str, text: str = "",
     refs = extract_image_refs(message)
     if not refs:
         return []
-    # 文本与上下文统一去 CQ 码：图片消息的正文就是 CQ 串，不能拿它当聊天内容。
+    # 清理正文中粘贴的旧消息标记，避免污染分类上下文。
     clean_text = strip_cq_codes(text)
     clean_context = [item for item in map(strip_cq_codes, context) if item]
-    # 单人限流的键：官方协议下是 member_openid，onebot 下是 QQ 号，取到哪个用哪个。
+    # 单人限流的键：使用适配层提供的成员 OpenID。
     user = ""
     for field in ("user_id", "member_openid", "user_openid", "author_id"):
         candidate = str(_read_field(message, field, "") or "").strip()

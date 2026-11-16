@@ -75,7 +75,9 @@ def report_file(path: Path) -> int:
     print(f"配置文件：{path}")
     print(f"键数量　：{len(values)}")
 
-    deprecated = ("ACM_APPID", "ACM_APP_SECRET", "ACM_PUBLISHER_WHITELIST")
+    deprecated = ("ACM_APPID", "ACM_APP_SECRET", "ACM_PUBLISHER_WHITELIST",
+                  "ACM_BOT_PROTOCOL", "ACM_ONEBOT_WS_URL", "ACM_ONEBOT_TOKEN",
+                  "ACM_BOT_QQ", "ACM_WS_IDLE_TIMEOUT_SECONDS")
     leftovers = [name for name in deprecated if name in values]
     if leftovers:
         print(f"可删除　：{'、'.join(leftovers)}（旧版遗留，已不再读取）")
@@ -83,13 +85,8 @@ def report_file(path: Path) -> int:
     missing_keys = [key for key in template if key not in values]
     extra_keys = [key for key in values if template and key not in template]
 
-    protocol = values.get("ACM_BOT_PROTOCOL", "onebot").strip().lower()
-    if protocol == "qqbot":
-        required = ("ACM_QQBOT_APPID", "ACM_QQBOT_SECRET", "ACM_LLM_API_KEY")
-    else:
-        required = ("ACM_ONEBOT_WS_URL", "ACM_LLM_API_KEY")
-
-    print(f"\n[必填] 当前协议 {protocol}")
+    required = ("ACM_QQBOT_APPID", "ACM_QQBOT_SECRET", "ACM_LLM_API_KEY")
+    print("\n[必填] QQ 开放平台官方机器人")
     missing = []
     for name in required:
         value = values.get(name, "")
@@ -139,7 +136,9 @@ def report_project() -> int:
         print(f"已补齐　：本次自动补入 {len(config.ENV_ADDED_KEYS)} 个新增配置项")
     print(f"接入协议：{config.BOT_PROTOCOL}")
 
-    deprecated = ("ACM_APPID", "ACM_APP_SECRET", "ACM_PUBLISHER_WHITELIST")
+    deprecated = ("ACM_APPID", "ACM_APP_SECRET", "ACM_PUBLISHER_WHITELIST",
+                  "ACM_BOT_PROTOCOL", "ACM_ONEBOT_WS_URL", "ACM_ONEBOT_TOKEN",
+                  "ACM_BOT_QQ", "ACM_WS_IDLE_TIMEOUT_SECONDS")
     if Path(config.ENV_FILE).exists():
         try:
             text = Path(config.ENV_FILE).read_text(encoding="utf-8")

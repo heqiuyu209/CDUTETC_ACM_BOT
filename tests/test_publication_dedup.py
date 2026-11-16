@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cdutetc import config, crawler, database, llm, main
-from cdutetc.clients.onebot import OneBotMessage
+from conftest import official_message
 from cdutetc.contest_fields import map_competition_info
 from cdutetc.errors import DeliveryMode, DeliveryResult
 from cdutetc.llm import validate_contest_info
@@ -324,15 +324,15 @@ def test_optional_field_types_are_validated_before_storage(field):
 
 
 @pytest.mark.parametrize("official_aliases", [False, True])
-async def test_onebot_publish_twice_preserves_fields_without_second_notification(db_file, monkeypatch, official_aliases):
+async def test_official_publish_twice_preserves_fields_without_second_notification(db_file, monkeypatch, official_aliases):
     monkeypatch.setattr(config, "PUBLISH_CONFIRM_ENABLED", False)
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2", "g3"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
     monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
-    onebot = SimpleNamespace(send_group_msg_result=AsyncMock(
-        return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
+    official = SimpleNamespace(send_group_msg_result=AsyncMock(
+        return_value=DeliveryResult.sent("qqbot", DeliveryMode.ACTIVE, "sent")
     ))
-    bot = main.ACMBot(onebot)
+    bot = main.ACMBot(official)
     extracted = {
         "name": "完整校赛", "edition": "2026", "reg_start": "2026-11-01 08:00",
         "reg_deadline": "2026-11-10 23:59", "contest_time": "2026-11-20 09:00",
@@ -340,17 +340,15 @@ async def test_onebot_publish_twice_preserves_fields_without_second_notification
         "summary": "官方摘要", "official_site": "https://invented.example.com/wrong",
     }
     if official_aliases:
-        for legacy, official in (("reg_start", "official_reg_start"),
+        for legacy, official_field in (("reg_start", "official_reg_start"),
                                  ("reg_deadline", "official_reg_deadline"),
                                  ("contest_time", "official_time"), ("raw_note", "official_rules")):
-            extracted[official] = extracted.pop(legacy)
+            extracted[official_field] = extracted.pop(legacy)
     monkeypatch.setattr(main, "fetch_text", AsyncMock(return_value=PAGE))
     monkeypatch.setattr(llm, "_chat_once", AsyncMock(return_value=json.dumps(extracted, ensure_ascii=False)))
 
     def message(mid):
-        return OneBotMessage({"post_type": "message", "message_type": "group", "group_id": "g1",
-                              "user_id": "teacher", "message_id": mid, "self_id": 30001,
-                              "raw_message": f"[CQ:at,qq=30001] 发布 {URL}"})
+        return official_message(message_type="group", group_id="g1", user_id="teacher", msg_id=mid, bot_id=30001, content=f"<@30001> 发布 {URL}")
 
     await bot.on_group_at_message_create(message("first"))
     record = database.list_competitions(status="confirmed")[0]
@@ -362,7 +360,7 @@ async def test_onebot_publish_twice_preserves_fields_without_second_notification
     }
     for field, value in expected.items():
         assert record[field] == value
-    first_calls = list(onebot.send_group_msg_result.await_args_list)
+    first_calls = list(official.send_group_msg_result.await_args_list)
     notices = [call.args for call in first_calls if "【新比赛发布】" in call.args[1]]
     assert [group for group, content in notices] == ["g1"]
     assert all(expected["official_reg_deadline"] in content and expected["official_time"] in content
@@ -372,7 +370,7 @@ async def test_onebot_publish_twice_preserves_fields_without_second_notification
     await bot.on_group_at_message_create(message("second"))
     assert database.list_competitions(status="confirmed") == [record]
     assert counts(db_file[0]) == (1, 1, 1, 1)
-    added = onebot.send_group_msg_result.await_args_list[len(first_calls):]
+    added = official.send_group_msg_result.await_args_list[len(first_calls):]
     assert len(added) == 1 and added[0].args[0] == "g1" and "未重复发布" in added[0].args[1]
 
 
@@ -475,10 +473,10 @@ async def test_publish_with_official_homepage_keeps_teacher_time_and_tracks(db_f
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1"})
     monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher"})
     monkeypatch.setattr(config, "GROUP_ACTIVE_MESSAGES_ENABLED", True)
-    onebot = SimpleNamespace(send_group_msg_result=AsyncMock(
-        return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
+    official = SimpleNamespace(send_group_msg_result=AsyncMock(
+        return_value=DeliveryResult.sent("qqbot", DeliveryMode.ACTIVE, "sent")
     ))
-    bot = main.ACMBot(onebot)
+    bot = main.ACMBot(official)
     page = AsyncMock(return_value=HOMEPAGE)
     monkeypatch.setattr(main, "fetch_text", page)
     chat = AsyncMock(return_value=json.dumps({
@@ -488,9 +486,7 @@ async def test_publish_with_official_homepage_keeps_teacher_time_and_tracks(db_f
     }, ensure_ascii=False))
     monkeypatch.setattr(llm, "_chat_once", chat)
 
-    message = OneBotMessage({"post_type": "message", "message_type": "group", "group_id": "g1",
-                             "user_id": "teacher", "message_id": "home-1", "self_id": 30001,
-                             "raw_message": f"[CQ:at,qq=30001] {TEACHER_TEXT}"})
+    message = official_message(message_type="group", group_id="g1", user_id="teacher", msg_id="home-1", bot_id=30001, content=f"<@30001> {TEACHER_TEXT}")
     await bot.on_group_at_message_create(message)
 
     sent = chat.await_args.args[1]

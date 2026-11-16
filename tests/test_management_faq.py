@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cdutetc import commands, config, database, main, utils
-from cdutetc.clients.onebot import OneBotMessage
+from conftest import official_message
 from cdutetc.errors import DeliveryMode, DeliveryResult
 
 
@@ -34,17 +34,14 @@ def db(tmp_path, monkeypatch):
 
 
 def message(api, text, member, group="g1"):
-    return OneBotMessage({
-        "message_id": 1, "group_id": group, "raw_message": f"[CQ:at,qq=30001] {text}",
-        "message_type": "group", "user_id": member, "self_id": "30001",
-    })
+    return official_message(msg_id=1, group_id=group, content=f"<@30001> {text}", message_type="group", user_id=member, bot_id="30001")
 
 
 @pytest.mark.parametrize("member", ["admin", "teacher"])
-async def test_onebot_role_can_add_cancel_courses_and_add_delete_faq(db, monkeypatch, member):
+async def test_official_role_can_add_cancel_courses_and_add_delete_faq(db, monkeypatch, member):
     question_id = database.add_unanswered_question("g1", "怎么报名？", "student")
     api = SimpleNamespace(send_group_msg_result=AsyncMock(
-        return_value=DeliveryResult.sent("onebot", DeliveryMode.ACTIVE, "sent")
+        return_value=DeliveryResult.sent("qqbot", DeliveryMode.ACTIVE, "sent")
     ))
     client = main.ACMBot(api)
     await client.on_group_at_message_create(message(api, "/课程添加 算法课 周三 19:00-21:00 机房", member))

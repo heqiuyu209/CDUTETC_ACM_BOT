@@ -70,7 +70,7 @@ async def test_main_general_reminder_keeps_platform_error_code(db, monkeypatch):
     monkeypatch.setattr(reminder, "datetime", Clock)
     bot = main.ACMBot()
     monkeypatch.setattr(bot, "_send_group_result", AsyncMock(return_value=DeliveryResult(
-        False, DeliveryCode.FORBIDDEN, "onebot",
+        False, DeliveryCode.FORBIDDEN, "qqbot",
     )))
     await bot._general_remind_job()
     row = database.list_deliveries("g1")[0]
