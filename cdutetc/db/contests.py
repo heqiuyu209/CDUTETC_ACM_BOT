@@ -1,7 +1,9 @@
 """比赛主数据访问：contests 兼容表、competitions 及版本快照、比赛编辑与赛制迁移。"""
 
 import logging
-import hashlib, json, sqlite3
+import hashlib
+import json
+import sqlite3
 from datetime import datetime
 from urllib.parse import urlsplit
 from cdutetc import config

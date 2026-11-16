@@ -38,6 +38,7 @@ INTENT_RECURRING_COURSE = "RECURRING_COURSE"
 INTENT_ONE_OFF_SESSION = "ONE_OFF_SESSION"
 INTENT_CONTEST = "CONTEST"
 INTENT_UPDATE_CANCEL = "UPDATE_CANCEL"
+INTENT_POLICY_FAQ = "POLICY_FAQ"
 INTENT_CHAT_IGNORE = "CHAT_IGNORE"
 
 INTENTS = (
@@ -45,6 +46,7 @@ INTENTS = (
     INTENT_ONE_OFF_SESSION,
     INTENT_CONTEST,
     INTENT_UPDATE_CANCEL,
+    INTENT_POLICY_FAQ,
     INTENT_CHAT_IGNORE,
 )
 
@@ -70,6 +72,12 @@ TIME_ANCHOR = re.compile(
 EVENT_ANCHOR = re.compile(
     r"课|周报|集训|训练|机房|实验室|比赛|周赛|选拔|模拟|补题|讲座|调课|改到|取消|推迟|地点|链接|http",
     re.IGNORECASE,
+)
+# 锚点三：队规/制度/流程类表达。这类消息常常既无日期也无课程关键词
+# （「请假要提前一天报备」「报销单据交给组长」），漏了它就会在预过滤阶段被静默丢弃。
+POLICY_ANCHOR = re.compile(
+    r"制度|规定|规则|规范|纪律|要求|考勤|签到|打卡|请假|报备|报销|发票|物资|经费|"
+    r"值班|值日|机位|设备|不得|禁止|严禁|必须|统一|流程|申请|须知|注意事项|以后|一律",
 )
 
 # @ 段与用户粘贴的表情标记在计数前剔除。
@@ -119,7 +127,11 @@ def should_call_llm(text: str) -> bool:
     plain = normalize_text(text)
     if len(plain) < MIN_TEXT_LENGTH:
         return False
-    return bool(TIME_ANCHOR.search(plain) or EVENT_ANCHOR.search(plain))
+    return bool(
+        TIME_ANCHOR.search(plain)
+        or EVENT_ANCHOR.search(plain)
+        or POLICY_ANCHOR.search(plain)
+    )
 
 
 def _weekday_of(moment: datetime) -> str:
@@ -238,7 +250,7 @@ def _system_prompt(now: datetime) -> str:
         "你是 ACM 集训队群消息的意图解析器，只输出一个 JSON 对象，不要解释、不要代码块。\n"
         f"当前北京时间：{now:%Y-%m-%d %H:%M} {_weekday_of(now)}。\n"
         "输出字段：\n"
-        '{"intent":"RECURRING_COURSE|ONE_OFF_SESSION|CONTEST|UPDATE_CANCEL|CHAT_IGNORE",'
+        '{"intent":"RECURRING_COURSE|ONE_OFF_SESSION|CONTEST|UPDATE_CANCEL|POLICY_FAQ|CHAT_IGNORE",'
         '"confidence":"high|medium","title":"","date":"","weekday":"","start_time":"",'
         '"end_time":"","location":"","url":"","target_id":0,"cancel":false,'
         '"missing":["造成不完整所缺的信息英文键"]}\n'
@@ -248,8 +260,14 @@ def _system_prompt(now: datetime) -> str:
         "- CONTEST：比赛通知（含周赛/选拔/模拟赛），给 title、date、start_time，有链接填 url。\n"
         "- UPDATE_CANCEL：修改或取消已有课程/比赛，target_id 填索引里的编号，"
         "cancel=true 表示取消。\n"
-        "- CHAT_IGNORE：闲聊、鼓励、感想（即使含时间词），例如「昨晚CF打得不错，下周继续保持」。\n"
-        "- 凡是提问、求推荐、寒暄、@他人，一律 CHAT_IGNORE。\n"
+        "- POLICY_FAQ：老师发布需要长期遵守的队规/制度/流程要求，没有具体某一天的时间锚点，"
+        "例如「以后请假必须提前一天在群里报备」「报销单据周五前交给组长」「训练期间禁止带外队人员进机房」。"
+        "title 填规则主题（如「请假流程」），这类消息 confidence 一律 high。\n"
+        "- CHAT_IGNORE：闲聊、鼓励、感想、批评训话（即使含时间词或「以后」），"
+        "例如「昨晚CF打得不错，下周继续保持」「大家最近状态不错，继续努力」。\n"
+        "- 提问、求推荐、寒暄、@他人，一律 CHAT_IGNORE。\n"
+        "- 既是规则又含一次性日程的消息（如「这周三晚七点讲图论，以后迟到不许进教室」）"
+        "按日程处理，归 RECURRING_COURSE / ONE_OFF_SESSION，不要归 POLICY_FAQ。\n"
         "- confidence：时间与事项都能直接执行才 high；出现「找个晚上」「下周再说」「待定」"
         "这类模糊表达必须 medium，并在 missing 里写明缺什么。\n"
         "- 日期只输出 YYYY-MM-DD，时间只输出 HH:MM，不要自己推算相对日期。"
@@ -569,6 +587,7 @@ def ctx_label(intent: str) -> str:
         INTENT_ONE_OFF_SESSION: "单次集训",
         INTENT_CONTEST: "比赛",
         INTENT_UPDATE_CANCEL: "改期/取消",
+        INTENT_POLICY_FAQ: "队规/制度",
     }.get(intent, "通知")
 
 
@@ -601,6 +620,9 @@ async def handle_message(text: str, *, group_id: str, sender_id: str,
     intent = slots["intent"]
     if intent == INTENT_CHAT_IGNORE:
         return _result(intent, "ignored")
+    # 队规/制度类不进日程落库链：先提炼成问答草稿，等老师私聊点头才生效。
+    if intent == INTENT_POLICY_FAQ:
+        return await _apply_policy_faq(text, slots, group_id, sender_id)
     # 比赛链接补充：正文里的「地点：xxx」能补上模型漏掉的场地，
     # 抓取失败只是少一点补充信息，不影响落库。
     if intent == INTENT_CONTEST:
@@ -648,6 +670,64 @@ async def _apply_high(text: str, slots: dict, group_id: str, sender_id: str,
     prefix = "📌 已自动登记集训" if intent == INTENT_ONE_OFF_SESSION else "📌 已自动登记课程"
     return _result(intent, "saved", reply=_course_receipt(course, prefix=prefix),
                    object_id=course.get("id"))
+
+
+def _policy_private_text(topic: str, created: list[dict], duplicates: list[dict]) -> str:
+    """私聊确认卡：只列草稿编号 + 问答，一句话说清怎么回。"""
+    lines = [f"📋 队规问答草稿·{topic}（共 {len(created)} 条，等你确认）"]
+    for item in created:
+        lines.append(f'#{item["faq_id"]}')
+        lines.append(f'Q: {item["question"]}')
+        lines.append(f'A: {item["answer"]}')
+        lines.append("")
+    if duplicates:
+        lines.append("以下与已录入问答重复，未重复建档：")
+        lines.extend(f'- {item["question"]}' for item in duplicates[:5])
+        lines.append("")
+    lines.append(
+        "回复「确认 编号」让它生效，「FAQ驳回 编号」丢弃；"
+        "多条可写「确认 12 13」，「确认 全部」/「FAQ驳回 全部」一次处理。\n"
+        "不想私聊处理，也可以在群里用 /FAQ待确认、/FAQ确认、/FAQ驳回。"
+    )
+    return "\n".join(lines).strip()
+
+
+async def _apply_policy_faq(text: str, slots: dict, group_id: str, sender_id: str) -> dict:
+    """队规/制度通知：提炼问答草稿写 pending，私聊老师确认后才生效。
+
+    刻意不做的事：绝不直接写 confirmed——老师一句「以后别迟到」不该自动变成队规，
+    必须本人点头；提炼不到可复用规则、或与既有问答重复时，群里保持安静或只回一句
+    「未重复建档」，绝不刷屏。
+    """
+    if not getattr(config, "TEACHER_POLICY_FAQ_ENABLED", True):
+        return _result(INTENT_POLICY_FAQ, "ignored")
+    drafts = await llm.extract_faqs(normalize_text(text))
+    if not drafts:
+        return _result(INTENT_POLICY_FAQ, "ignored")
+    topic = str(slots.get("title") or "").strip() or "队规"
+    created: list[dict] = []
+    duplicates: list[dict] = []
+    for draft in drafts:
+        try:
+            outcome = db.add_faq_pending(
+                group_id, draft["question"], draft["answer"],
+                source=db.teacher_source(sender_id), operator=sender_id,
+            )
+        except Exception:
+            logger.exception("队规问答草稿入库失败 [group=%s]", group_id)
+            continue
+        (created if outcome.get("created") else duplicates).append(outcome)
+    if not created and not duplicates:
+        return _result(INTENT_POLICY_FAQ, "ignored")
+    if created:
+        reply = f"📝 收到「{topic}」相关队规，已提炼 {len(created)} 条问答草稿，私聊确认后生效。"
+    else:
+        reply = f"📝 这条队规和已录入问答重复（{len(duplicates)} 条），未重复建档。"
+    notify = [(sender_id, _policy_private_text(topic, created, duplicates))] if created else []
+    return _result(
+        INTENT_POLICY_FAQ, "pending", reply=reply, notify=notify,
+        object_id=(created[0]["faq_id"] if created else None),
+    )
 
 
 def _apply_medium(text: str, slots: dict, group_id: str, sender_id: str,

@@ -1,7 +1,9 @@
 """训练与提醒域数据访问：training_sessions、org_events、reminder_deliveries 租约投递、自定义提醒。"""
 
 import logging
-import json, sqlite3, uuid
+import json
+import sqlite3
+import uuid
 from collections.abc import Iterable
 from datetime import datetime, timedelta
 from cdutetc import config

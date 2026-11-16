@@ -251,7 +251,10 @@ async def test_member_question_prefers_local_kb_without_model(bot, monkeypatch):
     await client.on_group_at_message_create(_message("本群校赛报名在哪里？", member_id="student"))
 
     chat.assert_not_awaited()
-    assert replies == [("g1", "本群知识库答案")]
+    assert [gid for gid, _ in replies] == ["g1"]
+    # 直答会在答案后追加「依据 FAQ #id」，方便队员核对来源
+    assert replies[0][1].startswith("本群知识库答案")
+    assert "依据 FAQ #" in replies[0][1]
 
 
 async def test_faq_match_still_skips_qa_model(bot, monkeypatch):
@@ -264,4 +267,5 @@ async def test_faq_match_still_skips_qa_model(bot, monkeypatch):
     await client.on_group_at_message_create(_message("校赛怎么报名？"))
 
     chat.assert_not_awaited()
-    assert replies == [("g1", "请找负责老师登记。")]
+    assert [gid for gid, _ in replies] == ["g1"]
+    assert replies[0][1].startswith("请找负责老师登记。")

@@ -1,7 +1,8 @@
 """问答与征集域数据访问：group_faq、unanswered_questions、collections 与报名登记。"""
 
 import logging
-import json, sqlite3
+import json
+import sqlite3
 from cdutetc import config, content_filter
 
 from cdutetc.db import admin as _admin
@@ -14,12 +15,50 @@ logger = logging.getLogger(__name__)
 
 _FAQ_COLS = "id, group_id, question, answer, source, status, updated_at"
 
+# group_faq.status 生命周期：
+#   pending   老师群内规则通知自动提炼出来的草稿，等本人私聊确认；
+#   confirmed 已生效，问答检索/上下文注入只认这一种；
+#   rejected  老师驳回的草稿，保留审计但不参与任何召回；
+#   deleted   管理端删除（软删），同样不参与召回。
+FAQ_PENDING = "pending"
+FAQ_CONFIRMED = "confirmed"
+FAQ_REJECTED = "rejected"
+FAQ_DELETED = "deleted"
+
+# 老师规则通知提炼出的草稿，source 记「teacher_intent:<提交人>」。
+# 这样私聊确认时能按提交人筛出自己的草稿，不必为了归属人多加一列。
+FAQ_SOURCE_TEACHER = "teacher_intent"
+
+
+def teacher_source(operator: str) -> str:
+    """规则草稿的 source 标记：带提交人，供私聊确认时按人过滤。"""
+    return f"{FAQ_SOURCE_TEACHER}:{_conn._as_str(operator)}"
+
 
 def _row_to_faq(r: sqlite3.Row) -> dict:
     return {
         "id": r[0], "group_id": r[1], "question": r[2], "answer": r[3],
         "source": r[4], "status": r[5], "updated_at": r[6],
     }
+
+
+def _close_same_question(conn, group_id: str, question: str, faq_id: int,
+                         *, skip_qid: int | None = None) -> None:
+    """FAQ 生效时顺手关掉本群其它同题未答问题（调用方保证已在事务内）。"""
+    target = _contests._normalize_question(question)
+    rows = conn.execute(
+        "SELECT id, question FROM unanswered_questions WHERE group_id = ? AND status = 'open'",
+        (group_id,),
+    ).fetchall()
+    for qid, stored_question in rows:
+        if qid == skip_qid:
+            continue
+        if _contests._normalize_question(stored_question) == target:
+            conn.execute(
+                "UPDATE unanswered_questions SET status = 'answered', faq_id = ?"
+                " WHERE id = ? AND group_id = ? AND status = 'open'",
+                (faq_id, qid, group_id),
+            )
 
 
 def add_faq(group_id: str, question: str, answer: str, source: str = "",
@@ -37,47 +76,188 @@ def add_faq(group_id: str, question: str, answer: str, source: str = "",
             (group_id, question, answer, _conn._as_str(source or ""), _conn.now_str()),
         )
         fid = cur.lastrowid
-        pending = conn.execute(
-            "SELECT id, question FROM unanswered_questions WHERE group_id = ? AND status = 'open'",
-            (group_id,),
-        ).fetchall()
-        for qid, stored_question in pending:
-            if _contests._normalize_question(stored_question) == question:
-                conn.execute(
-                    "UPDATE unanswered_questions SET status = 'answered', faq_id = ?"
-                    " WHERE id = ? AND group_id = ? AND status = 'open'",
-                    (fid, qid, group_id),
-                )
+        _close_same_question(conn, group_id, question, fid)
         _admin.add_audit(operator, group_id, "create", "faq", str(fid), "", question[:50], conn=conn)
         return fid
 
 
-def list_faq(group_id: str, keyword: str | None = None) -> list[dict]:
+def list_faq(group_id: str, keyword: str | None = None,
+             status: str | None = None) -> list[dict]:
+    """列出本群 FAQ。
+
+    ``status`` 语义（默认口径偏安全，避免未确认草稿被当作正式答案）：
+      - ``None``（默认）：只返回 confirmed —— 问答检索、上下文注入一律只认已生效条目；
+      - ``"all"``：除 rejected/deleted 外的全部，供管理端总览；
+      - 具体状态：``pending`` / ``confirmed`` / ``rejected`` / ``deleted`` 精确筛选。
+    """
+    where = ["group_id = ?"]
+    args: list = [group_id]
+    if status is None:
+        where.append("status = 'confirmed'")
+    elif status == "all":
+        where.append("status NOT IN ('rejected', 'deleted')")
+    else:
+        where.append("status = ?")
+        args.append(_conn._as_str(status))
+    if keyword:
+        where.append("(question LIKE ? OR answer LIKE ?)")
+        args.extend([f"%{keyword}%", f"%{keyword}%"])
     with _conn._connect() as conn:
-        if keyword:
-            rows = conn.execute(
-                f"SELECT {_FAQ_COLS} FROM group_faq WHERE group_id = ?"
-                " AND (question LIKE ? OR answer LIKE ?) AND status != 'deleted'"
-                " ORDER BY id DESC",
-                (group_id, f"%{keyword}%", f"%{keyword}%"),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                f"SELECT {_FAQ_COLS} FROM group_faq WHERE group_id = ? AND status != 'deleted'"
-                " ORDER BY id DESC",
-                (group_id,),
-            ).fetchall()
+        rows = conn.execute(
+            f"SELECT {_FAQ_COLS} FROM group_faq WHERE {' AND '.join(where)} ORDER BY id DESC",
+            args,
+        ).fetchall()
     return [_row_to_faq(r) for r in rows]
 
 
 def get_faq(group_id: str, faq_id: int) -> dict | None:
-    """只读取本群仍有效的 FAQ，供等待模型后的复核使用。"""
+    """只读取本群仍有效（confirmed）的 FAQ，供等待模型后的复核使用。"""
     with _conn._connect() as conn:
         row = conn.execute(
-            f"SELECT {_FAQ_COLS} FROM group_faq WHERE group_id=? AND id=? AND status != 'deleted'",
+            f"SELECT {_FAQ_COLS} FROM group_faq"
+            " WHERE group_id=? AND id=? AND status = 'confirmed'",
             (group_id, faq_id),
         ).fetchone()
     return _row_to_faq(row) if row else None
+
+
+def add_faq_pending(group_id: str, question: str, answer: str, source: str = "",
+                    operator: str = "") -> dict:
+    """写入待确认 FAQ（老师规则通知提炼），不直接生效。
+
+    去重口径：同群同问题已有 pending 草稿 → 覆盖答案（老师又补充了规则细节）；
+    已有 confirmed 条目 → 原样保留、不再生成草稿，避免重复打扰。
+
+    Returns:
+        {"faq_id": int, "question": str, "answer": str, "status": str, "created": bool}
+        ``created=False`` 表示命中了既有条目（pending 已更新 / confirmed 已存在）。
+    """
+    question = _contests._normalize_question(question)
+    answer = _conn._as_str(answer)
+    if not question or not answer:
+        raise ValueError("FAQ 的问题与答案都不能为空")
+    with _conn._connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT id, status, answer FROM group_faq WHERE group_id = ? AND question = ?"
+            " AND status IN ('pending', 'confirmed') ORDER BY id DESC",
+            (group_id, question),
+        ).fetchone()
+        if row is not None:
+            fid, status, stored_answer = int(row[0]), row[1], row[2]
+            if status == FAQ_PENDING and stored_answer != answer:
+                conn.execute(
+                    "UPDATE group_faq SET answer = ?, source = ?, updated_at = ? WHERE id = ?",
+                    (answer, _conn._as_str(source or ""), _conn.now_str(), fid),
+                )
+                _admin.add_audit(operator, group_id, "update", "faq_pending", str(fid),
+                                 str(stored_answer)[:50], answer[:50], conn=conn)
+            return {"faq_id": fid, "question": question, "answer": answer,
+                    "status": status, "created": False}
+        cur = conn.execute(
+            "INSERT INTO group_faq (group_id, question, answer, source, status, updated_at)"
+            " VALUES (?, ?, ?, ?, 'pending', ?)",
+            (group_id, question, answer, _conn._as_str(source or ""), _conn.now_str()),
+        )
+        fid = cur.lastrowid
+        _admin.add_audit(operator, group_id, "create", "faq_pending", str(fid), "",
+                         question[:50], conn=conn)
+        return {"faq_id": fid, "question": question, "answer": answer,
+                "status": FAQ_PENDING, "created": True}
+
+
+def get_pending_faq(group_id: str, faq_id: int) -> dict | None:
+    """按编号读取本群某条 pending 草稿。"""
+    try:
+        key = int(faq_id)
+    except (TypeError, ValueError):
+        return None
+    with _conn._connect() as conn:
+        row = conn.execute(
+            f"SELECT {_FAQ_COLS} FROM group_faq"
+            " WHERE group_id = ? AND id = ? AND status = 'pending'",
+            (group_id, key),
+        ).fetchone()
+    return _row_to_faq(row) if row else None
+
+
+def get_faq_record(faq_id: int) -> dict | None:
+    """按编号读取任意状态、任意群的 FAQ（私聊确认时据此定位归属群）。"""
+    try:
+        key = int(faq_id)
+    except (TypeError, ValueError):
+        return None
+    with _conn._connect() as conn:
+        row = conn.execute(
+            f"SELECT {_FAQ_COLS} FROM group_faq WHERE id = ?", (key,),
+        ).fetchone()
+    return _row_to_faq(row) if row else None
+
+
+def list_pending_faq(group_id: str = "", owner: str = "") -> list[dict]:
+    """列出待确认 FAQ。
+
+    Args:
+        group_id: 空表示全部群（管理端私聊/「确认全部」用）。
+        owner: 空表示不限提交人；填老师标识时只返回该老师提炼的草稿。
+    """
+    where, args = ["status = 'pending'"], []
+    if _conn._as_str(group_id):
+        where.insert(0, "group_id = ?")
+        args.append(_conn._as_str(group_id))
+    if _conn._as_str(owner):
+        where.append("source = ?")
+        args.append(teacher_source(owner))
+    with _conn._connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_FAQ_COLS} FROM group_faq WHERE {' AND '.join(where)} ORDER BY id DESC",
+            args,
+        ).fetchall()
+    return [_row_to_faq(r) for r in rows]
+
+
+def confirm_faq(group_id: str, faq_id: int, operator: str = "") -> dict | None:
+    """把 pending 草稿转为 confirmed 生效，并关闭本群同题未答问题。"""
+    try:
+        key = int(faq_id)
+    except (TypeError, ValueError):
+        return None
+    with _conn._connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            f"SELECT {_FAQ_COLS} FROM group_faq WHERE id = ? AND group_id = ? AND status = 'pending'",
+            (key, group_id),
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute(
+            "UPDATE group_faq SET status = 'confirmed', updated_at = ? WHERE id = ?",
+            (_conn.now_str(), key),
+        )
+        _close_same_question(conn, group_id, row[2], key)
+        _admin.add_audit(operator, group_id, "confirm", "faq", str(key), "pending",
+                         "confirmed", conn=conn)
+        record = _row_to_faq(row)
+    record["status"] = FAQ_CONFIRMED
+    return record
+
+
+def reject_faq(group_id: str, faq_id: int, operator: str = "", note: str = "") -> bool:
+    """驳回 pending 草稿：置为 rejected，保留审计但不参与召回。"""
+    try:
+        key = int(faq_id)
+    except (TypeError, ValueError):
+        return False
+    with _conn._connect() as conn:
+        cur = conn.execute(
+            "UPDATE group_faq SET status = 'rejected', updated_at = ?"
+            " WHERE id = ? AND group_id = ? AND status = 'pending'",
+            (_conn.now_str(), key, group_id),
+        )
+        if cur.rowcount:
+            _admin.add_audit(operator, group_id, "reject", "faq", str(key), "pending",
+                             ("rejected " + (note or "")).strip(), conn=conn)
+        return cur.rowcount > 0
 
 
 def delete_faq(group_id: str, faq_id: int, operator: str = "") -> bool:
@@ -179,18 +359,7 @@ def answer_unanswered_question(group_id: str, qid: int, answer: str,
             "UPDATE unanswered_questions SET status = 'answered', faq_id = ? WHERE id = ?",
             (fid, qid),
         )
-        target = _contests._normalize_question(question)
-        others = conn.execute(
-            "SELECT id, question FROM unanswered_questions"
-            " WHERE group_id = ? AND status = 'open'",
-            (group_id,),
-        ).fetchall()
-        for other_id, other_question in others:
-            if other_id != qid and _contests._normalize_question(other_question) == target:
-                conn.execute(
-                    "UPDATE unanswered_questions SET status = 'answered', faq_id = ?"
-                    " WHERE id = ?", (fid, other_id),
-                )
+        _close_same_question(conn, group_id, question, fid, skip_qid=qid)
         _admin.add_audit(operator, group_id, "answer_question", "unanswered_question",
                   str(qid), "", question, conn=conn)
         return {"faq_id": fid, "question": question, "asker": asker}

@@ -27,6 +27,8 @@ SESSION_WINDOW_DAYS = 7
 MAX_SESSION_ITEMS = 14
 MAX_COLLECTION_ITEMS = 8
 MAX_FAQ_ITEMS = 30
+# @提问时只注入与本问最相关的前 N 条 FAQ：全量塞进去会稀释事实、也挤占 token。
+FAQ_TOP_N = 3
 # 单条 FAQ 的展示上限，避免个别长答案挤占整段上下文预算。
 FAQ_QUESTION_CHARS = 60
 FAQ_ANSWER_CHARS = 120
@@ -181,6 +183,41 @@ def faq_pairs(group_id: str, limit: int = MAX_FAQ_ITEMS) -> list[dict]:
     return out
 
 
+def relevant_faqs(group_id: str, question: str, limit: int = FAQ_TOP_N) -> list[dict]:
+    """与当前提问最相关的已生效 FAQ（按 ``cdutetc.faq`` 的打分取 Top-N）。
+
+    只取 confirmed 条目：``db.list_faq`` 的默认口径就是 confirmed，
+    待确认草稿（pending）绝不能被当作教务事实注入提示词。
+    """
+    gid = (group_id or "").strip()
+    text = (question or "").strip()
+    if not gid or not text or limit <= 0:
+        return []
+    try:
+        items = db.list_faq(gid)
+    except Exception:
+        logger.warning("问答上下文读取相关 FAQ 失败 [group=%s]", gid, exc_info=True)
+        return []
+    if not items:
+        return []
+    # 延迟导入：faq 模块本身不依赖 qa_context，放在函数内可避免导入期耦合。
+    from cdutetc import faq as faq_search
+
+    out: list[dict] = []
+    for score, item in faq_search.top_matches(text, items, limit=limit):
+        question_text = (item.get("question") or "").strip()
+        answer = (item.get("answer") or "").strip()
+        if not question_text or not answer:
+            continue
+        out.append({
+            "id": item.get("id"),
+            "question": question_text,
+            "answer": answer,
+            "score": round(score, 3),
+        })
+    return out
+
+
 # ---------------------------------------------------------------------
 # 文本结构化
 # ---------------------------------------------------------------------
@@ -248,8 +285,20 @@ def _truncate(text: str, limit: int) -> str:
     return "\n".join(kept)
 
 
-def build_group_qa_context(group_id: str, now: datetime | None = None) -> str:
+def _faq_line(item: dict) -> str:
+    """FAQ 行：带编号，模型据此才能给出「依据 FAQ #3」这类来源提示。"""
+    head = f'#{item["id"]} ' if item.get("id") else ""
+    return (f'- {head}Q: {_clip(item["question"], FAQ_QUESTION_CHARS)}'
+            f' A: {_clip(item["answer"], FAQ_ANSWER_CHARS)}')
+
+
+def build_group_qa_context(group_id: str, now: datetime | None = None,
+                           question: str = "") -> str:
     """组装本群问答事实上下文；三路数据全空或开关关闭时返回空串。
+
+    ``question`` 非空时（@机器人 提问场景），FAQ 段只注入与该问题最相关的
+    ``FAQ_TOP_N`` 条，让模型聚焦证据、避免分工不明的泛化条目干扰作答。
+    ``question`` 留空时保持原行为（全量 ``MAX_FAQ_ITEMS`` 条），供摘要类场景复用。
 
     返回示例::
 
@@ -268,9 +317,10 @@ def build_group_qa_context(group_id: str, now: datetime | None = None) -> str:
         return ""
 
     current = _now(now)
+    asked = (question or "").strip()
     weekly = weekly_courses(gid, now)
     collections = open_collections(gid)
-    faqs = faq_pairs(gid)
+    faqs = relevant_faqs(gid, asked) if asked else faq_pairs(gid)
     if not (weekly or collections or faqs):
         return ""
 
@@ -285,11 +335,11 @@ def build_group_qa_context(group_id: str, now: datetime | None = None) -> str:
     lines.extend([_week_course_line(item) for item in weekly] or ["- 暂无已登记课程"])
     lines.append("2. 进行中的征集与报名：")
     lines.extend([_collection_line(item) for item in collections] or ["- 暂无开放中的征集"])
-    lines.append("3. 常见问题（FAQ）：")
-    lines.extend(
-        [f'- Q: {_clip(item["question"], FAQ_QUESTION_CHARS)} A: {_clip(item["answer"], FAQ_ANSWER_CHARS)}'
-         for item in faqs] or ["- 暂无已录入 FAQ"]
-    )
+    if asked:
+        lines.append(f"3. 常见问题（FAQ，与本问最相关的 {len(faqs)} 条，可直接引用编号）：")
+    else:
+        lines.append("3. 常见问题（FAQ）：")
+    lines.extend([_faq_line(item) for item in faqs] or ["- 暂无已录入 FAQ"])
     lines.append("4. 每周常规训练/任务（每周重复，无单次日期）：")
     lines.extend([_repeat_course_line(item) for item in weekly] or ["- 暂无周常课程"])
     return _truncate(
@@ -306,6 +356,7 @@ __all__ = [
     "weekly_courses",
     "open_collections",
     "faq_pairs",
+    "relevant_faqs",
 ]
 
 # 保留 daily_digest 引用，表明课程解析逻辑与其同源（避免重复实现）。

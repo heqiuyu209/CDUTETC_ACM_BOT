@@ -156,11 +156,11 @@ async def test_unknown_question_still_collected_and_exact_faq_without_question_w
     monkeypatch.setattr(llm, "_chat_once", AsyncMock(side_effect=AssertionError("普通查询不调模型")))
     database.add_faq("g1", "二机位", "第二个摄像头，用来拍桌面。")
     replies = await commands.handle_non_command_message("二机位", "g1", "member")
-    assert replies[0]["text"] == "第二个摄像头，用来拍桌面。"
+    assert replies[0]["text"].startswith("第二个摄像头，用来拍桌面。")
     database.add_faq("g1", "队服", "联系负责老师领取。")
     assert not content_filter.is_information_request("队服")
     replies = await commands.handle_non_command_message("队服", "g1", "member")
-    assert replies[0]["text"] == "联系负责老师领取。"
+    assert replies[0]["text"].startswith("联系负责老师领取。")
     replies = await commands.handle_non_command_message("校赛时间", "g1", "member")
     assert "问题编号" in replies[0]["text"]
     assert [q["question"] for q in database.list_unanswered("g1")] == ["校赛时间"]

@@ -280,6 +280,8 @@ QA_MEMBER_NO_MATCH_REPLY = os.getenv(
 QA_KB_MATCH_MIN_SCORE = float(os.getenv("ACM_QA_KB_MATCH_MIN_SCORE", "0.34"))
 # 仅本地无法确定 FAQ 时让模型选择候选编号；默认关闭，保持零模型成本。
 QA_FAQ_LLM_ENABLED = os.getenv("ACM_QA_FAQ_LLM_ENABLED", "0") == "1"
+# FAQ 直答时是否附「依据 FAQ #编号」来源提示；默认开，便于成员核对与老师改错。
+QA_FAQ_CITE_ENABLED = os.getenv("ACM_QA_FAQ_CITE_ENABLED", "1") != "0"
 
 # --- 8) 动态群上下文注入（问答链路重构） ---
 # 开启后每次 @机器人 提问都会把「未来 7 天课程 + 开放征集 + 本群 FAQ」拼成
@@ -409,6 +411,9 @@ NL_INTENT_ENABLED = os.getenv("ACM_NL_INTENT_ENABLED", "1") != "0"
 # 是否自动识别意图并登记课程/比赛。关闭后只认 / 开头的显式命令，
 # 群内普通消息一律不进意图管线（不做预过滤、不调模型）。
 TEACHER_AUTO_INTENT_ENABLED = os.getenv("ACM_TEACHER_AUTO_INTENT_ENABLED", "1") != "0"
+# 老师发的队规/制度类消息（考勤、报销、请假流程等，无具体日程）是否自动提炼成
+# FAQ 草稿并私聊请其确认。关闭后这类消息按闲聊静默，不写 pending、不发私聊。
+TEACHER_POLICY_FAQ_ENABLED = os.getenv("ACM_TEACHER_POLICY_FAQ_ENABLED", "1") != "0"
 
 # ================= 群聊娱乐（零 Token，默认开启） =================
 # 跟风复读（+1）：群友连续刷同一句话时被动复读一遍，全程不调模型、不占主动额度。

@@ -146,7 +146,9 @@ async def test_faq_answer_wins_before_algorithm_gate(bot, monkeypatch):
     monkeypatch.setattr(llm, "_chat_once", chat)
 
     replies = await _run_chain(bot, "动态规划是什么", member_id="teacher")
-    assert replies == [("g1", "管理员预设答案")]
+    assert [gid for gid, _ in replies] == ["g1"]
+    # 命中 FAQ 会在标准答案后追加来源提示（依据 FAQ #id）
+    assert replies[0][1].startswith("管理员预设答案")
     chat.assert_not_awaited()
 
 

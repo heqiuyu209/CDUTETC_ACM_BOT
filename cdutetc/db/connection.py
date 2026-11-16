@@ -1,7 +1,8 @@
 """数据库连接层：连接管理、事务封装（with _connect()）、WAL、建表与迁移 schema。"""
 
 import logging
-import sqlite3, time
+import sqlite3
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from cdutetc.config import DB_PATH

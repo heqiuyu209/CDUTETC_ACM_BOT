@@ -309,7 +309,9 @@ def handle_command(command: str, args: str, sender: str, current_group: str = ""
                    *, private: bool = False) -> list[dict] | None:
     if command not in COMMANDS:
         return None
-    reply = lambda text, **extra: [{"group_id": current_group, "text": text, **extra}]
+    def reply(text: str, **extra) -> list[dict]:
+        return [{"group_id": current_group, "text": text, **extra}]
+
     # 作用域闸门：私聊只有超管（global），群聊是超管或本群老师（group）；
     # 群内查询永远只能落到 current_group，跨群与配置类操作仍锁在超管。
     from cdutetc import roles

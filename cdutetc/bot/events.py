@@ -140,6 +140,15 @@ class EventsMixin:
         try:
             uid = message.user_id
             content = message.content or ""
+            if not _main.is_super_admin(uid):
+                # 老师在群里发队规后，草稿确认回到私聊：回「确认 12」/「FAQ驳回 12」。
+                # 必须放在超管闸门之前——老师不是超管，放后面就永远收不到自己的回执。
+                decision = (_main.commands.handle_pending_decision(str(uid), content)
+                            if _main.can_manage_group(uid) else None)
+                if decision:
+                    for line in decision:
+                        await self._send_private_result(uid, line)
+                    return
             # 私聊作用域闸门：只有超管能进管理链路，老师与普通成员一律在这里返回，
             # 避免老师借私聊拿到跨群配置/比赛，也避免后续审批与命令被误触发。
             if not _main.is_super_admin(uid):
@@ -156,6 +165,12 @@ class EventsMixin:
             if _main.is_super_admin(uid):
                 handled = await self._handle_publish_decision(uid, content)
                 if handled:
+                    return
+                # 超管也可代为确认老师的 FAQ 草稿（allow_any），回执同样走私聊。
+                decision = _main.commands.handle_pending_decision(str(uid), content, allow_any=True)
+                if decision:
+                    for line in decision:
+                        await self._send_private_result(uid, line)
                     return
             if content.strip().startswith("/") and _main.is_super_admin(uid):
                 cmd, args = _main.parse_command(content)

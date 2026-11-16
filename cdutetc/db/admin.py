@@ -1,7 +1,9 @@
 """管理域数据访问：群白名单、教师授权、admin_workspaces、audit_log、group_settings、账号标注与别名。"""
 
 import logging
-import hashlib, json, sqlite3
+import hashlib
+import json
+import sqlite3
 from datetime import datetime, timedelta
 from cdutetc import config
 from cdutetc.errors import DeliveryCode

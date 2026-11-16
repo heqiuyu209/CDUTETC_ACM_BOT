@@ -51,6 +51,151 @@ def cmd_faq_delete(group_id: str, sender: str, args: str) -> list[dict]:
     return [{"group_id": group_id, "text": f"已删除 FAQ #{fid}"}]
 
 
+def _faq_cite(faq: dict) -> str:
+    """FAQ 直答正文：默认附来源编号，方便老师核对、成员追问时对号。"""
+    answer = str(faq.get("answer") or "").strip()
+    if not config.QA_FAQ_CITE_ENABLED:
+        return answer
+    return f"{answer}\n（依据 FAQ #{faq['id']}）"
+
+
+_PENDING_LIST_LIMIT = 10
+# 私聊确认语：刻意避开发布审批的「同意/通过/拒绝/驳回 + 编号」，两套审批互不抢占。
+_PENDING_DECISION_RE = re.compile(
+    r"^(?P<verb>faq确认|faq驳回|确认)\s*(?P<ids>全部|全选|所有|all|\d[\d\s,，、]*)$", re.I,
+)
+_ALL_PENDING_WORDS = frozenset({"全部", "全选", "所有", "all"})
+
+
+def _parse_pending_ids(raw: str) -> list[int] | None:
+    """解析编号串：「12 13」「#12」「12,13」→ [12, 13]；「全部」→ None；空 → []。"""
+    text = (raw or "").strip()
+    if not text:
+        return []
+    if text.lower() in _ALL_PENDING_WORDS:
+        return None
+    return [int(token) for token in re.findall(r"\d+", text)]
+
+
+def cmd_faq_pending_list(group_id: str, sender: str, args: str) -> list[dict]:
+    """查看本群待确认的问答草稿（老师规则通知自动提炼，未被确认前不参与回答）。"""
+    if not can_manage_group(sender):
+        return [{"group_id": group_id, "text": "仅老师/超管可查看待确认问答"}]
+    items = db.list_pending_faq(group_id)
+    if not items:
+        return [{"group_id": group_id,
+                 "text": "本群没有待确认的问答草稿。\n"
+                         "老师在群里发队规/制度类通知时，会自动提炼成草稿放在这里。"}]
+    lines = [f"待确认问答草稿（{len(items)} 条）："]
+    for item in items[:_PENDING_LIST_LIMIT]:
+        lines.append(f"#{item['id']} Q：{item['question']}")
+        lines.append(f"   A：{item['answer']}")
+    if len(items) > _PENDING_LIST_LIMIT:
+        rest = len(items) - _PENDING_LIST_LIMIT
+        lines.append(f"……另有 {rest} 条，可先按编号处理前 {_PENDING_LIST_LIMIT} 条。")
+    lines.append("")
+    lines.append("通过：/FAQ确认 <编号>（多个编号空格分隔，或 /FAQ确认 全部）")
+    lines.append("丢弃：/FAQ驳回 <编号>（或 /FAQ驳回 全部）")
+    return [{"group_id": group_id, "text": "\n".join(lines)}]
+
+
+def _decide_pending(group_id: str, operator: str, args: str, *, confirm: bool) -> list[dict]:
+    """群内批量确认/驳回本群草稿；逐条给出结果，不做“全部成功”式的模糊回执。"""
+    command = "FAQ确认" if confirm else "FAQ驳回"
+    ids = _parse_pending_ids(args)
+    if ids == []:
+        return [{"group_id": group_id,
+                 "text": f"用法：/{command} <编号>，可写多个编号或「全部」。\n"
+                         "先用 /FAQ待确认 查看待处理草稿。"}]
+    if ids is None:
+        ids = [item["id"] for item in db.list_pending_faq(group_id)]
+        if not ids:
+            return [{"group_id": group_id, "text": "本群没有待确认的问答草稿。"}]
+    done: list[int] = []
+    missing: list[int] = []
+    for fid in ids:
+        if db.get_pending_faq(group_id, fid) is None:
+            missing.append(fid)
+            continue
+        ok = (db.confirm_faq(group_id, fid, operator=operator) if confirm
+              else db.reject_faq(group_id, fid, operator=operator))
+        (done if ok else missing).append(fid)
+    lines: list[str] = []
+    if done:
+        lines.append(("已确认 " if confirm else "已驳回 ")
+                     + f"{len(done)} 条：" + "、".join(f"#{i}" for i in done))
+        lines.append("已生效，之后的同类提问会直接由机器人回答。" if confirm
+                     else "这些草稿不会再被采用。")
+    if missing:
+        lines.append("未处理：" + "、".join(f"#{i}" for i in missing)
+                     + "（不存在、不属于本群或不是待确认状态）")
+    return [{"group_id": group_id, "text": "\n".join(lines)}]
+
+
+def cmd_faq_confirm(group_id: str, sender: str, args: str) -> list[dict]:
+    """确认草稿生效（确认后同类提问即可直接作答）。"""
+    if not can_manage_group(sender):
+        return [{"group_id": group_id, "text": "仅老师/超管可确认问答草稿"}]
+    return _decide_pending(group_id, sender, args, confirm=True)
+
+
+def cmd_faq_reject(group_id: str, sender: str, args: str) -> list[dict]:
+    """驳回草稿（保留审计，但不再参与任何召回）。"""
+    if not can_manage_group(sender):
+        return [{"group_id": group_id, "text": "仅老师/超管可驳回问答草稿"}]
+    return _decide_pending(group_id, sender, args, confirm=False)
+
+
+def handle_pending_decision(sender: str, text: str, *, allow_any: bool = False) -> list[str] | None:
+    """私聊回复「确认 12」/「驳回全部」：处理本人提炼、尚未生效的问答草稿。
+
+    归属校验按草稿 source 里的提交人做，默认只认自己的草稿——老师之间不互相覆盖
+    对方刚发的队规；超管（``allow_any``）可代为处理任意草稿。
+
+    Returns:
+        回执行列表；文本不符合确认/驳回语法时返回 None，交由调用方按普通私聊处理。
+    """
+    match = _PENDING_DECISION_RE.match((text or "").strip())
+    if not match:
+        return None
+    verb = match.group("verb").lower()
+    confirm = verb != "faq驳回"
+    raw = match.group("ids").strip()
+    if raw.lower() in _ALL_PENDING_WORDS:
+        owner = "" if allow_any else sender
+        ids = [item["id"] for item in db.list_pending_faq(owner=owner)]
+        if not ids:
+            return ["你没有待确认的问答草稿。" if not allow_any else "当前没有待确认的问答草稿。"]
+    else:
+        ids = [int(token) for token in re.findall(r"\d+", raw)]
+    own = db.teacher_source(sender)
+    done: list[int] = []
+    foreign: list[int] = []
+    absent: list[int] = []
+    for fid in ids:
+        record = db.get_faq_record(fid)
+        if record is None or record.get("status") != db.FAQ_PENDING:
+            absent.append(fid)
+            continue
+        if not allow_any and record.get("source") != own:
+            foreign.append(fid)
+            continue
+        ok = (db.confirm_faq(record["group_id"], fid, operator=sender) if confirm
+              else db.reject_faq(record["group_id"], fid, operator=sender))
+        (done if ok else absent).append(fid)
+    lines: list[str] = []
+    if done:
+        lines.append(("已确认 " if confirm else "已驳回 ")
+                     + f"{len(done)} 条：" + "、".join(f"#{i}" for i in done))
+        lines.append("已在群里生效，之后同类提问我会直接答。" if confirm
+                     else "这些草稿已丢弃，不会再被引用。")
+    if foreign:
+        lines.append("不是你的草稿，未处理：" + "、".join(f"#{i}" for i in foreign))
+    if absent:
+        lines.append("不存在或已处理：" + "、".join(f"#{i}" for i in absent))
+    return lines or ["没有可处理的内容。"]
+
+
 def cmd_ask(group_id: str, sender: str, args: str) -> list[dict]:
     """记录未答问题。若 FAQ 已命中（上层先查过），不会走到这里。"""
     question = args.strip()
@@ -245,7 +390,7 @@ async def handle_non_command_message(text: str, group_id: str, sender: str,
     is_request = content_filter.is_information_request(text)
     faq = await match_faq(group_id, text, exact_only=not is_request)
     if faq is not None:
-        return [{"group_id": group_id, "text": faq['answer']}]
+        return [{"group_id": group_id, "text": _faq_cite(faq)}]
     if not is_request:
         return ([{"group_id": group_id, "text": SOCIAL_FALLBACK_TEXT}]
                 if config.QA_SOCIAL_CHAT_ENABLED else [])

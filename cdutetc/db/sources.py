@@ -1,7 +1,9 @@
 """来源监控与发布审核管线：competition_sources、待审发布、爬虫 diff 待应用更新。"""
 
 import logging
-import hashlib, json, sqlite3
+import hashlib
+import json
+import sqlite3
 from urllib.parse import urlsplit
 from cdutetc import config
 
