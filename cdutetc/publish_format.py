@@ -267,6 +267,10 @@ def _extend_scope_with_group(cid: int, group_id: str) -> bool:
     if not group_id:
         return False
     try:
+        from cdutetc import group_cleanup
+
+        if group_cleanup.is_competition_archived(group_id, cid):
+            return False
         scope = _main.db.get_competition_notify_groups(cid)
     except (_main.sqlite3.Error, ValueError):
         return False

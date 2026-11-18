@@ -193,12 +193,12 @@ def _sanitize_url(value: str) -> str:
     return text
 
 
-def _contest_index(now: datetime) -> list[dict]:
+def _contest_index(group_id: str, now: datetime) -> list[dict]:
     """未来 7 天、已确认且有开赛时间的比赛精简索引（只留 ID/名称/时间）。"""
     horizon = now + timedelta(days=7)
     items: list[dict] = []
     try:
-        contests = db.list_competitions(status="confirmed")
+        contests = db.list_group_competitions(group_id, status="confirmed")
     except Exception:
         logger.warning("读取比赛列表失败，上下文不含比赛索引")
         return items
@@ -241,7 +241,7 @@ def _course_index(group_id: str) -> list[dict]:
 
 
 def build_context(group_id: str, now: datetime) -> tuple[list[dict], list[dict]]:
-    return _course_index(group_id), _contest_index(now)
+    return _course_index(group_id), _contest_index(group_id, now)
 
 
 def _system_prompt(now: datetime) -> str:
@@ -527,13 +527,19 @@ def _apply_update(group_id: str, slots: dict, now: datetime, operator: str) -> t
         fresh = db.get_group_course(group_id, target_id) or course
         return "course_updated", fresh
     contest = db.get_competition(target_id)
-    if contest is None:
+    if (contest is None or contest.get("status") != "confirmed"
+            or group_id not in db.get_competition_target_groups(target_id)):
         return None
     if cancel:
-        # 比赛表没有 cancelled 状态（改动状态机会污染既有查询），
-        # 取消的语义落到「不再推送」：解绑通知群 + 作废待发节点。
-        db.set_competition_notify_groups(target_id, set(), operator)
-        db.drop_pending_deliveries("competition", target_id)
+        from cdutetc import group_cleanup
+
+        try:
+            if not group_cleanup.archive_competition(group_id, target_id, operator=operator,
+                                                     reason="cancelled"):
+                return None
+        except ValueError:
+            # 发送中的对象留待补全，不取消在途租约。
+            return None
         return "contest_cancelled", contest
     updates = {}
     moment = _slot_date(slots, now)
@@ -548,8 +554,6 @@ def _apply_update(group_id: str, slots: dict, now: datetime, operator: str) -> t
         return None
     if not db.update_competition(target_id, updates, operator, "老师群内通知改期"):
         return None
-    db.set_competition_notify_groups(target_id, {group_id}, operator)
-    db.drop_pending_deliveries("competition", target_id)
     fresh = db.get_competition(target_id) or contest
     return "contest_updated", fresh
 

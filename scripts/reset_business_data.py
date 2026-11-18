@@ -16,6 +16,7 @@ from pathlib import Path
 
 # 子表、队列先清；不重置 sqlite_sequence，防止旧审批编号指向新记录。
 BUSINESS_TABLES = (
+    "group_competition_archives", "group_test_records",
     "reminder_success_receipts", "reminder_deliveries", "reminders",
     # 统一提醒中心的自定义提醒：属业务数据，正式启用前随重置一并清空。
     "custom_reminders",

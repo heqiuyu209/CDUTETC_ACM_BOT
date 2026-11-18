@@ -16,6 +16,7 @@ from cdutetc.utils import is_super_admin, parse_command
 
 from cdutetc.handlers import _shared as _shared
 from cdutetc.handlers import admin_cmd as _admin_cmd
+from cdutetc.handlers import cleanup_cmd as _cleanup_cmd
 from cdutetc.handlers import collection_cmd as _collection
 from cdutetc.handlers import contest_cmd as _contest
 from cdutetc.handlers import faq_cmd as _faq_cmd
@@ -29,10 +30,12 @@ async def handle_command(text: str, group_id: str, sender: str,
                          client=None, *, private: bool = False,
                          active_group: str | None = None) -> list[dict] | None:
     """处理一条命令消息；超管私聊回执统一带工作区状态标牌（实现见 _handle_command_impl）。"""
-    return _admin_cmd._with_private_header(
-        await _handle_command_impl(text, group_id, sender, client,
-                                   private=private, active_group=active_group),
-        sender, private)
+    result = await _handle_command_impl(text, group_id, sender, client,
+                                       private=private, active_group=active_group)
+    cmd, _ = parse_command(text) if text.startswith("/") else (None, "")
+    if private and cmd in _cleanup_cmd.CLEANUP_COMMANDS:
+        return _cleanup_cmd.with_cleanup_header(result or [], sender)
+    return _admin_cmd._with_private_header(result, sender, private)
 
 
 async def _handle_command_impl(text: str, group_id: str, sender: str,
@@ -57,6 +60,11 @@ async def _handle_command_impl(text: str, group_id: str, sender: str,
     if cmd is None:
         return [{"group_id": group_id, "text": "请写上命令名，例如 /帮助。"}]
     cmd = _admin_cmd.canonical_command(cmd)
+    # 清理必须明确选群，不能经过工作区默认群降维或信任调用方传来的 active_group。
+    if cmd in _cleanup_cmd.CLEANUP_COMMANDS:
+        return await asyncio.to_thread(
+            _cleanup_cmd.handle_cleanup_command, cmd, args, group_id, sender, private=was_private,
+        )
     # 超管私聊 `/群配置 集训队`：先按名字/序号锁定工作区，再把参数清空，
     # 这样后续统一按「本群视角」展示，用户不必记 group_openid。
     if was_private and is_super_admin(sender) and cmd == "群配置":
@@ -168,7 +176,7 @@ async def _handle_command_impl(text: str, group_id: str, sender: str,
         return _shared._error_reply(group_id, AppErrorCode.INTERNAL)
 
 
-_CHILDREN = (_contest, _training, _faq_cmd, _collection, _admin_cmd, _shared)
+_CHILDREN = (_contest, _training, _faq_cmd, _collection, _admin_cmd, _cleanup_cmd, _shared)
 _LOCAL = {
     "__name__", "__doc__", "__spec__", "__loader__", "__package__", "__path__",
     "__builtins__", "_CHILDREN", "_LOCAL", "_CommandsFacade",

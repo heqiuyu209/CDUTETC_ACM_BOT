@@ -102,6 +102,10 @@ def list_question_contests(group_id: str, limit: int = 5, *, order: str = "recen
                        official_site AS source_link, updated_at AS sort_time,
                        1 AS is_public, id
                 FROM competitions c WHERE status = 'confirmed'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM group_competition_archives ga
+                    WHERE ga.competition_id=c.id AND ga.group_id=?
+                  )
                   AND (
                     NOT EXISTS (
                         SELECT 1 FROM competition_notify_groups ng
@@ -123,7 +127,7 @@ def list_question_contests(group_id: str, limit: int = 5, *, order: str = "recen
             ORDER BY {order_sql}
             LIMIT ?
             """,
-            (group_id, group_id, limit),
+            (group_id, group_id, group_id, limit),
         ).fetchall()
     return [dict(zip(fields, row)) for row in rows]
 
@@ -372,15 +376,18 @@ def get_competition_notify_groups(competition_id: int) -> set[str]:
 
 
 def _competition_target_groups_on(conn: sqlite3.Connection, competition_id: int) -> set[str]:
+    archived = {r[0] for r in conn.execute(
+        "SELECT group_id FROM group_competition_archives WHERE competition_id=?", (competition_id,),
+    )}
     groups = {r[0] for r in conn.execute(
         "SELECT group_id FROM competition_notify_groups WHERE competition_id=?", (competition_id,),
     )}
     if groups:
-        return groups & set(config.ALLOWED_GROUPS)
+        return (groups & set(config.ALLOWED_GROUPS)) - archived
     if (conn.execute("SELECT 1 FROM weekly_contest_runs WHERE competition_id=?", (competition_id,)).fetchone()
             or not conn.execute("SELECT 1 FROM competitions WHERE id=?", (competition_id,)).fetchone()):
         return set()
-    return set(config.ALLOWED_GROUPS)
+    return set(config.ALLOWED_GROUPS) - archived
 
 
 def get_competition_target_groups(competition_id: int) -> set[str]:

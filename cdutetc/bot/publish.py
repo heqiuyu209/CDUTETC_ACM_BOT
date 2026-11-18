@@ -59,9 +59,15 @@ class PublishMixin:
                     )
                     await self._notify_publish_group(pending_item, cid, uid)
                 else:
+                    from cdutetc import group_cleanup
+
+                    source_group = pending_item.get("group_id") or ""
+                    archived = (source_group in _main.config.ALLOWED_GROUPS
+                                and group_cleanup.is_competition_archived(source_group, cid))
                     await self._send_private_result(
                         uid, f"该比赛已存在（编号 {cid}），未重复入库；"
-                        "通知范围和未来提醒计划已按本次申请同步。"
+                        + (f"来源群已归档，归档继续生效。需要恢复时请选中来源群使用 /恢复比赛 {cid}。"
+                           if archived else "通知范围和未来提醒计划已按本次申请同步。")
                     )
             else:
                 if not _main.db.reject_pending_publication(pid, operator=uid, note=note):
@@ -140,23 +146,35 @@ class PublishMixin:
         duplicate = _main.db.find_duplicate_competition(competition_info)
         if duplicate is not None and duplicate.get("status") == "confirmed":
             cid = duplicate["id"]
+            from cdutetc import group_cleanup
+
+            if group_cleanup.is_competition_archived(group_id, cid):
+                await self._safe_reply(
+                    message,
+                    f"该比赛已存在（编号 {cid}），本群已归档，本次未重复发布。"
+                    f"需要重新显示和提醒时，请超管使用 /恢复比赛 {cid}。",
+                )
+                return
             # 同一场比赛在另一个群再次发布：不新建记录，只把本群加入通知范围，
             # 这样「本群发布的比赛在本群提醒」和「一场公开比赛通知多个群」都满足。
             scope = _main.db.get_competition_notify_groups(cid)
             if scope and group_id not in scope:
                 scope.add(group_id)
                 _main.db.set_competition_notify_groups(cid, scope, operator=f"publish:{member_id}")
+                joined = group_id in _main.db.get_competition_target_groups(cid)
                 await self._safe_reply(
                     message,
                     f"该比赛已存在（编号 {cid}），已把本群加入通知范围，"
-                    "之后的提醒本群也会收到。",
+                    + ("之后的提醒本群也会收到。" if joined else "本群当前未列入实际目标群，请超管核对授权和归档状态。"),
                 )
             else:
+                joined = group_id in _main.db.get_competition_target_groups(cid)
                 await self._safe_reply(
                     message,
                     f"该比赛已存在（编号 {cid}，"
                     f"{duplicate['name']} {duplicate.get('official_time') or '时间待定'}），"
-                    "本群已在其通知范围内，本次未重复发布。",
+                    + ("本群已在其通知范围内，本次未重复发布。" if joined
+                       else "本群当前未列入实际目标群，本次未重复发布；请超管核对比赛通知设置。"),
                 )
             return
 

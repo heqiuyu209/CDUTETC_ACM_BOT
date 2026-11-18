@@ -165,21 +165,29 @@ def cmd_notify_groups(group_id: str, sender: str, args: str) -> list[dict]:
     comp = db.get_competition(cid)
     if comp is None:
         return [{"group_id": group_id, "text": f"比赛 #{cid} 不存在"}]
-    if db.is_weekly_competition(cid):
+    from cdutetc import group_cleanup
+
+    def actual_scope() -> str:
         targets = db.get_competition_target_groups(cid)
+        result = "实际目标：" + ("、".join(sorted(targets)) or "无")
+        if group_id in config.ALLOWED_GROUPS and group_cleanup.is_competition_archived(group_id, cid):
+            result += f"\n本群已归档；需要重新显示和提醒时，请使用 /恢复比赛 {cid}。"
+        return result
+
+    if db.is_weekly_competition(cid):
         return [{"group_id": group_id, "text": "这是自动周赛，范围由各群周赛开关决定。\n"
-                 + "当前目标：" + ("、".join(sorted(targets)) or "尚无启用群")
+                 + actual_scope()
                  + "\n请用 /周赛设置 群名或标识 开启|关闭，其他场次的 /通知群 用法不变。"}]
     current = db.get_competition_notify_groups(cid)
     if len(parts) == 1:
         scope = "、".join(sorted(current)) if current else "全部允许群"
         return [{"group_id": group_id,
-                 "text": f"比赛 #{cid}「{comp['name']}」当前通知范围：{scope}"}]
+                 "text": f"比赛 #{cid}「{comp['name']}」配置通知范围：{scope}\n" + actual_scope()}]
     spec = parts[1].strip()
     if spec in ("全部", "all", "0"):
         db.set_competition_notify_groups(cid, set(), operator=sender)
         return [{"group_id": group_id,
-                 "text": f"比赛 #{cid} 已恢复为通知全部允许群"}]
+                 "text": f"比赛 #{cid} 已设置为全部允许群，群归档仍然生效。\n" + actual_scope()}]
     targets = {g.strip() for g in re.split(r"[,，\s]+", spec) if g.strip()}
     bad = [g for g in targets if not is_valid_account_id(g)]
     if bad:
@@ -188,10 +196,10 @@ def cmd_notify_groups(group_id: str, sender: str, args: str) -> list[dict]:
     if unknown:
         return [{"group_id": group_id,
                  "text": f"这些群未授权，先用 /加群 添加：{','.join(sorted(unknown))}"}]
-    count = db.set_competition_notify_groups(cid, targets, operator=sender)
+    db.set_competition_notify_groups(cid, targets, operator=sender)
     return [{"group_id": group_id,
-             "text": f"比赛 #{cid}「{comp['name']}」将只通知 {count} 个群："
-                     f"{'、'.join(sorted(targets))}"}]
+             "text": f"比赛 #{cid}「{comp['name']}」配置通知范围："
+                     f"{'、'.join(sorted(targets))}\n" + actual_scope()}]
 
 
 def admin_scope(sender: str, group_id: str, *, private: bool = False) -> str | None:

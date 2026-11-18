@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 
 from cdutetc import main as _main
 
@@ -34,6 +35,16 @@ def _weekly_contest_window(now: _main.datetime):
 
 class JobsMixin:
     """按职责拆分的 ACMBot 能力 Mixin。"""
+
+    async def _group_cleanup_job(self):
+        """只执行已开启的本群清理规则；不生成聊天内容或发送 QQ 消息。"""
+        try:
+            from cdutetc import group_cleanup
+
+            return await asyncio.to_thread(group_cleanup.run_rules)
+        except Exception:
+            logger.exception("每日本群清理规则执行失败")
+            return {}
 
     async def _contest_remind_job(self):
         """仅发送已持久化的开赛节点，失败不影响旧版提醒和后续轮次。"""

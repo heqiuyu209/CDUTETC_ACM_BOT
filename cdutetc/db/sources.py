@@ -369,12 +369,15 @@ def approve_pending_publication(pid: int, operator: str = "") -> tuple[int, bool
             existing_groups = {r[0] for r in conn.execute(
                 "SELECT group_id FROM competition_notify_groups WHERE competition_id = ?", (cid,)
             ).fetchall()}
-            if config.PUBLISH_SCOPE_TO_SOURCE and pending["group_id"]:
-                pending_groups = existing_groups | {pending["group_id"]}
-            else:
-                pending_groups = set()
-            groups = _contests._set_competition_scope_on(conn, cid, pending_groups)
-            _training._sync_contest_start_reminders(conn, cid, groups or None)
+            archived_source = conn.execute(
+                "SELECT 1 FROM group_competition_archives WHERE group_id=? AND competition_id=?",
+                (pending["group_id"], cid),
+            ).fetchone() is not None
+            # 重复审批保留已有订阅；空范围代表公共全群，不能缩成来源单群。
+            # 已归档来源群也不能通过重发申请改变共享范围。
+            if config.PUBLISH_SCOPE_TO_SOURCE and pending["group_id"] and existing_groups and not archived_source:
+                _contests._set_competition_scope_on(conn, cid, existing_groups | {pending["group_id"]})
+            _training._sync_contest_start_reminders(conn, cid)
         cur = conn.execute(
             "UPDATE pending_publications SET status = 'approved', decided_by = ?, decided_at = ?"
             " WHERE id = ? AND status = 'pending'",

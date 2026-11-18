@@ -119,6 +119,16 @@ class EventsMixin:
                     max_instances=1,
                     coalesce=True,
                 )
+        sched.add_job(
+            self._group_cleanup_job,
+            "cron",
+            hour=4,
+            minute=10,
+            timezone="Asia/Shanghai",
+            id="group-cleanup",
+            max_instances=1,
+            coalesce=True,
+        )
         sched.start()
         self.sched = sched
         logger.info(
@@ -235,6 +245,13 @@ class EventsMixin:
                     return
                 if cmd == "通知测试":
                     await self._send_private_result(uid, await self._notification_test(uid, args))
+                    return
+                if cmd in _main.commands.CLEANUP_COMMANDS:
+                    # 清理仅用真实选群会话；未选群时直接给引导，不落到 ADMIN_GROUP。
+                    replies = await _main.commands.handle_command(content, "", str(uid), private=True)
+                    for reply in replies or []:
+                        if reply.get("text"):
+                            await self._send_private_result(uid, reply["text"])
                     return
                 # 私聊绑定目标群后，业务指令按该群的单群视角执行（写库/查询/诊断都落到该群），
                 # 管理回执走私聊；比赛修正产生的公告按目标群主动投递。
