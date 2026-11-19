@@ -183,6 +183,7 @@ async def test_repeated_ready_keeps_scheduler_and_week_record(memory_db):
         expected = {
             "general-remind-check", "contest-remind-check", "source-crawl", "weekly-contest",
             "daily-digest",
+            "group-cleanup",
         }
         # 阶段三新增每日生活状态机：开启拟人聊天时额外注册 3 个状态切换任务
         if config.PERSONA_CHAT_ENABLED:

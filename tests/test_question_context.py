@@ -67,7 +67,7 @@ def _prompt_contests(chat_call):
     return json.JSONDecoder().raw_decode(archive)[0]
 
 
-async def test_teacher_published_competition_reaches_qa_model_in_allowed_groups(bot, monkeypatch):
+async def test_teacher_published_competition_prefers_local_fact_in_its_group(bot, monkeypatch):
     client, replies = bot
     fetch = AsyncMock(return_value="校赛官网正文")
     chat = AsyncMock(side_effect=[
@@ -76,7 +76,6 @@ async def test_teacher_published_competition_reaches_qa_model_in_allowed_groups(
             "reg_deadline": "2026-11-10 23:59",
             "contest_time": "2026-11-20 09:00",
         }, ensure_ascii=False),
-        "报名截止是 2026-11-10 23:59。",
         "没有可用的本群比赛信息。",
     ])
     monkeypatch.setattr(main, "fetch_text", fetch)
@@ -94,16 +93,10 @@ async def test_teacher_published_competition_reaches_qa_model_in_allowed_groups(
     )
 
     fetch.assert_awaited_once_with("https://example.com/contest")
-    assert chat.await_count == 3
-    expected = [{
-        "name": "新发布校赛",
-        "reg_deadline": "2026-11-10 23:59",
-        "contest_time": "2026-11-20 09:00",
-        "source_link": "https://example.com/contest",
-    }]
-    assert _prompt_contests(chat.await_args_list[1]) == expected
-    assert _prompt_contests(chat.await_args_list[2]) == []
-    assert ("g1", "报名截止是 2026-11-10 23:59。") in replies
+    # 本群已发布的事实本地直答，另一群没有资料时才进入模型。
+    assert chat.await_count == 2
+    assert _prompt_contests(chat.await_args_list[1]) == []
+    assert any(gid == "g1" and "新发布校赛" in answer and "2026-11-10 23:59" in answer for gid, answer in replies)
     assert ("g2", "没有可用的本群比赛信息。") in replies
 
 
@@ -180,7 +173,8 @@ async def test_qa_prompt_excludes_drafts_pending_and_private_legacy(bot, monkeyp
     chat = AsyncMock(return_value="正式报名截止是 2026-11-10 23:59。")
     monkeypatch.setattr(llm, "_chat_once", chat)
 
-    await client.on_group_at_message_create(_message("正式校赛什么时候截止？"))
+    # 明确调用模型入口验证注入范围；普通事实问答现在优先本地。
+    answer = await main.commands._answer_question_with_context("正式校赛什么时候截止？", "g1")
 
     chat.assert_awaited_once()
     context = _prompt_contests(chat.await_args)
@@ -188,10 +182,11 @@ async def test_qa_prompt_excludes_drafts_pending_and_private_legacy(bot, monkeyp
     formal = next(c for c in context if c["name"] == "正式校赛")
     assert formal["reg_deadline"] == "2026-11-10 23:59"
     assert "2026-12-01 23:59" not in chat.await_args.args[0]
+    assert "2026-11-10 23:59" in answer
 
 
 async def test_qa_reads_amended_formal_fields_instead_of_old_version(bot, monkeypatch):
-    client, _ = bot
+    client, replies = bot
     cid = database.create_competition(_public("原校赛标题"), status="confirmed")
     assert database.amend_competition(cid, {
         "name": "修正校赛标题",
@@ -204,13 +199,11 @@ async def test_qa_reads_amended_formal_fields_instead_of_old_version(bot, monkey
 
     await client.on_group_at_message_create(_message("修正校赛标题什么时候报名？"))
 
-    chat.assert_awaited_once()
-    assert _prompt_contests(chat.await_args) == [{
-        "name": "修正校赛标题",
-        "reg_deadline": "2026-12-02 23:59",
-        "contest_time": "2026-12-10 09:00",
-        "source_link": "https://example.com/corrected",
-    }]
+    chat.assert_not_awaited()
+    text = replies[-1][1]
+    assert "修正校赛标题" in text and "2026-12-02 23:59" in text
+    assert "2026-12-10 09:00" in text and "https://example.com/corrected" in text
+    assert "原校赛标题" not in text and "2026-11-10 23:59" not in text
 
 
 def test_question_context_orders_updates_and_limits_stably(memory_db, monkeypatch):

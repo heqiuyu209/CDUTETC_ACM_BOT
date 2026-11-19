@@ -332,7 +332,7 @@ async def test_member_weekly_question_answered_without_model(memory_db, monkeypa
         "location": "",
         "source_link": "",
     }
-    monkeypatch.setattr(commands.db, "list_question_contests", lambda gid: [contest])
+    monkeypatch.setattr(commands.db, "list_question_contests", lambda gid, **kwargs: [contest])
     monkeypatch.setattr(commands.db, "list_training_sessions", lambda *a, **k: [])
     monkeypatch.setattr(commands.db, "list_org_events", lambda *a, **k: [])
     chat = AsyncMock(return_value="不应调用")
@@ -385,7 +385,7 @@ async def test_answer_question_closes_and_indexes_faq(memory_db, monkeypatch):
     monkeypatch.setattr(llm, "_chat_once", chat)
     monkeypatch.setattr(commands.db, "list_training_sessions", lambda *a, **k: [])
     monkeypatch.setattr(commands.db, "list_org_events", lambda *a, **k: [])
-    monkeypatch.setattr(commands.db, "list_question_contests", lambda gid: [])
+    monkeypatch.setattr(commands.db, "list_question_contests", lambda gid, **kwargs: [])
     monkeypatch.setattr(config, "QA_MEMBER_KB_ONLY", True)
 
     replies = await commands.handle_non_command_message(

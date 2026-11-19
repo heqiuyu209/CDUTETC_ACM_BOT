@@ -10,7 +10,7 @@ from cdutetc import commands, config, database, llm
 
 @pytest.fixture
 def records(monkeypatch):
-    monkeypatch.setattr(database, "list_question_contests", lambda group: [{
+    monkeypatch.setattr(database, "list_question_contests", lambda group, **kwargs: [{
         "name": "ACM 周赛", "reg_deadline": "2026-11-08 12:00", "contest_time": "2026-11-08 19:00",
         "location": "B201", "mode": "", "source_link": "https://example.com",
     }])

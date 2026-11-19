@@ -575,7 +575,10 @@ def build_upcoming_reminders(group_id: str, now: datetime, days: int = 7) -> lis
 async def check_custom_reminders(send_group, now: datetime | None = None,
                                  max_attempts: int = _DELIVERY_MAX_ATTEMPTS) -> int:
     """投递到期的自定义提醒；每周循环顺延一周，单次提醒置 done。"""
-    from cdutetc.database import list_due_custom_reminders, update_custom_reminder
+    from cdutetc.database import (
+        list_due_custom_reminders, get_custom_reminder, complete_custom_reminder,
+        recover_custom_reminder_delivery,
+    )
 
     if max_attempts < 1:
         raise ValueError("提醒尝试次数必须大于零")
@@ -583,28 +586,45 @@ async def check_custom_reminders(send_group, now: datetime | None = None,
     def clock():
         return _resolved_now(now)
 
-    sent = 0
     allowed = set(config.ALLOWED_GROUPS)
-    for reminder in list_due_custom_reminders(clock()):
+
+    async def deliver(reminder):
         group_id = reminder.get("group_id")
         if group_id not in allowed or _platform_paused(group_id):
-            continue
+            return 0
+        if recover_custom_reminder_delivery(reminder, now=clock()):
+            return 0
+        target = reminder.get("target_time") or ""
+        key = delivery_dedup_key(group_id, "custom_reminder", reminder["id"], "due", target)
+        token = claim_delivery(group_id, "custom_reminder", reminder["id"], "due", target,
+                               now=clock(), max_attempts=max_attempts,
+                               lease_seconds=_DELIVERY_LEASE_SECONDS, allowed_groups=allowed)
+        if token is None or not validate_delivery_claim(key, token, now=clock(), allowed_groups=allowed):
+            return 0
+        fresh = get_custom_reminder(reminder["id"])
+        if fresh != reminder:
+            finish_delivery(key, token, False, error="提醒内容已变化", now=clock(), max_attempts=max_attempts)
+            return 0
         text = f"【提醒】{reminder.get('content') or ''}"
         ok, error, code = await _send_reminder_result(send_group, group_id, text)
         if not ok:
             logger.warning("自定义提醒 #%s 未发送 [%s] %s", reminder.get("id"), code, error)
-            continue
-        if (reminder.get("repeat_rule") or "none") == "weekly":
-            target = _parse_time(reminder.get("target_time") or "")
-            if target is not None:
-                update_custom_reminder(
-                    reminder["id"],
-                    target_time=(target + timedelta(days=7)).strftime("%Y-%m-%d %H:%M"),
-                    operator="system",
-                )
-                sent += 1
-                continue
-        update_custom_reminder(reminder["id"], status="done", operator="system")
-        sent += 1
+            finish_delivery(key, token, False, error=error, error_code=code,
+                            now=clock(), max_attempts=max_attempts)
+            return 0
+        try:
+            if record_delivery_success(key, token, now=clock()):
+                complete_custom_reminder(reminder, key, token, now=clock())
+                return 1
+        except sqlite3.Error:
+            logger.exception("自定义提醒回执或状态推进失败: %s", key)
+        return 0
+
+    sent = 0
+    for reminder in list_due_custom_reminders(clock()):
+        try:
+            sent += await deliver(reminder)
+        except sqlite3.Error:
+            logger.exception("自定义提醒读取/领取/恢复失败: %s", reminder.get("id"))
     return sent
 

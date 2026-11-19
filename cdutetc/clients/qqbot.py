@@ -70,7 +70,7 @@ class QQBotMessage:
     """官方群消息与私聊事件的统一封装。"""
 
     __slots__ = ("raw", "source", "id", "message_type", "group_id", "user_id",
-                 "content", "always_addressed", "mentions")
+                 "content", "always_addressed", "mentions", "reference_id")
 
     def __init__(self, data, *, message_type: str, group_id: str = "",
                  user_id: str = "", content: str = "", msg_id: str = "",
@@ -88,6 +88,9 @@ class QQBotMessage:
         if any(names.values()):
             self.raw["author"] = names
         self.source = data
+        reference = _field(_field(data, "message_reference"), "message_id", "")
+        # 只保留平台结构化引用 ID；引用正文和用户粘贴的引用标记不作为依据。
+        self.reference_id = reference if isinstance(reference, str) and 0 < len(reference) <= 256 else ""
         self.id = str(msg_id or "")
         self.message_type = message_type
         self.group_id = str(group_id or "")

@@ -203,7 +203,8 @@ def _row_to_training(r: sqlite3.Row) -> dict:
     }
 
 
-def create_training_session(group_id: str, info: dict, operator: str = "") -> int:
+def create_training_session(group_id: str, info: dict, operator: str = "", *,
+                            conn: sqlite3.Connection | None = None) -> int:
     """创建群内课程/训练安排。group_id 必填。"""
     group_id = _conn._as_str(group_id)
     title = _conn._as_str(info.get("title") or "")
@@ -229,8 +230,9 @@ def create_training_session(group_id: str, info: dict, operator: str = "") -> in
     )
     if values[12] not in ("confirmed", "draft", "cancelled"):
         raise ValueError("状态必须是 confirmed/draft/cancelled")
-    with _conn._connect() as conn:
-        cur = conn.execute(
+
+    def write_on(connection: sqlite3.Connection) -> int:
+        cur = connection.execute(
             "INSERT INTO training_sessions (group_id, title, weekday, start_time,"
             " end_time, location, needs_laptop, software, device_req, training_group,"
             " effective_start, effective_end, status, source, maintainer, updated_at,"
@@ -239,6 +241,11 @@ def create_training_session(group_id: str, info: dict, operator: str = "") -> in
             values,
         )
         return cur.lastrowid
+
+    if conn is not None:
+        return write_on(conn)
+    with _conn._connect() as connection:
+        return write_on(connection)
 
 
 def list_training_sessions(group_id: str, active_only: bool = True,
@@ -262,18 +269,25 @@ def list_training_sessions(group_id: str, active_only: bool = True,
     return [_row_to_training(r) for r in rows]
 
 
-def cancel_training_session(group_id: str, tid: int, operator: str = "") -> bool:
+def cancel_training_session(group_id: str, tid: int, operator: str = "", *,
+                            conn: sqlite3.Connection | None = None) -> bool:
     """取消课程（标记 cancelled，不物理删除；旧安排不再视为当前安排）。"""
-    with _conn._connect() as conn:
-        cur = conn.execute(
+
+    def write_on(connection: sqlite3.Connection) -> bool:
+        cur = connection.execute(
             "UPDATE training_sessions SET status = 'cancelled', updated_at = ?"
             " WHERE id = ? AND group_id = ?",
             (_conn.now_str(), tid, group_id),
         )
         if cur.rowcount:
             _admin.add_audit(operator, group_id, "cancel", "training_session", str(tid), "",
-                      "cancelled", conn=conn)
+                      "cancelled", conn=connection)
         return cur.rowcount > 0
+
+    if conn is not None:
+        return write_on(conn)
+    with _conn._connect() as connection:
+        return write_on(connection)
 
 
 _TRAINING_UPDATE_FIELDS = (
@@ -303,7 +317,8 @@ def get_group_course(group_id: str, course_id: int) -> dict | None:
     return _row_to_training(row) if row else None
 
 
-def update_group_course(group_id: str, course_id: int, operator: str = "", **kwargs) -> bool:
+def update_group_course(group_id: str, course_id: int, operator: str = "", *,
+                        conn: sqlite3.Connection | None = None, **kwargs) -> bool:
     """修改课程的可编辑字段（白名单字段 + 审计留痕）。
 
     - 未知字段直接 ValueError，避免拼写错误静默丢改动；
@@ -342,16 +357,22 @@ def update_group_course(group_id: str, course_id: int, operator: str = "", **kwa
         return False
     assignments = ", ".join(f"{field} = ?" for field in changes)
     values = [*changes.values(), _conn.now_str(), cid, group_id]
-    with _conn._connect() as conn:
-        cur = conn.execute(
+
+    def write_on(connection: sqlite3.Connection) -> bool:
+        cur = connection.execute(
             f"UPDATE training_sessions SET {assignments}, updated_at = ?"
             " WHERE id = ? AND group_id = ?",
             values,
         )
         if cur.rowcount:
             _admin.add_audit(operator, group_id, "update", "training_session", str(cid), "",
-                      json.dumps(sorted(changes), ensure_ascii=False), conn=conn)
+                      json.dumps(sorted(changes), ensure_ascii=False), conn=connection)
         return cur.rowcount > 0
+
+    if conn is not None:
+        return write_on(conn)
+    with _conn._connect() as connection:
+        return write_on(connection)
 
 
 def sync_future_contest_start_reminders(now: datetime | None = None) -> None:
@@ -368,7 +389,8 @@ def sync_future_contest_start_reminders(now: datetime | None = None) -> None:
 
 
 def _sync_contest_start_reminders(conn: sqlite3.Connection, competition_id: int,
-                                  group_ids=None, *, now: datetime | None = None) -> None:
+                                  group_ids=None, *, now: datetime | None = None,
+                                  only_group: str | None = None) -> None:
     """在业务写事务中同步比赛开赛前节点；过去节点不创建、不补发。"""
     row = conn.execute(
         "SELECT status, official_time FROM competitions WHERE id = ?", (competition_id,)
@@ -379,7 +401,9 @@ def _sync_contest_start_reminders(conn: sqlite3.Connection, competition_id: int,
         conn.execute(
             "UPDATE reminder_deliveries SET status = 'cancelled', lease_token = '', lease_until = ''"
             " WHERE obj_type = 'competition' AND obj_id = ? AND remind_type = 'contest_start'"
-            " AND status IN ('pending', 'sending')", (competition_id,),
+            " AND status IN ('pending', 'sending')"
+            + (" AND group_id=?" if only_group is not None else ""),
+            (competition_id, only_group) if only_group is not None else (competition_id,),
         )
         return
     offsets = tuple(getattr(config, "CONTEST_REMIND_OFFSETS_MINUTES", (30, 15)))
@@ -436,7 +460,9 @@ def _sync_contest_start_reminders(conn: sqlite3.Connection, competition_id: int,
     old = conn.execute(
         "SELECT id, dedup_key, status FROM reminder_deliveries"
         " WHERE obj_type = 'competition' AND obj_id = ? AND remind_type = 'contest_start'"
-        " AND status IN ('pending', 'sending')", (competition_id,),
+        " AND status IN ('pending', 'sending')"
+        + (" AND group_id=?" if only_group is not None else ""),
+        (competition_id, only_group) if only_group is not None else (competition_id,),
     ).fetchall()
     for delivery_id, key, status in old:
         if key not in desired:
@@ -449,7 +475,7 @@ def _sync_contest_start_reminders(conn: sqlite3.Connection, competition_id: int,
 _DELIVERY_COLS = (
     "id, group_id, obj_type, obj_id, remind_type, target_time, attempts,"
     " status, sent_at, last_error, dedup_key, lease_token, lease_until,"
-    " scheduled_at, expires_at, error_code"
+    " scheduled_at, expires_at, error_code, object_snapshot"
 )
 
 
@@ -462,6 +488,7 @@ def _row_to_delivery(r: sqlite3.Row) -> dict:
         "scheduled_at": r[13] if len(r) > 13 else "",
         "expires_at": r[14] if len(r) > 14 else "",
         "error_code": r[15] if len(r) > 15 else "",
+        "object_snapshot": r[16] if len(r) > 16 else "",
     }
 
 
@@ -585,11 +612,20 @@ def _delivery_invalid_status(conn: sqlite3.Connection, delivery: dict,
         ).fetchone()
         if superseded:
             return "cancelled"
+    elif delivery["obj_type"] == "custom_reminder":
+        row = conn.execute(
+            "SELECT group_id,status,target_time FROM custom_reminders WHERE id=?", (delivery["obj_id"],),
+        ).fetchone()
+        if (delivery["remind_type"] != "due" or row is None or row[0] != delivery["group_id"]
+                or row[1] != "pending" or _conn._canonical_time(row[2]) != delivery["target_time"]):
+            return "cancelled"
     else:
         return "cancelled"
     target = _delivery_parse_time(delivery["target_time"])
     if target is None:
         return "cancelled"
+    if delivery["obj_type"] == "custom_reminder":
+        return None if target <= now else "cancelled"
     if delivery["remind_type"] == "contest_start":
         scheduled = _delivery_parse_time(delivery.get("scheduled_at") or "")
         expires = _delivery_parse_time(delivery.get("expires_at") or "")
@@ -695,9 +731,13 @@ def claim_delivery(group_id: str, obj_type: str, obj_id: int, remind_type: str,
             return None
         token = uuid.uuid4().hex
         until = (now + timedelta(seconds=lease_seconds)).strftime("%Y-%m-%d %H:%M:%S")
+        snapshot = ""
+        if obj_type == "custom_reminder":
+            row = conn.execute(f"SELECT {_CUSTOM_REMINDER_COLS} FROM custom_reminders WHERE id=?", (obj_id,)).fetchone()
+            snapshot = json.dumps(_row_to_custom_reminder(row), ensure_ascii=False, sort_keys=True)
         conn.execute(
-            "UPDATE reminder_deliveries SET status = 'sending', attempts = attempts + 1, lease_token = ?, lease_until = ?"
-            " WHERE id = ?", (token, until, delivery["id"]),
+            "UPDATE reminder_deliveries SET status = 'sending', attempts = attempts + 1, lease_token = ?, lease_until = ?,"
+            " object_snapshot=? WHERE id = ?", (token, until, snapshot, delivery["id"]),
         )
         return token
 
@@ -900,6 +940,48 @@ def get_custom_reminder(reminder_id: int) -> dict | None:
             f"SELECT {_CUSTOM_REMINDER_COLS} FROM custom_reminders WHERE id = ?", (rid,)
         ).fetchone()
     return _row_to_custom_reminder(row) if row else None
+
+
+def complete_custom_reminder(reminder: dict, dedup_key: str, token: str, *, now=None) -> bool:
+    """回执、提醒状态投影同事务；清理会保留 sending 直到此处提交完成。"""
+    key = _canonical_delivery_key(dedup_key)
+    with _conn._connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if not conn.execute("SELECT 1 FROM reminder_success_receipts WHERE dedup_key=? AND lease_token=?",
+                            (key, token)).fetchone():
+            return False
+        row = conn.execute(f"SELECT {_CUSTOM_REMINDER_COLS} FROM custom_reminders WHERE id=?",
+                           (reminder["id"],)).fetchone()
+        # 相同时间的本次发送已经完成；保留最新内容，改期后的新实例不推进。
+        current = _row_to_custom_reminder(row) if row is not None else None
+        if (current is not None and current["group_id"] == reminder["group_id"]
+                and current["target_time"] == reminder["target_time"] and current["status"] == "pending"):
+            target = _delivery_parse_time(current["target_time"])
+            if current["repeat_rule"] == "weekly" and target is not None:
+                next_time = (target + timedelta(days=7)).strftime("%Y-%m-%d %H:%M")
+                conn.execute("UPDATE custom_reminders SET target_time=?,updated_at=? WHERE id=?",
+                             (next_time, _delivery_now(now).strftime("%Y-%m-%d %H:%M:%S"), reminder["id"]))
+            else:
+                conn.execute("UPDATE custom_reminders SET status='done',updated_at=? WHERE id=?",
+                             (_delivery_now(now).strftime("%Y-%m-%d %H:%M:%S"), reminder["id"]))
+        conn.execute("UPDATE reminder_deliveries SET status='sent',lease_token='',lease_until='',last_error='',"
+                     "error_code='',sent_at=? WHERE dedup_key=? AND lease_token=?",
+                     (_delivery_now(now).strftime("%Y-%m-%d %H:%M:%S"), key, token))
+        return True
+
+
+def recover_custom_reminder_delivery(reminder: dict, *, now=None) -> bool:
+    """重启/状态投影失败后用成功回执与原发送快照推进，绝不重发。"""
+    key = delivery_dedup_key(reminder["group_id"], "custom_reminder", reminder["id"], "due", reminder["target_time"])
+    with _conn._connect() as conn:
+        row = conn.execute("SELECT d.object_snapshot,r.lease_token FROM reminder_deliveries d"
+                           " JOIN reminder_success_receipts r ON r.dedup_key=d.dedup_key"
+                           " WHERE d.dedup_key=?", (key,)).fetchone()
+    if row is None or not row[0]:
+        return False
+    original = json.loads(row[0])
+    complete_custom_reminder(original, key, row[1], now=now)
+    return True
 
 
 def update_custom_reminder(reminder_id: int, *, content: str | None = None,

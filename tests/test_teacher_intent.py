@@ -297,7 +297,8 @@ async def test_invalid_json_is_ignored(env, model, monkeypatch):
 async def test_context_carries_beijing_time_and_compact_indexes(env, model):
     """送进模型的上下文必须含北京时间与本群课程/比赛精简索引。"""
     db.create_training_session(GID, {
-        "title": "常规集训", "weekday": "周三", "start_time": "19:00", "status": "confirmed",
+        "title": "常规集训", "weekday": "周三", "start_time": "19:00", "end_time": "21:00",
+        "location": "B302", "status": "confirmed",
     }, operator=TEACHER)
     db.create_competition({"name": "新生赛", "official_time": "2026-11-20 19:00"},
                           status="confirmed", operator=TEACHER)
@@ -311,9 +312,17 @@ async def test_context_carries_beijing_time_and_compact_indexes(env, model):
     payload = json.loads(user_prompt)
     assert payload["message"] == "明晚的课正常进行"
     assert payload["courses"][0]["title"] == "常规集训"
+    assert payload["courses"][0]["type"] == "training_session"
+    assert payload["courses"][0]["date"] == "2026-11-18"
+    assert payload["courses"][0]["start_time"] == "19:00"
+    assert payload["courses"][0]["end_time"] == "21:00"
+    assert payload["courses"][0]["location"] == "B302"
+    assert set(payload["courses"][0]) == {"id", "type", "title", "date", "weekday", "start_time", "end_time", "location"}
     assert payload["contests"][0]["name"] == "新生赛"
-    # 比赛索引只带 ID/名称/时间，不能把整条记录塞进上下文。
-    assert set(payload["contests"][0]) == {"id", "name", "time"}
+    assert payload["contests"][0]["type"] == "competition"
+    assert payload["contests"][0]["time"] == "2026-11-20 19:00"
+    # 类型区分撞号，实际日期/时间/地点供补充字段复用，不带整条记录。
+    assert set(payload["contests"][0]) == {"id", "type", "name", "time", "location"}
 
 
 def test_teacher_gate_accepts_whitelist_registered_teacher_and_super_admin(env, monkeypatch):
@@ -325,6 +334,8 @@ def test_teacher_gate_accepts_whitelist_registered_teacher_and_super_admin(env, 
 
     monkeypatch.setattr(config, "TEACHER_WHITELIST", set(), raising=False)
     monkeypatch.setattr(db, "get_group_teachers", lambda gid: ["teacher-2"])
+    assert teacher_intent.is_teacher_speaker(GID, "teacher-2") is False
+    monkeypatch.setattr(config, "TEACHER_WHITELIST", {"teacher-2"})
     assert teacher_intent.is_teacher_speaker(GID, "teacher-2") is True
     assert teacher_intent.is_teacher_speaker(GID, MEMBER) is False
 

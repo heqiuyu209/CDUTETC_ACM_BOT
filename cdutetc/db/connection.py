@@ -334,6 +334,7 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries (
     scheduled_at TEXT NOT NULL DEFAULT '',
     expires_at  TEXT NOT NULL DEFAULT '',
     error_code  TEXT NOT NULL DEFAULT '',
+    object_snapshot TEXT NOT NULL DEFAULT '',
     UNIQUE (dedup_key)
 )
 """
@@ -517,6 +518,24 @@ _INDEX_DDL = (
 
 
 _ALL_DDL = (
+    """CREATE TABLE IF NOT EXISTS business_message_context (
+        group_id TEXT NOT NULL, message_id TEXT NOT NULL, items_json TEXT NOT NULL,
+        expires_at TEXT NOT NULL, PRIMARY KEY(group_id,message_id))""",
+    """CREATE TABLE IF NOT EXISTS business_patch_receipts (
+        group_id TEXT NOT NULL, message_id TEXT NOT NULL, sender_id TEXT NOT NULL,
+        reply TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(group_id,message_id))""",
+    """CREATE TABLE IF NOT EXISTS group_competition_locations (
+        group_id TEXT NOT NULL, competition_id INTEGER NOT NULL, location TEXT NOT NULL,
+        updated_by TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY(group_id,competition_id))""",
+    """CREATE TABLE IF NOT EXISTS group_competition_archives (
+        group_id TEXT NOT NULL, competition_id INTEGER NOT NULL,
+        reason TEXT NOT NULL DEFAULT '', archived_at TEXT NOT NULL DEFAULT '',
+        archived_by TEXT NOT NULL DEFAULT '', PRIMARY KEY(group_id,competition_id))""",
+    """CREATE TABLE IF NOT EXISTS group_test_records (
+        group_id TEXT NOT NULL, object_type TEXT NOT NULL, object_id INTEGER NOT NULL,
+        marked_at TEXT NOT NULL DEFAULT '', marked_by TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY(group_id,object_type,object_id))""",
     """CREATE TABLE IF NOT EXISTS group_weekly_settings (
         group_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
         updated_by TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '')""",
@@ -772,7 +791,7 @@ def _migrate_reminder_deliveries(conn: sqlite3.Connection) -> None:
     if not conn.in_transaction:
         conn.execute("BEGIN IMMEDIATE")
     cols = {r[1] for r in conn.execute("PRAGMA table_info(reminder_deliveries)")}
-    for column in ("lease_token", "lease_until", "scheduled_at", "expires_at", "error_code"):
+    for column in ("lease_token", "lease_until", "scheduled_at", "expires_at", "error_code", "object_snapshot"):
         if column not in cols:
             conn.execute(f"ALTER TABLE reminder_deliveries ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
     # 成功事实保留原始记录，并为旧时间格式补规范身份；状态投影失败的成功也不能重发。
@@ -832,7 +851,8 @@ def _migrate_reminder_deliveries(conn: sqlite3.Connection) -> None:
                CASE WHEN r.dedup_key IS NOT NULL THEN '' ELSE d.lease_token END AS lease_token,
                CASE WHEN r.dedup_key IS NOT NULL THEN '' ELSE d.lease_until END AS lease_until,
                 d.scheduled_at, d.expires_at,
-                CASE WHEN r.dedup_key IS NOT NULL THEN '' ELSE d.error_code END AS error_code
+                CASE WHEN r.dedup_key IS NOT NULL THEN '' ELSE d.error_code END AS error_code,
+                d.object_snapshot
         FROM reminder_deliveries d
         LEFT JOIN reminder_success_receipts r ON r.dedup_key = d.dedup_key
     """)

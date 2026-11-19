@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import re
+from contextlib import closing
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
@@ -110,12 +111,13 @@ def is_teacher_speaker(group_id: str, sender_id: str) -> bool:
     speaker = str(sender_id or "").strip()
     if not speaker:
         return False
-    if can_manage_group(speaker):
-        return True
-    if not str(group_id or "").strip():
+    if group_id not in config.ALLOWED_GROUPS:
         return False
+    if speaker in config.SUPER_ADMIN:
+        return True
     try:
-        return speaker in set(db.get_group_teachers(group_id))
+        owners = set(db.get_group_teachers(group_id))
+        return can_manage_group(speaker) and (not owners or speaker in owners)
     except Exception:
         # 库异常时按「不是老师」处理：宁可漏识别，也不能让普通成员的通知落库。
         logger.warning("读取群负责老师失败，按非老师处理: %s", group_id)
@@ -193,12 +195,12 @@ def _sanitize_url(value: str) -> str:
     return text
 
 
-def _contest_index(now: datetime) -> list[dict]:
+def _contest_index(group_id: str, now: datetime) -> list[dict]:
     """未来 7 天、已确认且有开赛时间的比赛精简索引（只留 ID/名称/时间）。"""
     horizon = now + timedelta(days=7)
     items: list[dict] = []
     try:
-        contests = db.list_competitions(status="confirmed")
+        contests = db.list_group_competitions(group_id, status="confirmed")
     except Exception:
         logger.warning("读取比赛列表失败，上下文不含比赛索引")
         return items
@@ -212,27 +214,31 @@ def _contest_index(now: datetime) -> list[dict]:
             continue
         if not (now <= moment <= horizon):
             continue
-        items.append({"id": item.get("id"), "name": item.get("name") or "",
-                      "time": moment.strftime("%m-%d %H:%M")})
+        items.append({"id": item.get("id"), "type": "competition", "name": item.get("name") or "",
+                      "time": moment.strftime("%Y-%m-%d %H:%M"), "location": item.get("location") or ""})
         if len(items) >= MAX_CONTESTS_IN_CONTEXT:
             break
     return items
 
 
-def _course_index(group_id: str) -> list[dict]:
+def _course_index(group_id: str, now: datetime | None = None) -> list[dict]:
     """本群当前生效课程的精简索引。"""
     items: list[dict] = []
     try:
-        sessions = db.list_training_sessions(group_id)
+        from cdutetc import qa_context
+        sessions = qa_context.week_sessions(group_id, now=now)
     except Exception:
         logger.warning("读取课程列表失败，上下文不含课程索引: %s", group_id)
         return items
     for session in sessions:
         items.append({
             "id": session.get("id"),
+            "type": "training_session",
             "title": session.get("title") or "",
-            "weekday": session.get("weekday") or "",
-            "start_time": session.get("start_time") or "",
+            "date": session["start_dt"].strftime("%Y-%m-%d"),
+            "weekday": session.get("weekday_label") or "",
+            "start_time": session.get("start_text") or "",
+            "end_time": session.get("end_text") or "",
             "location": session.get("location") or "",
         })
         if len(items) >= MAX_COURSES_IN_CONTEXT:
@@ -241,7 +247,7 @@ def _course_index(group_id: str) -> list[dict]:
 
 
 def build_context(group_id: str, now: datetime) -> tuple[list[dict], list[dict]]:
-    return _course_index(group_id), _contest_index(now)
+    return _course_index(group_id, now), _contest_index(group_id, now)
 
 
 def _system_prompt(now: datetime) -> str:
@@ -252,13 +258,13 @@ def _system_prompt(now: datetime) -> str:
         "输出字段：\n"
         '{"intent":"RECURRING_COURSE|ONE_OFF_SESSION|CONTEST|UPDATE_CANCEL|POLICY_FAQ|CHAT_IGNORE",'
         '"confidence":"high|medium","title":"","date":"","weekday":"","start_time":"",'
-        '"end_time":"","location":"","url":"","target_id":0,"cancel":false,'
+        '"end_time":"","location":"","url":"","target_id":0,"target_type":"","cancel":false,'
         '"missing":["造成不完整所缺的信息英文键"]}\n'
         "判定规则：\n"
         "- RECURRING_COURSE：周期课程，如「每周三晚7点在B302讲图论」，给 weekday。\n"
         "- ONE_OFF_SESSION：单次集训/周报/补题课，给 date 与 start_time。\n"
         "- CONTEST：比赛通知（含周赛/选拔/模拟赛），给 title、date、start_time，有链接填 url。\n"
-        "- UPDATE_CANCEL：修改或取消已有课程/比赛，target_id 填索引里的编号，"
+        "- UPDATE_CANCEL：修改或取消已有课程/比赛，target_id 填索引里的编号，target_type 填 training_session 或 competition，"
         "cancel=true 表示取消。\n"
         "- POLICY_FAQ：老师发布需要长期遵守的队规/制度/流程要求，没有具体某一天的时间锚点，"
         "例如「以后请假必须提前一天在群里报备」「报销单据周五前交给组长」「训练期间禁止带外队人员进机房」。"
@@ -313,6 +319,7 @@ def parse_result(content: str) -> dict | None:
         "location": str(data.get("location") or "").strip()[:40],
         "url": str(data.get("url") or "").strip(),
         "target_id": target_id,
+        "target_type": str(data.get("target_type") or "").strip(),
         "cancel": bool(data.get("cancel")),
         "missing": missing,
     }
@@ -458,8 +465,17 @@ def _save_course(group_id: str, intent: str, slots: dict, now: datetime,
     if not info.get("start_time"):
         return None
     info["maintainer"] = operator
-    course_id = db.create_training_session(group_id, info, operator=operator)
-    return db.get_group_course(group_id, course_id)
+    from cdutetc import business_followup
+
+    with closing(db._connect()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if not business_followup._allowed(conn, group_id, operator):
+            return None
+        course_id = db.create_training_session(group_id, info, operator=operator, conn=conn)
+        fresh = business_followup._record(conn, group_id, "training_session", course_id)
+        if fresh is None:
+            conn.rollback()
+        return fresh
 
 
 def _save_contest(group_id: str, slots: dict, now: datetime, operator: str) -> dict | None:
@@ -469,41 +485,61 @@ def _save_contest(group_id: str, slots: dict, now: datetime, operator: str) -> d
     if moment is None or not start:
         return None
     official_time = f"{moment:%Y-%m-%d} {start}"
+    from cdutetc import business_followup
+
     try:
-        cid = db.create_competition(
-            {
-                "name": slots.get("title") or "比赛",
-                "official_time": official_time,
-                "official_site": _sanitize_url(slots.get("url")),
-            },
-            status="confirmed",
-            operator=operator,
-        )
+        with closing(db._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not business_followup._allowed(conn, group_id, operator):
+                return None
+            cid = db.create_competition(
+                {
+                    "name": slots.get("title") or "比赛",
+                    "official_time": official_time,
+                    "official_site": _sanitize_url(slots.get("url")),
+                },
+                status="confirmed",
+                operator=operator,
+                conn=conn,
+            )
+            if not cid or db.set_competition_notify_groups(cid, {group_id}, operator, conn=conn) != 1:
+                conn.rollback()
+                return None
+            if slots.get("location") and not business_followup.set_competition_location(
+                    group_id, operator, cid, slots["location"], now=now, conn=conn):
+                conn.rollback()
+                return None
+            fresh = business_followup._record(conn, group_id, "competition", cid)
+            if fresh is None:
+                conn.rollback()
+            return fresh
     except Exception:
         logger.exception("老师意图写比赛失败")
         return None
-    if not cid:
-        return None
-    try:
-        db.set_competition_notify_groups(cid, {group_id}, operator)
-    except Exception:
-        logger.warning("比赛提醒范围绑定失败: %s", cid)
-    return db.get_competition(cid)
 
 
 def _apply_update(group_id: str, slots: dict, now: datetime, operator: str) -> tuple[str, dict] | None:
     """改期/改地点/取消：先定对象类型，再改字段，最后作废旧提醒节点。"""
+    if not is_teacher_speaker(group_id, operator):
+        return None
     target_id = int(slots.get("target_id") or 0)
     if target_id <= 0:
         return None
     cancel = bool(slots.get("cancel"))
     course = db.get_group_course(group_id, target_id)
+    if course and course.get("status") != "confirmed":
+        course = None
+    contest = db.get_competition(target_id)
+    contest = contest if (contest and contest.get("status") == "confirmed"
+                          and group_id in db.get_competition_target_groups(target_id)) else None
+    kind = slots.get("target_type") or ""
+    if kind in {"course", "training_session"}:
+        contest = None
+    elif kind in {"contest", "competition"}:
+        course = None
+    elif kind or (course is not None and contest is not None):
+        return None
     if course is not None:
-        if cancel:
-            if not db.cancel_training_session(group_id, target_id, operator):
-                return None
-            db.drop_pending_deliveries("training_session", target_id, group_id=group_id)
-            return "course_cancelled", course
         updates: dict = {}
         weekday = _parse_weekday(slots.get("weekday"))
         start = _parse_clock(slots.get("start_time"))
@@ -518,40 +554,78 @@ def _apply_update(group_id: str, slots: dict, now: datetime, operator: str) -> t
             updates["location"] = slots["location"]
         if slots.get("title"):
             updates["title"] = slots["title"]
-        if not updates:
+        if not cancel and not updates:
             return None
-        if not db.update_group_course(group_id, target_id, operator, **updates):
-            return None
-        # 旧的 24h/1h 节点已经对应不上新时间，清掉后被扫描式计划重建。
-        db.drop_pending_deliveries("training_session", target_id, group_id=group_id)
-        fresh = db.get_group_course(group_id, target_id) or course
-        return "course_updated", fresh
-    contest = db.get_competition(target_id)
+        from cdutetc import business_followup
+
+        with closing(db._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not business_followup._allowed(conn, group_id, operator):
+                return None
+            current_course = business_followup._record(conn, group_id, "training_session", target_id)
+            if current_course is None:
+                return None
+            if not kind and business_followup._record(conn, group_id, "competition", target_id) is not None:
+                return None
+            if cancel:
+                saved = db.cancel_training_session(group_id, target_id, operator, conn=conn)
+            else:
+                saved = db.update_group_course(group_id, target_id, operator, conn=conn, **updates)
+            if not saved:
+                conn.rollback()
+                return None
+            # 课程、审计和旧节点共享事务，清理失败时也不提交改期/取消。
+            db.drop_pending_deliveries("training_session", target_id, group_id=group_id, conn=conn)
+            if cancel:
+                return "course_cancelled", current_course
+            fresh = business_followup._record(conn, group_id, "training_session", target_id)
+            if fresh is None:
+                conn.rollback()
+                return None
+            return "course_updated", fresh
     if contest is None:
         return None
-    if cancel:
-        # 比赛表没有 cancelled 状态（改动状态机会污染既有查询），
-        # 取消的语义落到「不再推送」：解绑通知群 + 作废待发节点。
-        db.set_competition_notify_groups(target_id, set(), operator)
-        db.drop_pending_deliveries("competition", target_id)
-        return "contest_cancelled", contest
     updates = {}
     moment = _slot_date(slots, now)
     start = _parse_clock(slots.get("start_time"))
     if moment is not None and start:
         updates["official_time"] = f"{moment:%Y-%m-%d} {start}"
-    if slots.get("location"):
-        updates["summary"] = slots["location"]
     if slots.get("url"):
         updates["official_site"] = _sanitize_url(slots["url"])
-    if not updates:
+    location = slots.get("location")
+    if not cancel and not updates and not location:
         return None
-    if not db.update_competition(target_id, updates, operator, "老师群内通知改期"):
-        return None
-    db.set_competition_notify_groups(target_id, {group_id}, operator)
-    db.drop_pending_deliveries("competition", target_id)
-    fresh = db.get_competition(target_id) or contest
-    return "contest_updated", fresh
+    from cdutetc import business_followup, group_cleanup
+
+    with closing(db._connect()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        # 领取写锁后再读权限、状态和群范围；字段与地点共享提交边界。
+        if not business_followup._allowed(conn, group_id, operator):
+            return None
+        current_contest = business_followup._record(conn, group_id, "competition", target_id)
+        if current_contest is None:
+            return None
+        if not kind and conn.execute("SELECT 1 FROM training_sessions WHERE id=? AND group_id=?"
+                                     " AND status='confirmed'", (target_id, group_id)).fetchone():
+            return None
+        if cancel:
+            if group_cleanup._sending(conn, group_id, "competition", target_id):
+                return None
+            path = group_cleanup._path(conn)
+            group_cleanup._backup(path, path.parent / "backups")
+            group_cleanup._clear(conn, group_id, "competition", target_id, operator,
+                                 business_followup._now(now), "cancelled")
+            return "contest_cancelled", current_contest
+        # 任何一项失败都不允许提交已成功的另一项。
+        if updates and not db.update_competition(target_id, updates, operator, "老师群内通知改期", conn=conn):
+            conn.rollback()
+            return None
+        if location and not business_followup.set_competition_location(
+                group_id, operator, target_id, location, now=now, conn=conn):
+            conn.rollback()
+            return None
+        fresh = business_followup._record(conn, group_id, "competition", target_id)
+        return "contest_updated", fresh
 
 
 def _private_targets(group_id: str, sender_id: str) -> list[str]:
@@ -615,6 +689,8 @@ async def handle_message(text: str, *, group_id: str, sender_id: str,
         # 第一层拦下的都是闲聊：不花 token，也不在群里留下任何痕迹。
         return _result(INTENT_CHAT_IGNORE, "ignored")
     slots = await classify(text, group_id=group_id, now=moment)
+    if not is_teacher_speaker(group_id, sender_id):
+        return _result(INTENT_CHAT_IGNORE, "ignored")
     if slots is None:
         return _result(INTENT_CHAT_IGNORE, "ignored")
     intent = slots["intent"]

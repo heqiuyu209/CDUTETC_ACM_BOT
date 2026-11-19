@@ -98,10 +98,16 @@ def list_question_contests(group_id: str, limit: int = 5, *, order: str = "recen
             SELECT name, reg_deadline, contest_time, mode, location, source_link, id
             FROM (
                 SELECT name, official_reg_deadline AS reg_deadline,
-                       official_time AS contest_time, '' AS mode, '' AS location,
+                       official_time AS contest_time, '' AS mode,
+                       COALESCE((SELECT location FROM group_competition_locations gl
+                                 WHERE gl.competition_id=c.id AND gl.group_id=?), '') AS location,
                        official_site AS source_link, updated_at AS sort_time,
                        1 AS is_public, id
                 FROM competitions c WHERE status = 'confirmed'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM group_competition_archives ga
+                    WHERE ga.competition_id=c.id AND ga.group_id=?
+                  )
                   AND (
                     NOT EXISTS (
                         SELECT 1 FROM competition_notify_groups ng
@@ -123,7 +129,7 @@ def list_question_contests(group_id: str, limit: int = 5, *, order: str = "recen
             ORDER BY {order_sql}
             LIMIT ?
             """,
-            (group_id, group_id, limit),
+            (group_id, group_id, group_id, group_id, limit),
         ).fetchall()
     return [dict(zip(fields, row)) for row in rows]
 
@@ -276,7 +282,7 @@ def _create_competition_on(conn: sqlite3.Connection, info: dict,
     return cid
 
 
-def create_competition(info: dict, status: str = "draft", operator: str = "",
+def create_competition(info: dict, status: str = "draft", operator: str = "", *,
                        conn: sqlite3.Connection | None = None) -> int:
     """创建公共比赛（默认草稿）。校验失败抛 ValueError，不写库。"""
     if conn is not None:
@@ -372,15 +378,18 @@ def get_competition_notify_groups(competition_id: int) -> set[str]:
 
 
 def _competition_target_groups_on(conn: sqlite3.Connection, competition_id: int) -> set[str]:
+    archived = {r[0] for r in conn.execute(
+        "SELECT group_id FROM group_competition_archives WHERE competition_id=?", (competition_id,),
+    )}
     groups = {r[0] for r in conn.execute(
         "SELECT group_id FROM competition_notify_groups WHERE competition_id=?", (competition_id,),
     )}
     if groups:
-        return groups & set(config.ALLOWED_GROUPS)
+        return (groups & set(config.ALLOWED_GROUPS)) - archived
     if (conn.execute("SELECT 1 FROM weekly_contest_runs WHERE competition_id=?", (competition_id,)).fetchone()
             or not conn.execute("SELECT 1 FROM competitions WHERE id=?", (competition_id,)).fetchone()):
         return set()
-    return set(config.ALLOWED_GROUPS)
+    return set(config.ALLOWED_GROUPS) - archived
 
 
 def get_competition_target_groups(competition_id: int) -> set[str]:
@@ -392,36 +401,37 @@ def get_competition_target_groups(competition_id: int) -> set[str]:
 def list_group_competitions(group_id: str, status: str | None = "confirmed") -> list[dict]:
     """列出对指定群可见的比赛（公共比赛对全部允许群可见，周赛仅指定群可见）。"""
     gid = str(group_id).strip()
-    return [
+    items = [
         competition for competition in list_competitions(status)
         if gid in get_competition_target_groups(competition["id"])
     ]
+    with _conn._connect() as conn:
+        locations = dict(conn.execute("SELECT competition_id,location FROM group_competition_locations WHERE group_id=?", (gid,)))
+    return [{**item, "location": locations.get(item["id"], "")} for item in items]
 
 
 def set_competition_notify_groups(competition_id: int, group_ids,
-                                  operator: str = "") -> int:
+                                  operator: str = "", *,
+                                  conn: sqlite3.Connection | None = None) -> int:
     """设置范围；公共比赛空集合为全部允许群，自动周赛空集合为无目标群。
 
     Returns:
         实际写入的群数（0 表示已清空为全局）。
     """
     groups = {str(g).strip() for g in (group_ids or []) if str(g).strip()}
-    with _conn._connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-            "DELETE FROM competition_notify_groups WHERE competition_id = ?",
-            (competition_id,),
-        )
-        for gid in sorted(groups):
-            conn.execute(
-                "INSERT OR IGNORE INTO competition_notify_groups"
-                " (competition_id, group_id) VALUES (?, ?)",
-                (competition_id, gid),
-            )
-        _training._sync_contest_start_reminders(conn, competition_id, groups or set(config.ALLOWED_GROUPS))
+
+    def write_on(connection: sqlite3.Connection) -> int:
+        _set_competition_scope_on(connection, competition_id, groups)
+        _training._sync_contest_start_reminders(connection, competition_id, groups or set(config.ALLOWED_GROUPS))
         _admin.add_audit(operator, "", "set_notify_groups", "competition",
-                  str(competition_id), "", ",".join(sorted(groups)), conn=conn)
+                  str(competition_id), "", ",".join(sorted(groups)), conn=connection)
         return len(groups)
+
+    if conn is not None:
+        return write_on(conn)
+    with _conn._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        return write_on(connection)
 
 
 def list_competitions(status: str | None = None) -> list[dict]:
@@ -448,10 +458,12 @@ def _add_version(conn: sqlite3.Connection, cid: int, kind: str, fields: dict,
     )
 
 
-def update_competition(cid: int, info: dict, operator: str = "", note: str = "") -> bool:
+def update_competition(cid: int, info: dict, operator: str = "", note: str = "", *,
+                       conn: sqlite3.Connection | None = None) -> bool:
     """更新公共比赛字段并记录变更版本。仅更新传入的字段（部分更新）。
 
     传入字段逐个清洗：name 非空；时间字段统一格式；其余字符串。
+    传入 conn 时由调用方统一提交或回滚，供比赛字段与本群地点原子更新。
     """
     cleaned: dict[str, str] = {}
     allowed = {
@@ -476,23 +488,28 @@ def update_competition(cid: int, info: dict, operator: str = "", note: str = "")
         return False
     sets = ", ".join(f"{c} = ?" for c in cols)
     args = [cleaned[c] for c in cols] + [_conn.now_str(), cid]
-    with _conn._connect() as conn:
-        cur = conn.execute(
+    def write_on(connection):
+        cur = connection.execute(
             f"UPDATE competitions SET {sets}, updated_at = ? WHERE id = ?", args
         )
         if cur.rowcount == 0:
             return False
-        cur_comp = conn.execute(
+        cur_comp = connection.execute(
             f"SELECT {_COMPETITION_COLS} FROM competitions WHERE id = ?", (cid,)
         ).fetchone()
-        _add_version(conn, cid, "draft", _row_to_competition(cur_comp),
+        _add_version(connection, cid, "draft", _row_to_competition(cur_comp),
                      note or "编辑", operator)
         if "official_time" in cleaned:
-            scoped = {r[0] for r in conn.execute(
+            scoped = {r[0] for r in connection.execute(
                 "SELECT group_id FROM competition_notify_groups WHERE competition_id = ?", (cid,)
             ).fetchall()}
-            _training._sync_contest_start_reminders(conn, cid, scoped or None)
+            _training._sync_contest_start_reminders(connection, cid, scoped or None)
         return True
+
+    if conn is not None:
+        return write_on(conn)
+    with _conn._connect() as connection:
+        return write_on(connection)
 
 
 def confirm_competition(cid: int, operator: str = "") -> bool:
@@ -821,7 +838,8 @@ _TARGET_NAME_COLUMNS = {
 _GROUP_PERMISSION_RETRY_SECONDS = 300
 
 
-def drop_pending_deliveries(obj_type: str, obj_id: int, *, group_id: str = "") -> int:
+def drop_pending_deliveries(obj_type: str, obj_id: int, *, group_id: str = "",
+                            conn: sqlite3.Connection | None = None) -> int:
     """作废某对象的**未发送**提醒节点，返回删除条数。
 
     课程改期/取消、比赛改期后，旧时间点的 pending 行已经不可能再被
@@ -840,6 +858,7 @@ def drop_pending_deliveries(obj_type: str, obj_id: int, *, group_id: str = "") -
     if _conn._as_str(group_id):
         sql += " AND group_id = ?"
         args.append(_conn._as_str(group_id))
-    with _conn._connect() as conn:
-        cur = conn.execute(sql, args)
-        return cur.rowcount
+    if conn is not None:
+        return conn.execute(sql, args).rowcount
+    with _conn._connect() as connection:
+        return connection.execute(sql, args).rowcount

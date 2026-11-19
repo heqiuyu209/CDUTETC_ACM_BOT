@@ -289,6 +289,7 @@ def today_competitions(group_id: str, now: datetime | None = None) -> list[dict]
             "edition": (contest.get("edition") or "").strip(),
             "url": (contest.get("official_site") or "").strip(),
             "summary": (contest.get("summary") or "").strip(),
+            "location": (contest.get("location") or "").strip(),
             "weekly": bool(weekly),
         })
     out.sort(key=lambda item: item["start_dt"])
@@ -389,6 +390,8 @@ def _render_competitions(competitions: list[dict], current: datetime) -> list[st
             countdown = "进行中" if delta <= timedelta(0) else f"{_remaining_label(delta)}后"
             lines.append(f"- {item['start_dt'].strftime('%H:%M')}（{countdown}）")
             lines.append(f"  {item['name']}")
+            if item.get("location"):
+                lines.append(f"  地点：{item['location']}")
             link = (item.get("url") or item.get("site") or "").strip()
             if link:  # 没有链接的场次（如队内 ACM 周赛）不输出空的「链接：」行
                 lines.append(f"  链接：{link}")

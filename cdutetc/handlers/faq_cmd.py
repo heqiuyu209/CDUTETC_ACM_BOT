@@ -249,6 +249,66 @@ async def match_faq(group_id: str, text: str, *, exact_only: bool = False) -> di
     return await faq_search.find(group_id, text, db.list_faq(group_id), exact_only=exact_only)
 
 
+def _business_name_match(text: str, title: str) -> tuple[int, bool]:
+    """完整名称优先；名称末尾数字必须作为完整编号匹配。"""
+    title = title.strip()
+    if not title:
+        return 0, True
+    numbered = re.fullmatch(r"(.*?\D)(\d+)", title)
+    if numbered:
+        mentioned = re.search(re.escape(numbered[1]) + r"(\d+)", text, re.I)
+        if mentioned and mentioned[1] != numbered[2]:
+            return 0, False
+    pattern = ((r"(?<!\d)" if title[0].isdigit() else "") + re.escape(title)
+               + (r"(?!\d)" if title[-1].isdigit() else ""))
+    return (len(title) if re.search(pattern, text, re.I) else 0), True
+
+
+def _select_business_fact(text: str, competitions: list[dict], sessions: list[dict]
+                          ) -> tuple[str, dict | None, str | None]:
+    """跨课程和比赛选唯一事实；最高同分且地点不同则只询问对象。"""
+    from cdutetc import qa_context
+
+    weekday = re.search(r"(?:周|星期|礼拜)[一二三四五六日天]", text)
+    requested_weekday = qa_context._training_weekday(weekday[0]) if weekday else None
+    ranked = []
+    for kind, records, title_key, extra_key in (
+        ("competition", competitions, "name", "contest_time"),
+        ("training_session", sessions, "title", "location"),
+    ):
+        for item in records:
+            title = item.get(title_key) or ""
+            exact_length, compatible = _business_name_match(text, title)
+            if not compatible:
+                continue
+            if requested_weekday is not None:
+                if kind == "training_session":
+                    actual_weekday = qa_context._training_weekday(item.get("weekday"))
+                else:
+                    moment = db._delivery_parse_time(item.get("contest_time") or "")
+                    actual_weekday = moment.weekday() if moment else None
+                if actual_weekday is not None and actual_weekday != requested_weekday:
+                    continue
+            score = content_filter.record_match_score(text, title, item.get(extra_key) or "")
+            if exact_length or score >= config.QA_KB_MATCH_MIN_SCORE:
+                ranked.append((exact_length, 1.0 if exact_length else score, kind, item))
+    if not ranked:
+        return "", None, None
+    best_rank = max((row[0], row[1]) for row in ranked)
+    top = [row for row in ranked if (row[0], row[1]) == best_rank]
+    locations = {(row[3].get("location") or "").strip() for row in top}
+    if len(top) > 1 and len(locations) > 1:
+        lines = ["地点：匹配到多项地点不同的安排，请明确要查询哪一项。"]
+        for _length, _score, kind, item in top[:5]:
+            label = "比赛" if kind == "competition" else "课程"
+            title = item.get("name" if kind == "competition" else "title") or "未命名安排"
+            when = (item.get("contest_time") if kind == "competition" else
+                    " ".join(str(item.get(key) or "") for key in ("weekday", "start_time")).strip())
+            lines.append(f"· {label} {item['id']}：{title}" + (f"｜{when}" if when else ""))
+        return "", None, "\n".join(lines)
+    return top[0][2], top[0][3], None
+
+
 async def _answer_from_knowledge_base(text: str, group_id: str) -> str | None:
     """只查库内已录入内容作答，不调用模型（普通成员问答路径）。
 
@@ -259,16 +319,16 @@ async def _answer_from_knowledge_base(text: str, group_id: str) -> str | None:
     因此不会出现模型编造或“我没有数据库权限”这类管理端话术。
     """
     threshold = config.QA_KB_MATCH_MIN_SCORE
+    kind, selected, clarification = _select_business_fact(
+        text, db.list_question_contests(group_id, limit=50),
+        db.list_training_sessions(group_id, active_only=True),
+    )
+    if clarification:
+        return clarification
 
     # 1) 已录入比赛：Dice 相似度 + 标题关键词命中取最高（口语问法也能召回）
-    best, best_score = None, 0.0
-    for comp in db.list_question_contests(group_id):
-        score = content_filter.record_match_score(
-            text, comp.get("name") or "", comp.get("contest_time") or "",
-        )
-        if score > best_score:
-            best, best_score = comp, score
-    if best is not None and best_score >= threshold:
+    best = selected if kind == "competition" else None
+    if best is not None:
         name = best.get('name') or '未命名比赛'
         fields = (("报名截止", "reg_deadline"), ("比赛时间", "contest_time"),
                   ("形式", "mode"), ("地点", "location"), ("官网", "source_link"))
@@ -297,20 +357,20 @@ async def _answer_from_knowledge_base(text: str, group_id: str) -> str | None:
         return "\n".join(lines)
 
     # 2) 本群课程安排
-    best_t, best_t_score = None, 0.0
-    for session in db.list_training_sessions(group_id, active_only=True):
-        score = content_filter.record_match_score(
-            text, session.get("title") or "", session.get("location") or "",
-        )
-        if score > best_t_score:
-            best_t, best_t_score = session, score
-    if best_t is not None and best_t_score >= threshold:
+    best_t = selected if kind == "training_session" else None
+    if best_t is not None:
+        from cdutetc import qa_context
+
         lines = [f"【{best_t.get('title') or '集训课'}】"]
-        weekday = {0: "周一", 1: "周二", 2: "周三", 3: "周四",
-                   4: "周五", 5: "周六", 6: "周日"}.get(best_t.get("weekday"))
-        if weekday:
-            lines.append(f"时间：{weekday} {best_t.get('start_time') or ''}"
-                         f"-{best_t.get('end_time') or ''}".rstrip("-"))
+        weekday_index = qa_context._training_weekday(best_t.get("weekday"))
+        start, end = qa_context._normalized_clocks(best_t.get("start_time"), best_t.get("end_time"))
+        if weekday_index is not None and start is not None:
+            weekday = qa_context._WEEKDAY_LABELS[weekday_index]
+            span = start.strftime("%H:%M") + (f"-{end:%H:%M}" if end else "")
+            date = qa_context._single_occurrence_date(best_t)
+            lines.append(f"时间：{date + ' ' if date else ''}{weekday} {span}")
+        elif re.search(r"时间|什么时候|几点|周几|何时", text):
+            lines.append("时间：还没登记，暂时无法确定")
         if best_t.get("location"):
             lines.append(f"地点：{best_t['location']}")
         if best_t.get("needs_laptop"):
@@ -401,11 +461,12 @@ async def handle_non_command_message(text: str, group_id: str, sender: str,
     if config.QA_PROBLEM_GATE_ENABLED and content_filter.is_algorithm_query(text):
         return [{"group_id": group_id, "text": config.QA_PROBLEM_REPLY}]
 
-    # 普通成员：知识库优先，未命中转人工，全程不产生模型调用
+    # 老师与成员都先答本群已登记事实，命中不必花模型 Token。
+    answer = await _answer_from_knowledge_base(text, group_id)
+    if answer is not None:
+        return [{"group_id": group_id, "text": answer}]
+    # 普通成员：未命中转人工，全程不产生模型调用
     if not staff and config.QA_MEMBER_KB_ONLY:
-        answer = await _answer_from_knowledge_base(text, group_id)
-        if answer is not None:
-            return [{"group_id": group_id, "text": answer}]
         # 可选：先用动态上下文模型作答（事实覆盖不到才转工单），默认关闭保持零 token
         if config.QA_MEMBER_CONTEXT_ANSWER and config.LLM_API_KEY:
             contextual = await _answer_from_context(text, group_id)
@@ -432,7 +493,7 @@ async def _answer_question_with_context(text: str, group_id: str) -> str:
     """带上当前群教务事实的模型问答；模型异常按「模型暂时不可用」返回。"""
     from cdutetc import qa_context
 
-    group_context = qa_context.build_group_qa_context(group_id) if config.QA_CONTEXT_ENABLED else ""
+    group_context = qa_context.build_group_qa_context(group_id, question=text) if config.QA_CONTEXT_ENABLED else ""
     try:
         return await llm.answer_question(
             text, db.list_question_contests(group_id), group_context=group_context,
