@@ -203,7 +203,8 @@ def _row_to_training(r: sqlite3.Row) -> dict:
     }
 
 
-def create_training_session(group_id: str, info: dict, operator: str = "") -> int:
+def create_training_session(group_id: str, info: dict, operator: str = "", *,
+                            conn: sqlite3.Connection | None = None) -> int:
     """创建群内课程/训练安排。group_id 必填。"""
     group_id = _conn._as_str(group_id)
     title = _conn._as_str(info.get("title") or "")
@@ -229,8 +230,9 @@ def create_training_session(group_id: str, info: dict, operator: str = "") -> in
     )
     if values[12] not in ("confirmed", "draft", "cancelled"):
         raise ValueError("状态必须是 confirmed/draft/cancelled")
-    with _conn._connect() as conn:
-        cur = conn.execute(
+
+    def write_on(connection: sqlite3.Connection) -> int:
+        cur = connection.execute(
             "INSERT INTO training_sessions (group_id, title, weekday, start_time,"
             " end_time, location, needs_laptop, software, device_req, training_group,"
             " effective_start, effective_end, status, source, maintainer, updated_at,"
@@ -239,6 +241,11 @@ def create_training_session(group_id: str, info: dict, operator: str = "") -> in
             values,
         )
         return cur.lastrowid
+
+    if conn is not None:
+        return write_on(conn)
+    with _conn._connect() as connection:
+        return write_on(connection)
 
 
 def list_training_sessions(group_id: str, active_only: bool = True,
@@ -262,18 +269,25 @@ def list_training_sessions(group_id: str, active_only: bool = True,
     return [_row_to_training(r) for r in rows]
 
 
-def cancel_training_session(group_id: str, tid: int, operator: str = "") -> bool:
+def cancel_training_session(group_id: str, tid: int, operator: str = "", *,
+                            conn: sqlite3.Connection | None = None) -> bool:
     """取消课程（标记 cancelled，不物理删除；旧安排不再视为当前安排）。"""
-    with _conn._connect() as conn:
-        cur = conn.execute(
+
+    def write_on(connection: sqlite3.Connection) -> bool:
+        cur = connection.execute(
             "UPDATE training_sessions SET status = 'cancelled', updated_at = ?"
             " WHERE id = ? AND group_id = ?",
             (_conn.now_str(), tid, group_id),
         )
         if cur.rowcount:
             _admin.add_audit(operator, group_id, "cancel", "training_session", str(tid), "",
-                      "cancelled", conn=conn)
+                      "cancelled", conn=connection)
         return cur.rowcount > 0
+
+    if conn is not None:
+        return write_on(conn)
+    with _conn._connect() as connection:
+        return write_on(connection)
 
 
 _TRAINING_UPDATE_FIELDS = (
@@ -303,7 +317,8 @@ def get_group_course(group_id: str, course_id: int) -> dict | None:
     return _row_to_training(row) if row else None
 
 
-def update_group_course(group_id: str, course_id: int, operator: str = "", **kwargs) -> bool:
+def update_group_course(group_id: str, course_id: int, operator: str = "", *,
+                        conn: sqlite3.Connection | None = None, **kwargs) -> bool:
     """修改课程的可编辑字段（白名单字段 + 审计留痕）。
 
     - 未知字段直接 ValueError，避免拼写错误静默丢改动；
@@ -342,16 +357,22 @@ def update_group_course(group_id: str, course_id: int, operator: str = "", **kwa
         return False
     assignments = ", ".join(f"{field} = ?" for field in changes)
     values = [*changes.values(), _conn.now_str(), cid, group_id]
-    with _conn._connect() as conn:
-        cur = conn.execute(
+
+    def write_on(connection: sqlite3.Connection) -> bool:
+        cur = connection.execute(
             f"UPDATE training_sessions SET {assignments}, updated_at = ?"
             " WHERE id = ? AND group_id = ?",
             values,
         )
         if cur.rowcount:
             _admin.add_audit(operator, group_id, "update", "training_session", str(cid), "",
-                      json.dumps(sorted(changes), ensure_ascii=False), conn=conn)
+                      json.dumps(sorted(changes), ensure_ascii=False), conn=connection)
         return cur.rowcount > 0
+
+    if conn is not None:
+        return write_on(conn)
+    with _conn._connect() as connection:
+        return write_on(connection)
 
 
 def sync_future_contest_start_reminders(now: datetime | None = None) -> None:

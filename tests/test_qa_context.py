@@ -209,7 +209,7 @@ async def test_staff_question_passes_group_context(env):
     group_context = answer.await_args.kwargs["group_context"]
     assert "图论进阶" in group_context
     assert "[ID: 1] 天梯赛选拔" in group_context
-    assert "机房钥匙找谁？" in group_context
+    assert "机房钥匙找谁？" not in group_context
 
 
 async def test_staff_unknown_marker_becomes_ticket(env):
@@ -291,7 +291,7 @@ async def test_staff_real_llm_path_sees_facts_and_answers(env):
 
     assert replies[0]["text"] == "本周三 19:00-21:00 图论进阶，地点实训楼 B302。"
     assert "图论进阶" in seen["system"]
-    assert "机房钥匙找谁？" in seen["system"]
+    assert "机房钥匙找谁？" not in seen["system"]
     assert "/课程列表" in seen["system"]
 
 

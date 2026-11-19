@@ -109,6 +109,14 @@ class JobsMixin:
                     continue
                 if result.ok:
                     sent += 1
+                    if result.message_id:
+                        try:
+                            from cdutetc import business_followup
+
+                            business_followup.remember_digest(group_id, result.message_id, detail, now=now)
+                        except Exception:
+                            # 平台已确认发送，绑定失败不改变投递结果，也不重发早报。
+                            logger.exception("[晨报] 群 %s 业务引用绑定失败", group_id)
                     continue
                 if result.code == DeliveryCode.QUOTA_EXHAUSTED:
                     logger.warning(

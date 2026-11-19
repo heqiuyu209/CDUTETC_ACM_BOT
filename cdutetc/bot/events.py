@@ -344,6 +344,48 @@ class EventsMixin:
             self._schedule_meme_collect(message, group_id, text)
             if not text:
                 return
+            # 显式地点补充在老师自动意图与聊天前处理；无@也仅放行有本群写权限的老师。
+            from cdutetc import business_followup, roles
+
+            # 地点问句是只读查询，先于补地点处理；无@时也必须阻断老师写意图。
+            if not text.startswith("/") and business_followup.is_location_query(text):
+                if not addressed:
+                    return
+                member_id = self._extract_member_id(message)
+                allowed, gate_reply = self._qa_gate(member_id, text)
+                if not allowed:
+                    if gate_reply:
+                        await self._safe_reply(message, _main.content_filter.sanitize_output(
+                            gate_reply, max_length=_main.config.QA_OUTPUT_MAX_LENGTH,
+                            max_link_length=_main.config.QA_OUTPUT_MAX_LINK_LENGTH,
+                        ))
+                    return
+                if not _main.db.group_switch_enabled(group_id, "qa_enabled"):
+                    return
+                from cdutetc.handlers import faq_cmd
+
+                answer = await faq_cmd._answer_from_knowledge_base(text, group_id)
+                if answer:
+                    if not any(line.startswith("地点：") for line in answer.splitlines()):
+                        answer += "\n地点：还没登记，暂时无法确定"
+                else:
+                    answer = "本群暂无对应的已登记地点，请明确课程或比赛名称。"
+                await self._safe_reply(message, _main.content_filter.sanitize_output(
+                    answer, max_length=_main.config.QA_OUTPUT_MAX_LENGTH,
+                    max_link_length=_main.config.QA_OUTPUT_MAX_LINK_LENGTH,
+                ))
+                return
+            if (not text.startswith("/") and business_followup.is_location_message(text)
+                    and (addressed or (roles.resolve_admin_scope(self._extract_member_id(message), group_id)
+                                      and _main.config.TEACHER_AUTO_INTENT_ENABLED))):
+                result = await _main.asyncio.to_thread(
+                    business_followup.handle_location, text, group_id, self._extract_member_id(message),
+                    msg_id=str(getattr(message, "id", "") or ""),
+                    reference_id=str(getattr(message, "reference_id", "") or ""),
+                )
+                if result is not None:
+                    await self._safe_reply(message, result["reply"])
+                    return
             # 群全量消息入口：老师没 @ 机器人、也没带 / 命令，只是在群里说安排
             # （「周三晚七点讲图论」）时，交给隐式意图管线判断要不要登记。
             # 队员的普通消息在这里一定返回 False，继续走原有逻辑直至放行。

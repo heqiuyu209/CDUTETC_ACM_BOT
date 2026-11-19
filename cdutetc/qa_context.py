@@ -12,9 +12,10 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, time, timedelta
 
-from cdutetc import config, daily_digest
+from cdutetc import config, content_filter, daily_digest
 from cdutetc import database as db
 from cdutetc.daily_digest import TZ, _clock, _load_fields, _now, _training_weekday
 from cdutetc.utils import normalize_time_expression, split_normalized_time
@@ -32,6 +33,8 @@ FAQ_TOP_N = 3
 # 单条 FAQ 的展示上限，避免个别长答案挤占整段上下文预算。
 FAQ_QUESTION_CHARS = 60
 FAQ_ANSWER_CHARS = 120
+COMPACT_FACT_TOKEN_LIMIT = 160
+COMPACT_FACT_MAX_ITEMS = 3
 
 _WEEKDAY_LABELS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
@@ -65,18 +68,17 @@ def week_sessions(group_id: str, now: datetime | None = None,
         for session in sessions:
             if _training_weekday(session.get("weekday")) != day.weekday():
                 continue
-            start_clock = _clock(session.get("start_time"))
+            start_clock, end_clock = _normalized_clocks(session.get("start_time"), session.get("end_time"))
             if start_clock is None:
                 continue
             start = datetime.combine(day, start_clock, tzinfo=TZ)
-            end_clock = _clock(session.get("end_time"))
             end = datetime.combine(day, end_clock, tzinfo=TZ) if end_clock else start
             if end < start:  # 跨零点课程：结束时间视为次日
                 end += timedelta(days=1)
             if end <= current:
                 continue
             try:
-                if not db.training_occurrence_valid(session, start):
+                if not _valid_session_occurrence(session, start):
                     continue
             except Exception:
                 logger.warning("课程生效期校验失败 [session=%s]", session.get("id"), exc_info=True)
@@ -86,17 +88,19 @@ def week_sessions(group_id: str, now: datetime | None = None,
                 "title": session.get("title") or "训练安排",
                 "weekday_label": _WEEKDAY_LABELS[day.weekday()],
                 "date_label": day.strftime("%m-%d") + " " + _WEEKDAY_LABELS[day.weekday()],
+                "date_text": day.strftime("%Y-%m-%d"),
                 "start_text": start.strftime("%H:%M"),
                 "end_text": end.strftime("%H:%M") if end_clock else "",
                 "location": (session.get("location") or "").strip(),
                 "start_dt": start,
+                "recurring": not _single_day_session(session),
             })
     out.sort(key=lambda item: item["start_dt"])
     return out[:MAX_SESSION_ITEMS]
 
 
 def weekly_courses(group_id: str, now: datetime | None = None) -> list[dict]:
-    """本周（``now`` 所在周，周一~周日）可上的周常课程，按星期与开始时间排序。
+    """本周（周一~周日）实际有效的课程实例，区分单次和每周安排。
 
     与 :func:`week_sessions` 的区别：这里不剪掉「本周已过去」的课，而是把每门课
     落到本周对应的公历日期上，模型据此才能回答「这周四有课吗」而不是回答「未登记」。
@@ -122,6 +126,9 @@ def weekly_courses(group_id: str, now: datetime | None = None) -> list[dict]:
         if start_clock is None:
             continue
         day = monday + timedelta(days=weekday_index)
+        start = datetime.combine(day, start_clock, tzinfo=TZ)
+        if not _valid_session_occurrence(session, start):
+            continue
         out.append({
             "id": session.get("id"),
             "title": session.get("title") or "训练安排",
@@ -131,6 +138,7 @@ def weekly_courses(group_id: str, now: datetime | None = None) -> list[dict]:
             "date_text": day.strftime("%Y-%m-%d"),
             "location": (session.get("location") or "").strip(),
             "sort_key": (weekday_index, start_clock),
+            "recurring": not _single_day_session(session),
         })
     out.sort(key=lambda item: item["sort_key"])
     return out[:MAX_SESSION_ITEMS]
@@ -222,6 +230,43 @@ def relevant_faqs(group_id: str, question: str, limit: int = FAQ_TOP_N) -> list[
 # 文本结构化
 # ---------------------------------------------------------------------
 
+
+def _valid_session_occurrence(session: dict, start: datetime) -> bool:
+    """规范化已有时间再校验真实生效期；未知值不能生成课程实例。"""
+    index = _training_weekday(session.get("weekday"))
+    if index is None:
+        return False
+    normalized = {**session, "weekday": _WEEKDAY_LABELS[index],
+                  "start_time": start.strftime("%H:%M:%S")}
+    try:
+        return db.training_occurrence_valid(normalized, start)
+    except Exception:
+        logger.warning("问答课程实例校验失败 [session=%s]", session.get("id"), exc_info=True)
+        return False
+
+
+def _single_day_session(session: dict) -> bool:
+    start = db._delivery_parse_time(session.get("effective_start") or "")
+    end = db._delivery_parse_time(session.get("effective_end") or "")
+    return bool(start and end and start <= end and end - start < timedelta(days=7))
+
+
+def _single_occurrence_date(session: dict) -> str:
+    """短有效期的实际开课日，不能把有效期第一天冒认为开课日。"""
+    if not _single_day_session(session):
+        return ""
+    bound = db._delivery_parse_time(session.get("effective_start") or "")
+    weekday = _training_weekday(session.get("weekday"))
+    start_clock, _ = _normalized_clocks(session.get("start_time"), session.get("end_time"))
+    if weekday is None or start_clock is None:
+        return ""
+    day = bound.date() + timedelta(days=(weekday - bound.weekday()) % 7)
+    occurrence = datetime.combine(day, start_clock, tzinfo=TZ)
+    if occurrence < bound:
+        occurrence += timedelta(days=7)
+    return occurrence.date().isoformat() if _valid_session_occurrence(session, occurrence) else ""
+
+
 def _normalized_clocks(start_raw: str, end_raw: str) -> tuple[time | None, time | None]:
     """把脏时间（如 ``19-21点``）先归一化再解析，归一化失败退回原始写法。"""
     packed = " ".join(x for x in ((start_raw or "").strip(), (end_raw or "").strip()) if x)
@@ -239,8 +284,9 @@ def _span_text(item: dict) -> str:
 
 def _week_course_line(item: dict) -> str:
     """段落 1 行：显式带本周公历日期，避免模型把周常课程判为「未登记」。"""
+    kind = "｜单次安排" if not item.get("recurring", True) else ""
     return (f'- {item["title"]}｜{item["weekday_label"]} {_span_text(item)}'
-            f'｜本周具体日期 {item["date_text"]}｜{item["location"] or "地点待定"}')
+            f'｜本周具体日期 {item["date_text"]}｜{item["location"] or "地点待定"}{kind}')
 
 
 def _repeat_course_line(item: dict) -> str:
@@ -341,11 +387,101 @@ def build_group_qa_context(group_id: str, now: datetime | None = None,
         lines.append("3. 常见问题（FAQ）：")
     lines.extend([_faq_line(item) for item in faqs] or ["- 暂无已录入 FAQ"])
     lines.append("4. 每周常规训练/任务（每周重复，无单次日期）：")
-    lines.extend([_repeat_course_line(item) for item in weekly] or ["- 暂无周常课程"])
+    lines.extend([_repeat_course_line(item) for item in weekly if item.get("recurring", True)]
+                 or ["- 暂无周常课程"])
     return _truncate(
         "\n".join(lines),
         int(getattr(config, "QA_CONTEXT_MAX_CHARS", 3000)),
     )
+
+
+def compact_business_facts(group_id: str, text: str, now: datetime | None = None) -> str:
+    """只取本问相关的本群事实，最多三行、160 估算 Token；纯闲聊为空。"""
+    from cdutetc.persona_chat import estimate_tokens
+
+    gid, asked = (group_id or "").strip(), (text or "").strip()
+    if gid not in config.ALLOWED_GROUPS or not asked or content_filter.is_social_chat(asked):
+        return ""
+    current = _now(now)
+    threshold = max(0.34, config.QA_KB_MATCH_MIN_SCORE)
+    candidates: list[tuple[float, str]] = []
+
+    def short(value, limit=18):
+        return _clip(" ".join(str(value or "").split()), limit)
+
+    def add(score, line):
+        if score >= threshold:
+            candidates.append((score, line))
+
+    querying = content_filter.is_information_request(asked) or bool(re.search(r"地点|教室|时间|安排", asked))
+    course_query = querying and bool(re.search(r"课程|集训|上课|课表|训练|补题|周报|讲座", asked))
+    sessions = weekly_courses(gid, current) if re.search(r"本周|这周", asked) else week_sessions(gid, current)
+    requested_date = None
+    for pattern, offset in ((r"后天", 2), (r"明天|明晚", 1), (r"今天|今晚", 0)):
+        if re.search(pattern, asked):
+            requested_date = (current + timedelta(days=offset)).date().isoformat()
+            break
+    weekday_match = re.search(r"(?:周|星期|礼拜)([一二三四五六日天])", asked)
+    requested_weekday = _training_weekday(weekday_match.group(0)) if weekday_match else None
+    for item in sessions:
+        if requested_date and item["date_text"] != requested_date:
+            continue
+        if requested_weekday is not None and _training_weekday(item["weekday_label"]) != requested_weekday:
+            continue
+        score = content_filter.record_match_score(asked, item["title"])
+        if course_query:
+            score = max(score, threshold)
+        add(score, f"课程 {short(item['title'])}｜{item['date_text']} {item['weekday_label']} "
+                   f"{_span_text(item)}｜{short(item['location']) or '地点待定'}")
+    try:
+        contests = db.list_question_contests(gid, limit=20)
+    except Exception:
+        logger.warning("聊天事实读取比赛失败 [group=%s]", gid, exc_info=True)
+        contests = []
+    contest_query = querying and bool(re.search(r"比赛|竞赛|校赛|周赛|选拔赛", asked))
+    for item in contests:
+        name = item.get("name") or "比赛"
+        score = content_filter.record_match_score(asked, name)
+        moment = db._delivery_parse_time(item.get("contest_time") or "")
+        if requested_date and moment is not None and moment < current:
+            continue
+        if moment is not None and requested_date and moment.date().isoformat() != requested_date:
+            continue
+        if moment is not None and requested_weekday is not None and moment.weekday() != requested_weekday:
+            continue
+        if contest_query and moment and current <= moment <= current + timedelta(days=7):
+            score = max(score, threshold)
+        time_text = item.get("contest_time") if moment else "时间待定"
+        line = f"比赛 {short(name)}｜{time_text}｜{short(item.get('location')) or '地点待定'}"
+        if re.search(r"报名|截止", asked):
+            deadline = db._delivery_parse_time(item.get("reg_deadline") or "")
+            line += f"｜报名截止 {item.get('reg_deadline') if deadline else '待定'}"
+        add(score, line)
+    collection_query = querying and bool(re.search(r"征集|报名|登记", asked))
+    for item in open_collections(gid):
+        deadline = db._delivery_parse_time(item["deadline"])
+        if deadline and deadline <= current:
+            continue
+        score = content_filter.record_match_score(asked, item["title"])
+        if collection_query:
+            score = max(score, threshold)
+        line = f"征集 #{item['id']} {short(item['title'])}｜截止 {item['deadline'] if deadline else '待定'}"
+        if item["remaining"] is not None:
+            line += f"｜剩 {item['remaining']} 名额"
+        add(score, line)
+    for item in relevant_faqs(gid, asked):
+        add(item["score"], f"FAQ #{item['id']} {short(item['question'], 14)}：{short(item['answer'], 32)}")
+
+    kept: list[str] = []
+    for _score, line in sorted(candidates, key=lambda item: -item[0]):
+        if line in kept:
+            continue
+        # 整行保留，避免把日期/地点裁成另一条事实。
+        if estimate_tokens("\n".join([*kept, line])) <= COMPACT_FACT_TOKEN_LIMIT:
+            kept.append(line)
+        if len(kept) >= COMPACT_FACT_MAX_ITEMS:
+            break
+    return "\n".join(kept)
 
 
 __all__ = [
@@ -357,6 +493,7 @@ __all__ = [
     "open_collections",
     "faq_pairs",
     "relevant_faqs",
+    "compact_business_facts",
 ]
 
 # 保留 daily_digest 引用，表明课程解析逻辑与其同源（避免重复实现）。

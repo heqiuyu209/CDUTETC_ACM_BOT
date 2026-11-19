@@ -98,6 +98,8 @@ def _snapshot(conn, gid, kind, item):
             state[table] = _rows(conn, f"SELECT * FROM {table} WHERE competition_id=? ORDER BY rowid", (oid,))
         state["archive"] = _rows(conn, "SELECT * FROM group_competition_archives"
                                  " WHERE group_id=? AND competition_id=?", (gid, oid))
+        state["location"] = _rows(conn, "SELECT * FROM group_competition_locations"
+                                  " WHERE group_id=? AND competition_id=?", (gid, oid))
     elif kind == "collection":
         state["responses"] = _rows(conn, "SELECT * FROM collection_responses WHERE collection_id=? ORDER BY id", (oid,))
     elif kind == "faq":

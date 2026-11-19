@@ -332,9 +332,17 @@ class PersonaMixin:
         except _main.sqlite3.Error:
             status_text = _main.db.DEFAULT_DAILY_STATUS
             logger.warning("生活状态读取失败，本次用默认状态", exc_info=True)
+        from cdutetc import qa_context
+
+        current = _main.datetime.now(_main.ZoneInfo("Asia/Shanghai"))
+        try:
+            business_facts = qa_context.compact_business_facts(group_id, body, now=current)
+        except Exception:
+            logger.warning("本群聊天事实读取失败，本次不注入业务事实", exc_info=True)
+            business_facts = ""
         system, user = _main.persona_chat.build_conversation(
             nickname=nickname, text=body, status_text=status_text,
-            facts=facts, context=context,
+            facts=facts, context=context, business_facts=business_facts, now=current,
         )
         try:
             raw_reply = await _main.persona_chat.chat(system, user)

@@ -518,6 +518,16 @@ _INDEX_DDL = (
 
 
 _ALL_DDL = (
+    """CREATE TABLE IF NOT EXISTS business_message_context (
+        group_id TEXT NOT NULL, message_id TEXT NOT NULL, items_json TEXT NOT NULL,
+        expires_at TEXT NOT NULL, PRIMARY KEY(group_id,message_id))""",
+    """CREATE TABLE IF NOT EXISTS business_patch_receipts (
+        group_id TEXT NOT NULL, message_id TEXT NOT NULL, sender_id TEXT NOT NULL,
+        reply TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(group_id,message_id))""",
+    """CREATE TABLE IF NOT EXISTS group_competition_locations (
+        group_id TEXT NOT NULL, competition_id INTEGER NOT NULL, location TEXT NOT NULL,
+        updated_by TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY(group_id,competition_id))""",
     """CREATE TABLE IF NOT EXISTS group_competition_archives (
         group_id TEXT NOT NULL, competition_id INTEGER NOT NULL,
         reason TEXT NOT NULL DEFAULT '', archived_at TEXT NOT NULL DEFAULT '',
