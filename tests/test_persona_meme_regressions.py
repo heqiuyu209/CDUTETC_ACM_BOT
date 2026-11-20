@@ -205,7 +205,7 @@ async def test_interjection_current_message_not_duplicated_in_prompt(monkeypatch
     monkeypatch.setattr(persona_chat.get_gate(), "_rng", lambda: 0.0)
     for index in range(persona_chat.INTERJECT_MIN_MESSAGES):
         await bot.on_group_at_message_create(message(f"唯一文本{index}", at=False, index=index))
-    assert chat.await_args.args[1].count("唯一文本11") == 1
+    assert chat.await_args.args[1].count(f"唯一文本{persona_chat.INTERJECT_MIN_MESSAGES - 1}") == 1
 
 
 @pytest.mark.parametrize("text_ok,image_ok", [(False, False), (False, True), (True, False), (True, True)])

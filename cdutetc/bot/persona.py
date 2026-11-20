@@ -287,6 +287,58 @@ class PersonaMixin:
         tail = str(member_id or "")[-4:]
         return f"群友{tail}" if tail else "群友"
 
+    async def _handle_private_chat(self, message: _main.QQBotMessage, text: str,
+                                   user_id: str) -> bool:
+        """私聊接话使用独立用户滑窗，回执仅关联当前 C2C 入站消息。"""
+        from cdutetc import private_chat
+
+        if not private_chat.is_chat_message(text):
+            return False
+        allowed, gate_reply = self._qa_gate(user_id, text)
+        if not allowed:
+            if gate_reply:
+                await self._send_private_result(user_id, gate_reply)
+            return True
+        if not _main.config.QA_SOCIAL_CHAT_ENABLED:
+            return True
+        reply = private_chat.local_call_reply(text)
+        if not reply and _main.content_filter.is_social_chat(text):
+            reply = _main.llm._local_social_reply(text)
+        if not reply:
+            fallback = "我在呢，慢慢说～"
+            reply = fallback
+            if _main.config.PERSONA_CHAT_ENABLED and _main.config.LLM_API_KEY:
+                memory = getattr(self, "_private_chat_memory", None)
+                if memory is None:
+                    memory = _main.persona_chat.PersonaMemory()
+                    self._private_chat_memory = memory
+                nickname = self._nickname_of(message, user_id)
+                system, user = _main.persona_chat.build_conversation(
+                    nickname=nickname, text=text, status_text=_main.db.DEFAULT_DAILY_STATUS,
+                    facts=[], context=memory.recent(user_id), business_facts="",
+                )
+                try:
+                    raw = await _main.asyncio.wait_for(
+                        _main.persona_chat.chat(system, user), timeout=8.0,
+                    )
+                    filtered = _main.content_filter.sanitize_output(
+                        raw if isinstance(raw, str) else "",
+                        max_length=_main.config.QA_OUTPUT_MAX_LENGTH,
+                        max_link_length=_main.config.QA_OUTPUT_MAX_LINK_LENGTH,
+                    )
+                    body, _category = _main.persona_chat.split_meme_tag(filtered)
+                    reply = _main.persona_chat.clamp_reply(body) or fallback
+                except Exception:
+                    logger.exception("私聊接话失败，使用本地回应")
+                memory.observe(user_id, nickname, text)
+                memory.observe(user_id, "雄姐", reply)
+        reply = _main.content_filter.sanitize_output(
+            reply, max_length=_main.config.QA_OUTPUT_MAX_LENGTH,
+            max_link_length=_main.config.QA_OUTPUT_MAX_LINK_LENGTH,
+        )
+        await self._send_private_result(user_id, reply)
+        return True
+
     async def _handle_persona_chat(self, message: _main.QQBotMessage, text: str,
                                    group_id: str, member_id: str,
                                    *, remember: bool = True,

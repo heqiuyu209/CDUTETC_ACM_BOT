@@ -159,6 +159,9 @@ class EventsMixin:
                     for line in decision:
                         await self._send_private_result(uid, line)
                     return
+            # 私聊社交独立于管理工作区；简单称呼零 Token，队务/命令继续走权限门禁。
+            if not _main.is_super_admin(uid) and await self._handle_private_chat(message, content, str(uid)):
+                return
             # 私聊作用域闸门：只有超管能进管理链路，老师与普通成员一律在这里返回，
             # 避免老师借私聊拿到跨群配置/比赛，也避免后续审批与命令被误触发。
             if not _main.is_super_admin(uid):
@@ -182,6 +185,8 @@ class EventsMixin:
                     for line in decision:
                         await self._send_private_result(uid, line)
                     return
+            if await self._handle_private_chat(message, content, str(uid)):
+                return
             if content.strip().startswith("/") and _main.is_super_admin(uid):
                 cmd, args = _main.parse_command(content)
                 from cdutetc import group_admin
@@ -403,8 +408,8 @@ class EventsMixin:
                     and await self._handle_chat_fun(
                         message, text, group_id, self._extract_member_id(message))):
                 return
-            # 拟人化插话：普通队员的闲聊在「高潮」时才可能被接一句（2 分钟 ≥12 条、
-            # 距上次插话 ≥60 分钟、5% 概率）；不满足就完全安静，照旧被忽略。
+            # 拟人化插话：普通队员的闲聊在「高潮」时才可能被接一句（2 分钟 ≥8 条、
+            # 距上次插话 ≥20 分钟、15% 概率）；不满足就完全安静，照旧被忽略。
             if (not addressed
                     and not text.startswith("/")
                     and _main.match_publish_command(text, _main.config.PUBLISH_CMD) is None
