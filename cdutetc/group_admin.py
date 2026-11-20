@@ -2,6 +2,7 @@
 
 import re
 import shlex
+from contextlib import closing
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -232,12 +233,91 @@ def describe(gid: str, *, this_week: bool = False, now: datetime | None = None, 
 
 def _teacher_id(selector: str) -> str:
     allowed = set(config.TEACHER_WHITELIST) | set(config.SUPER_ADMIN)
+    if selector.isdigit():
+        found = {item["openid"] for item in db.list_entity_aliases("user")
+                 if item["numeric_id"] == selector}
+        if len(found) > 1:
+            raise ValueError("这个 QQ 号对应多个老师标识，请使用 /老师列表 中的完整标识。")
+        if not found:
+            raise ValueError(f"QQ {selector} 尚未认领为老师身份。请使用 /老师列表 中的真实老师标识："
+                             " /绑老师 <老师标识> <姓名>；"
+                             "已授权老师可在群内 @我 /认领老师 <QQ号> <姓名> 后再按 QQ 绑定。")
+        uid = next(iter(found))
+        if uid not in allowed:
+            raise ValueError("该 QQ 对应的老师尚未授权，请先用真实老师标识 /加老师，再登记负责群。")
+        return uid
     if selector in allowed:
         return selector
     found = [uid for uid in allowed if db.get_account_label("user", uid) == selector]
     if len(found) != 1:
         raise ValueError("老师名未登记或有歧义，请使用 /老师列表 中的完整标识；未授权老师需先 /加老师。")
     return found[0]
+
+
+def _teacher_target(parts: list[str], *, workspace: str, show_choices: bool) -> tuple[str, list[str]]:
+    """老师的 QQ 不是群选择器；仍优先识别显式群并拒绝群/老师撞号。"""
+    if parts and parts[0].isdigit():
+        selector = parts[0]
+        try:
+            gid = resolve_group(selector)
+        except ValueError as error:
+            if "歧义" in str(error):
+                raise
+            if workspace:
+                return workspace, parts
+            raise ValueError("请先 /切换 <序号|群名> 选定工作区，再 /绑老师 <QQ号或老师标识> [姓名]。") from None
+        if any(item["numeric_id"] == selector for item in db.list_entity_aliases("user")):
+            raise ValueError("首个数字同时对应群和老师 QQ，请明确群名或群标识："
+                             " /绑老师 <群名或群标识> <QQ号或老师标识> [姓名]。")
+        return gid, parts[1:]
+    return _target_group(parts, workspace=workspace, show_choices=show_choices)
+
+
+def _teacher_binding(rest: list[str]) -> tuple[set[str], tuple[str, str] | None]:
+    """兼容老师列表；标识/QQ 后的一项姓名只描述已解析的同一个老师。"""
+    if rest == ["清空"]:
+        return set(), None
+    if len(rest) == 2 and not any(re.search(r"[,，]", part) for part in rest):
+        first, name = rest
+        allowed = set(config.TEACHER_WHITELIST) | set(config.SUPER_ADMIN)
+        if first.isdigit() or first in allowed:
+            uid = _teacher_id(first)
+            is_identity = (name in allowed or name.isdigit() or re.fullmatch(r"[A-Za-z0-9_-]{24,}", name)
+                           or any(db.get_account_label("user", teacher) == name for teacher in allowed))
+            if is_identity:
+                other = _teacher_id(name)
+                return {uid, other}, None
+            else:
+                if not name.strip() or len(name) > 40:
+                    raise ValueError("老师姓名需为 1–40 字；多个老师请用逗号分隔。")
+                return {uid}, (uid, name)
+    selectors = re.split(r"[,，\s]+", " ".join(rest))
+    return {_teacher_id(value) for value in selectors}, None
+
+
+def _save_teacher_binding(gid: str, teachers: set[str], named: tuple[str, str] | None, operator: str) -> None:
+    if named is None:
+        db.set_group_teachers(gid, teachers, operator=operator)
+        return
+    # 负责群与可选姓名一起提交，避免绑定失败仍覆盖已认领姓名。
+    with closing(db._connect()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if gid not in config.ALLOWED_GROUPS:
+            raise ValueError("群尚未授权")
+        if not teachers.issubset(set(config.TEACHER_WHITELIST) | set(config.SUPER_ADMIN)):
+            raise ValueError("包含未授权的老师，请先 /加老师，再登记负责群；本操作不会授予老师权限")
+        uid, name = named
+        stamp = db.now_str()
+        conn.execute("INSERT INTO account_labels(kind,account_id,label,updated_at) VALUES('user',?,?,?)"
+                     " ON CONFLICT(kind,account_id) DO UPDATE SET label=excluded.label,updated_at=excluded.updated_at",
+                     (uid, name, stamp))
+        conn.execute("UPDATE entity_aliases SET display_name=?,updated_at=? WHERE entity_type='user' AND openid=?",
+                     (name, stamp, uid))
+        db.add_audit(operator, "", "set_label", "user", uid, "", name, conn=conn)
+        conn.execute("DELETE FROM group_teacher_assignments WHERE group_id=?", (gid,))
+        conn.executemany("INSERT INTO group_teacher_assignments(group_id,user_id,updated_by,updated_at) VALUES(?,?,?,?)",
+                         [(gid, teacher, operator, stamp) for teacher in sorted(teachers)])
+        db.add_audit(operator, gid, "set_group_teachers", "group", gid, "", ",".join(sorted(teachers)), conn=conn)
 
 
 def _describe_all(*, this_week: bool = False) -> str:
@@ -339,7 +419,8 @@ def handle_command(command: str, args: str, sender: str, current_group: str = ""
                 return reply("跨群信息请在私聊中查询。")
             db.set_group_course_remind(remind_gid, enabled, sender)
             return reply(f"{_name(remind_gid)}课程提醒已{'开启' if enabled else '关闭'}。")
-        gid, rest = _target_group(parts, workspace=workspace, show_choices=not locked)
+        target = _teacher_target if command == "群老师" else _target_group
+        gid, rest = target(parts, workspace=workspace, show_choices=not locked)
         if locked and gid != locked:
             return reply("跨群信息请在私聊中查询。")
         if command == "群配置":
@@ -364,10 +445,9 @@ def handle_command(command: str, args: str, sender: str, current_group: str = ""
             return reply(message, refresh_weekly=True)
         if not rest:
             return reply(f"{_name(gid)}负责老师：{_teacher_names(gid)}"
-                         "\n设置：/绑老师 老师标识,老师标识；清空：/绑老师 清空")
-        selectors = re.split(r"[,，\s]+", " ".join(rest))
-        teacher_ids = set() if selectors == ["清空"] else {_teacher_id(value) for value in selectors}
-        db.set_group_teachers(gid, teacher_ids, operator=sender)
+                         "\n设置：/绑老师 <QQ号或老师标识> [姓名]；多个老师用逗号分隔；清空：/绑老师 清空")
+        teacher_ids, named = _teacher_binding(rest)
+        _save_teacher_binding(gid, teacher_ids, named, sender)
         return reply(f"{_name(gid)}负责老师：{_teacher_names(gid)}")
     except ValueError as error:
         return reply(str(error))

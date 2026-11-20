@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from unittest.mock import Mock
 
 import pytest
 
@@ -283,7 +284,7 @@ def test_gate_cooldown_blocks_second_interjection():
     gate, clock = _gate()
     for _ in range(persona_chat.INTERJECT_MIN_MESSAGES):
         gate.observe("g1")
-    # 冷却未满 60 分钟：即便条数够、概率命中也不说话
+    # 冷却未满 20 分钟：即便条数够、概率命中也不说话
     clock["now"] += persona_chat.INTERJECT_COOLDOWN_SECONDS - 1
     for _ in range(persona_chat.INTERJECT_MIN_MESSAGES + 5):
         assert gate.observe("g1") is False
@@ -304,11 +305,51 @@ def test_gate_probability_miss_keeps_quiet():
         assert gate.observe("g1") is False
 
 
+@pytest.mark.parametrize("draw, expected", [(0.149999, True), (0.15, False), (0.150001, False)])
+def test_default_gate_probability_boundary_after_eighth_message(draw, expected):
+    rng = Mock(return_value=draw)
+    gate, _clock = _gate(rng=rng)
+    for _ in range(7):
+        assert gate.observe("g1") is False
+    rng.assert_not_called()
+    assert gate.observe("g1") is expected
+    rng.assert_called_once_with()
+
+
+def test_default_gate_cooldown_expires_at_twenty_minutes_without_refreshing_on_blocked_messages():
+    rng = Mock(return_value=0.0)
+    gate, clock = _gate(rng=rng)
+    for _ in range(7):
+        assert gate.observe("g1") is False
+    assert gate.observe("g1") is True
+    rng.reset_mock()
+    clock["now"] += 1199.0
+    for _ in range(8):
+        assert gate.observe("g1") is False
+    rng.assert_not_called()
+    clock["now"] += 1.0
+    assert gate.observe("g1") is True
+    rng.assert_called_once_with()
+
+
+def test_default_gate_shared_speaking_quiet_window_keeps_ninety_second_boundary():
+    rng = Mock(return_value=0.0)
+    gate, clock = _gate(rng=rng)
+    gate.note_bot_spoke("g1")
+    clock["now"] += 89.0
+    for _ in range(8):
+        assert gate.observe("g1") is False
+    rng.assert_not_called()
+    clock["now"] += 1.0
+    assert gate.observe("g1") is True
+    rng.assert_called_once_with()
+
+
 def test_gate_window_expires_old_messages():
     gate, clock = _gate()
     for _ in range(persona_chat.INTERJECT_MIN_MESSAGES):
         gate.observe("g1")
-    # 距上一条已超出 2 分钟窗口：窗口内只剩当前这条，不够 12 条
+    # 距上一条已超出 2 分钟窗口：窗口内只剩当前这条，不够 8 条
     clock["now"] += persona_chat.INTERJECT_WINDOW_SECONDS + 1
     assert gate.observe("g1") is False
 

@@ -108,7 +108,7 @@ async def test_social_message_goes_to_persona(bot, monkeypatch):
     assert replies == ["这题我也不会，先补个线段树"]
     assert len(calls) == 1
     system, user = calls[0]
-    assert "学姐" in system
+    assert "雄姐" in system
     assert "在吗" in user
 
 
@@ -278,7 +278,7 @@ def _gate_hits(monkeypatch):
 
 
 async def test_interjection_silent_without_high_tide(bot, monkeypatch):
-    """群消息不足 12 条：即便概率命中也不插话。"""
+    """群消息不足 8 条：即便概率命中也不插话。"""
     b, _client, replies = bot
     calls = _patch_llm(monkeypatch, reply="学姐来了")
     _gate_hits(monkeypatch)
@@ -299,7 +299,7 @@ async def test_interjection_fires_on_high_tide(bot, monkeypatch):
 
 
 async def test_interjection_respects_cooldown(bot, monkeypatch):
-    """一次插话后 60 分钟内不再插话，哪怕群又炸了。"""
+    """一次插话后 20 分钟内不再插话，哪怕群又炸了。"""
     b, _client, replies = bot
     calls = _patch_llm(monkeypatch, reply="安静点")
     _gate_hits(monkeypatch)

@@ -293,7 +293,7 @@ async def test_private_event_replies_to_the_official_qq_identity(bot, official_c
     official_client.api.post_c2c_message.assert_awaited_once()
     assert official_client.api.post_c2c_message.call_args.kwargs["openid"] == "20001"
     text = official_client.api.post_c2c_message.call_args.kwargs["content"]
-    assert "私聊管理" in text and "20001" not in text
+    assert text and "私聊管理" not in text and "20001" not in text
 
 
 def test_run_bot_checks_config_then_constructs_and_starts_official(monkeypatch, official_client):
