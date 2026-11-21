@@ -29,6 +29,7 @@ from cdutetc import config, fetcher, llm
 from cdutetc import database as db
 from cdutetc.config import AUTO_FETCH_ENABLED, FETCH_MIN_INTERVAL_MINUTES, TZ_NAME
 from cdutetc.contest_fields import map_competition_info
+from cdutetc.contest_identity import platform_contest_key, prefer_title
 
 logger = logging.getLogger(__name__)
 
@@ -403,7 +404,7 @@ def parse_codeforces(payload: dict, now: datetime, window_days: int = 14) -> lis
             "url": _CF_URL_TEMPLATE.format(id=contest_id),
         })
     parsed.sort(key=lambda item: item["start"])
-    return parsed
+    return dedupe_contest_items(parsed)
 
 
 def _nowcoder_time(value) -> datetime | None:
@@ -496,7 +497,7 @@ def _nowcoder_items_to_contests(items, now: datetime, window_days: int) -> list[
             "url": url,
         })
     out.sort(key=lambda item: item["start"])
-    return out
+    return dedupe_contest_items(out)
 
 
 
@@ -513,7 +514,6 @@ def _nowcoder_blocks(text: str) -> list[tuple[int, int]]:
 
 def _nowcoder_from_html(text: str, now: datetime, window_days: int) -> list[dict]:
     out: list[dict] = []
-    seen: set[int] = set()
     blocks = _nowcoder_blocks(text)
     block_starts = [start for start, _ in blocks]
     block_has_anchor = [
@@ -522,7 +522,7 @@ def _nowcoder_from_html(text: str, now: datetime, window_days: int) -> list[dict
     for match in _NOWCODER_ANCHOR.finditer(text):
         contest_id = int(match.group(1))
         name = _clean_name(match.group(2))
-        if not name or contest_id in seen:
+        if not name:
             continue
         # 时间与标题同属一个列表项：只在锚所在块内、锚之后取时间；
         # 块内没有才回看上一块（且上一块不能含别的比赛锚），避免张冠李戴。
@@ -557,7 +557,6 @@ def _nowcoder_from_html(text: str, now: datetime, window_days: int) -> list[dict
                     end_time += timedelta(days=1)
                 end = end_time
                 minutes = int((end_time - start).total_seconds() // 60)
-        seen.add(contest_id)
         out.append({
             "platform": "牛客",
             "name": name,
@@ -567,7 +566,7 @@ def _nowcoder_from_html(text: str, now: datetime, window_days: int) -> list[dict
             "url": _NOWCODER_URL_TEMPLATE.format(id=contest_id),
         })
     out.sort(key=lambda item: item["start"])
-    return out
+    return dedupe_contest_items(out)
 
 
 def parse_nowcoder(text: str, now: datetime, window_days: int = 14) -> list[dict]:
@@ -582,18 +581,25 @@ def parse_nowcoder(text: str, now: datetime, window_days: int = 14) -> list[dict
 
 
 def dedupe_contest_items(items) -> list[dict]:
-    """按 (platform, name, start) 去重，保留首个。"""
-    seen: set[tuple[str, str, str]] = set()
+    """已知平台按赛事 ID 去重并保留更完整标题；未知平台沿用名称与时间。"""
+    positions: dict[tuple[str, ...], int] = {}
     out: list[dict] = []
     for item in items or []:
         if not isinstance(item, Mapping):
             continue
-        key = (str(item.get("platform") or ""), str(item.get("name") or ""),
-               str(item.get("start") or ""))
-        if not key[1] or not key[2] or key in seen:
+        name, start = _clean_name(item.get("name")), str(item.get("start") or "").strip()
+        if not name or not start:
             continue
-        seen.add(key)
-        out.append(dict(item))
+        identity = platform_contest_key(item.get("url"))
+        key = ("platform_id", identity) if identity else (
+            "name_time", str(item.get("platform") or ""), name, start)
+        previous = positions.get(key)
+        if previous is not None:
+            if identity and prefer_title(name, out[previous].get("name")):
+                out[previous] = {**item, "name": name}
+            continue
+        positions[key] = len(out)
+        out.append({**item, "name": name})
     return out
 
 
@@ -618,7 +624,7 @@ async def _fetch_nowcoder_contests(current: datetime, window: int, nc_fetcher) -
         items.extend(_nowcoder_items_to_contests(
             _nowcoder_items(payload), current, window))
     if json_ok:
-        # 跨月请求常出现同一场比赛（月末/月初边界），按 (平台, 名称, 开始时间) 去重。
+        # 跨月请求常出现同一场比赛（月末/月初边界），已知平台按赛事 ID 去重。
         return dedupe_contest_items(items)
     logger.warning("牛客日历接口不可用，降级抓取赛程页：%s", NOWCODER_CONTEST_PAGE)
     page = await nc_fetcher(NOWCODER_CONTEST_PAGE)
@@ -664,15 +670,6 @@ async def _nowcoder_http_get_text(url: str) -> str:
         url, {"Referer": NOWCODER_REFERER})
 
 
-def _existing_contest_keys() -> set[tuple[str, str]]:
-    """库内既有比赛的 (名称, 官方时间) 指纹。"""
-    keys: set[tuple[str, str]] = set()
-    for comp in db.list_competitions():
-        keys.add((str(comp.get("name") or "").strip(),
-                  str(comp.get("official_time") or "").strip()))
-    return keys
-
-
 def _contest_notify_groups() -> list[str]:
     configured = sorted(config.AUTO_CONTEST_NOTIFY_GROUPS)
     return configured or sorted(config.ALLOWED_GROUPS)
@@ -696,14 +693,10 @@ async def run_contest_fetch(now: datetime | None = None, *, fetchers=None) -> li
                     "error": problem.get("error")})
     items = dedupe_contest_items(list(fetched.get("codeforces", []))
                                  + list(fetched.get("nowcoder", [])))
-    existing = _existing_contest_keys()
     for item in items:
         name, start = item.get("name"), item.get("start")
         entry = {"platform": item.get("platform"), "name": name,
                  "start": start, "url": item.get("url")}
-        if (str(name).strip(), str(start).strip()) in existing:
-            out.append({**entry, "kind": "exists"})
-            continue
         info = {
             "name": str(name),
             "edition": item.get("platform") or "",
@@ -713,14 +706,12 @@ async def run_contest_fetch(now: datetime | None = None, *, fetchers=None) -> li
         }
         status = "confirmed" if config.AUTO_CONTEST_AUTO_CONFIRM else "draft"
         try:
-            cid = db.create_competition(info, status=status, operator="auto-fetch")
+            cid, created = db.create_crawled_competition(
+                info, status=status, operator="auto-fetch",
+                notify_groups=_contest_notify_groups() if status == "confirmed" else None,
+            )
         except Exception as error:
             out.append({**entry, "kind": "error", "error": str(error)})
             continue
-        if status == "confirmed":
-            groups = _contest_notify_groups()
-            if groups:
-                db.set_competition_notify_groups(cid, groups)
-        existing.add((str(name).strip(), str(start).strip()))
-        out.append({**entry, "kind": "created", "competition_id": cid})
+        out.append({**entry, "kind": "created" if created else "exists", "competition_id": cid})
     return out

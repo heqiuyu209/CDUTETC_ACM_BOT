@@ -5,7 +5,7 @@ import hashlib
 import json
 import sqlite3
 from urllib.parse import urlsplit
-from cdutetc import config
+from cdutetc import config, contest_identity
 
 from cdutetc.db import admin as _admin
 from cdutetc.db import connection as _conn
@@ -172,39 +172,93 @@ def _canonical_publication_url(url: str) -> str:
     return result
 
 
-def find_duplicate_competition(info: dict) -> dict | None:
-    """按「名称 + 届次 + 比赛时间」三者完全一致判定重复。
+def _platform_competition_keys_on(conn: sqlite3.Connection) -> dict[int, set[str]]:
+    """包括历史身份的编号映射，供查重及旧提醒回执关联使用。"""
+    identities: dict[int, set[str]] = {}
+    originals: dict[int, set[str]] = {}
+    sources: dict[int, set[str]] = {}
 
-    与 _publication_identity 不同：本函数不看链接，因此转发来的群消息
-    （通常没有链接）也能查出重复；三者任一不同都不算重复，避免误拒。
+    def remember(mapping, cid, key):
+        if key:
+            mapping.setdefault(cid, set()).add(key)
+
+    for raw, cid in conn.execute("SELECT identity_key,competition_id FROM publication_claims"):
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError, RecursionError):
+            continue
+        if isinstance(data, list) and data:
+            key = data[1] if len(data) == 2 and data[0] == "platform" else contest_identity.platform_contest_key(data[0])
+            if isinstance(key, str):
+                remember(identities, cid, key)
+    for cid, raw in conn.execute("SELECT competition_id,fields_json FROM competition_versions WHERE change_note='创建'"):
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError, RecursionError):
+            continue
+        if isinstance(data, dict):
+            remember(originals, cid, contest_identity.platform_contest_key(data.get("official_site")))
+    for cid, url in conn.execute("SELECT competition_id,url FROM competition_sources"):
+        remember(sources, cid, contest_identity.platform_contest_key(url))
+    result = {cid: set(keys) for cid, keys in originals.items()}
+    result.update({cid: set(keys) for cid, keys in identities.items()})
+    for cid, site in conn.execute("SELECT id,official_site FROM competitions"):
+        # 初始平台身份存在时不把后来修改的另一个链接冒认为新的比赛身份。
+        keys = identities.get(cid) or originals.get(cid)
+        if not keys:
+            keys = sources.get(cid) or {contest_identity.platform_contest_key(site)}
+        result[cid] = keys - {""}
+    return result
+
+
+def _find_platform_competition_on(conn: sqlite3.Connection, platform_key: str) -> dict | None:
+    """平台编号独立于可编辑标题和时间；旧重复优先正式且标题完整的记录。"""
+    if not platform_key:
+        return None
+    mapping = _platform_competition_keys_on(conn)
+    matches = []
+    for row in conn.execute(f"SELECT {_contests._COMPETITION_COLS} FROM competitions WHERE status IN ('confirmed','draft') ORDER BY id"):
+        record = _contests._row_to_competition(row)
+        keys = mapping.get(record["id"], set())
+        if platform_key in keys:
+            matches.append(record)
+    chosen = None
+    for record in matches:
+        if (chosen is None or record["status"] == "confirmed" and chosen["status"] != "confirmed"
+                or record["status"] == chosen["status"] and contest_identity.prefer_title(record["name"], chosen["name"])):
+            chosen = record
+    return chosen
+
+
+def _find_duplicate_competition_on(conn: sqlite3.Connection, info: dict) -> dict | None:
+    platform_key = contest_identity.platform_contest_key(info.get("official_site"))
+    if platform_key:
+        return _find_platform_competition_on(conn, platform_key)
+
+    def norm(value):
+        return " ".join(str(value or "").split()).strip().lower()
+
+    if not norm(info.get("name")):
+        return None
+    for row in conn.execute(f"SELECT {_contests._COMPETITION_COLS} FROM competitions WHERE status IN ('confirmed','draft') ORDER BY id"):
+        record = _contests._row_to_competition(row)
+        if all(norm(record.get(field)) == norm(info.get(field)) for field in ("name", "edition", "official_time")):
+            return record
+    return None
+
+
+def find_duplicate_competition(info: dict) -> dict | None:
+    """已知平台按比赛编号，其他来源按「名称 + 届次 + 比赛时间」判重。
+
+    不同平台编号绝不退回同名同时间匹配；无链接的转发保留原精确规则。
 
     Returns:
         命中的比赛记录（含 id/name/edition/official_time/status），无则 None。
     """
     if not isinstance(info, dict):
         return None
-    def norm(value) -> str:
-        return " ".join(str(value or "").split()).strip().lower()
-
-    name = norm(info.get("name"))
-    if not name:
-        return None
-    edition = norm(info.get("edition"))
-    contest_time = norm(info.get("official_time"))
     with _conn._connect() as conn:
-        rows = conn.execute(
-            f"SELECT {_contests._COMPETITION_COLS} FROM competitions"
-            " WHERE status IN ('confirmed', 'draft')"
-        ).fetchall()
-    for row in rows:
-        record = _contests._row_to_competition(row)
-        if (
-            norm(record.get("name")) == name
-            and norm(record.get("edition")) == edition
-            and norm(record.get("official_time")) == contest_time
-        ):
-            return record
-    return None
+        return _find_duplicate_competition_on(conn, info)
 
 
 def _find_legacy_publication(conn: sqlite3.Connection, identity: str,
@@ -342,8 +396,26 @@ def approve_pending_publication(pid: int, operator: str = "") -> tuple[int, bool
             raise ValueError(f"发布申请 #{pid} 不存在")
         pending = _row_to_pending_publication(row)
         if pending["status"] == "approved":
+            recorded = conn.execute("SELECT after_json FROM audit_log WHERE action='approve_publication'"
+                                    " AND object_type='pending_publication' AND object_id=? ORDER BY id DESC LIMIT 1",
+                                    (str(pid),)).fetchone()
+            if recorded and str(recorded[0]).startswith("competition:"):
+                try:
+                    approved_id = int(recorded[0].split(":", 1)[1])
+                except ValueError:
+                    approved_id = 0
+                if conn.execute("SELECT 1 FROM competitions WHERE id=?", (approved_id,)).fetchone():
+                    return approved_id, False
+                raise ValueError(f"已批准申请 #{pid} 对应比赛记录不存在")
             info = json.loads(pending["fields_json"] or "{}")
             cleaned = _contests._clean_competition_info(info)
+            if pending["source_url"]:
+                cleaned["official_site"] = pending["source_url"]
+            if contest_identity.platform_contest_key(cleaned["official_site"]):
+                record = _find_platform_competition_on(conn, contest_identity.platform_contest_key(cleaned["official_site"]))
+                if record:
+                    return record["id"], False
+                raise ValueError(f"已批准申请 #{pid} 对应比赛记录不存在")
             found = conn.execute(
                 "SELECT id FROM competitions WHERE lower(name) = lower(?)"
                 " AND lower(edition) = lower(?) AND lower(official_time) = lower(?)"

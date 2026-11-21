@@ -637,6 +637,52 @@ def _delivery_invalid_status(conn: sqlite3.Connection, delivery: dict,
     return "expired" if target <= now else None
 
 
+def _platform_delivery_conflict_on(conn: sqlite3.Connection, delivery: dict, now: datetime,
+                                    *, include_leases: bool) -> bool:
+    """同一平台节点跨旧对象编号共享成功/在途事实，不改历史去重键。"""
+    if delivery["obj_type"] != "competition" or delivery["remind_type"] not in {"reg_deadline", "contest_start"}:
+        return False
+    from cdutetc.db import sources
+
+    mapping = sources._platform_competition_keys_on(conn)
+    keys = mapping.get(delivery["obj_id"], set())
+    if len(keys) != 1:
+        return False
+    siblings = {cid for cid, identity in mapping.items()
+                if cid != delivery["obj_id"] and keys == identity}
+    if not siblings:
+        return False
+    own_parts = _canonical_delivery_key(delivery["dedup_key"]).split("|")
+    own_offset = own_parts[5] if len(own_parts) == 6 else ""
+
+    def same_node(key):
+        parts = _canonical_delivery_key(key).split("|")
+        if len(parts) not in {5, 6}:
+            return False
+        try:
+            cid = int(parts[2])
+        except ValueError:
+            return False
+        return (cid in siblings and parts[:2] == [delivery["group_id"], "competition"]
+                and parts[3:5] == [delivery["remind_type"], delivery["target_time"]]
+                and (len(parts) == 5 or len(own_parts) == 5 or parts[5] == own_offset))
+
+    for (key,) in conn.execute("SELECT dedup_key FROM reminder_success_receipts"):
+        if same_node(key):
+            return True
+    for key, status, token, until in conn.execute(
+            "SELECT dedup_key,status,lease_token,lease_until FROM reminder_deliveries"
+            " WHERE group_id=? AND obj_type='competition' AND remind_type=? AND target_time=?",
+            (delivery["group_id"], delivery["remind_type"], delivery["target_time"])):
+        if same_node(key):
+            if status == "sent":
+                return True
+            lease_until = _delivery_parse_time(until)
+            if include_leases and status == "sending" and token and lease_until and lease_until > now:
+                return True
+    return False
+
+
 def claim_delivery(group_id: str, obj_type: str, obj_id: int, remind_type: str,
                    target_time: str, *, now: datetime | None = None,
                    max_attempts: int = 3, lease_seconds: int = 120,
@@ -723,6 +769,8 @@ def claim_delivery(group_id: str, obj_type: str, obj_id: int, remind_type: str,
             return None
         if delivery["status"] in ("failed", "expired"):
             return None
+        if _platform_delivery_conflict_on(conn, delivery, now, include_leases=True):
+            return None
         if delivery["attempts"] >= max_attempts:
             conn.execute(
                 "UPDATE reminder_deliveries SET status = 'failed', lease_token = '', lease_until = '' WHERE id = ?",
@@ -758,6 +806,8 @@ def validate_delivery_claim(dedup_key: str, token: str, *, now: datetime | None 
                         (_canonical_delivery_key(dedup_key),)).fetchone():
             return False
         delivery = _row_to_delivery(row)
+        if _platform_delivery_conflict_on(conn, delivery, now, include_leases=False):
+            return False
         status = _delivery_invalid_status(conn, delivery, now, allowed_groups)
         if status:
             conn.execute(

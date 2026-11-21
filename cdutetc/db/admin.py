@@ -5,7 +5,7 @@ import hashlib
 import json
 import sqlite3
 from datetime import datetime, timedelta
-from cdutetc import config
+from cdutetc import config, contest_identity
 from cdutetc.errors import DeliveryCode
 
 from cdutetc.db import connection as _conn
@@ -37,10 +37,13 @@ def get_group_teachers(group_id: str) -> list[str]:
 
 
 def _publication_identity(info: dict, canonical_url: str) -> str:
-    """精确身份：URL、名称、届次；无届次时再加入三个目标时间。
+    """已知平台使用比赛编号；普通页面使用URL、名称、届次及必要目标时间。
 
     不做名称模糊匹配，也不把缺失时间猜成某个已知场次。
     """
+    platform_key = contest_identity.platform_contest_key(canonical_url)
+    if platform_key:
+        return json.dumps(["platform", platform_key], separators=(",", ":"))
     parts = [canonical_url, info["name"], info["edition"]]
     if not info["edition"]:
         for field in ("official_reg_start", "official_reg_deadline", "official_time"):

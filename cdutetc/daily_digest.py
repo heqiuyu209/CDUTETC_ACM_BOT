@@ -23,7 +23,7 @@ import re
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from cdutetc import config
+from cdutetc import config, contest_identity
 from cdutetc import database as db
 from cdutetc.reminder import _parse_time
 from cdutetc.utils import normalize_time_expression
@@ -101,6 +101,25 @@ def _remaining_label(delta: timedelta) -> str:
 # ---------------------------------------------------------------------
 # 数据源收集（只读）
 # ---------------------------------------------------------------------
+
+def _deduplicate_platform_competitions(items: list[dict]) -> list[dict]:
+    """本群有效候选按平台比赛编号去重，保留完整的真实记录供引用。"""
+    chosen: list[dict] = []
+    positions: dict[str, int] = {}
+    for item in items:
+        key = contest_identity.platform_contest_key(item.get("site") or "")
+        if not key:
+            chosen.append(item)
+            continue
+        position = positions.get(key)
+        if position is None:
+            positions[key] = len(chosen)
+            chosen.append(item)
+        elif contest_identity.prefer_title(item.get("name"), chosen[position].get("name")):
+            chosen[position] = item
+    chosen.sort(key=lambda item: item["start_dt"])
+    return chosen
+
 
 def today_sessions(group_id: str, now: datetime | None = None) -> list[dict]:
     """今日课程：星期匹配、未取消、且尚未结束的训练安排。"""
@@ -227,8 +246,7 @@ def soon_competitions(group_id: str, now: datetime | None = None,
             "start_dt": start,
             "site": (contest.get("official_site") or "").strip(),
         })
-    out.sort(key=lambda item: item["start_dt"])
-    return out
+    return _deduplicate_platform_competitions(out)
 
 
 def _weekly_visible_to(group_id: str) -> bool:
@@ -292,8 +310,7 @@ def today_competitions(group_id: str, now: datetime | None = None) -> list[dict]
             "location": (contest.get("location") or "").strip(),
             "weekly": bool(weekly),
         })
-    out.sort(key=lambda item: item["start_dt"])
-    return out
+    return _deduplicate_platform_competitions(out)
 
 
 def today_reminders(group_id: str, now: datetime | None = None) -> list[dict]:

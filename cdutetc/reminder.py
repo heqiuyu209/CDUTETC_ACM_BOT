@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from math import ceil
 from zoneinfo import ZoneInfo
 
-from cdutetc import config
+from cdutetc import config, contest_identity
 from cdutetc.clients.base import active_capabilities, active_protocol
 from cdutetc.config import TZ_NAME
 from cdutetc.notifications import map_by_group
@@ -115,6 +115,29 @@ def _platform_paused(group_id: str) -> bool:
     return group_notification_paused(active_protocol(), group_id)
 
 
+def _prefer_complete_platform_titles(items: list[dict], competitions: dict[int, dict]) -> list[dict]:
+    """先尝试完整标题的同节点记录，保留其他候选以便无效或失败时继续处理。"""
+    ordered = list(items)
+    first: dict[tuple, int] = {}
+    for index, item in enumerate(ordered):
+        if item.get("obj_type") != "competition":
+            continue
+        record = competitions.get(item["obj_id"], {})
+        identity = contest_identity.platform_contest_key(record.get("official_site"))
+        if not identity:
+            continue
+        target = item.get("target_time") or item.get("target_str")
+        offset = item.get("offset_hours")
+        if offset is None and item.get("remind_type") == "contest_start":
+            offset = _contest_offset_hours(item)
+        key = (identity, item["group_id"], item["remind_type"], target, offset)
+        position = first.setdefault(key, index)
+        chosen = competitions.get(ordered[position]["obj_id"], {})
+        if contest_identity.prefer_title(record.get("name"), chosen.get("name")):
+            ordered[position], ordered[index] = ordered[index], ordered[position]
+    return ordered
+
+
 async def check_contest_start_reminders(send_group, now: datetime | None = None,
                                        max_attempts: int = _DELIVERY_MAX_ATTEMPTS) -> int:
     """投递事务创建的开赛前30/15分钟计划；不动态补建逾期节点。"""
@@ -181,7 +204,8 @@ async def check_contest_start_reminders(send_group, now: datetime | None = None,
             logger.exception("开赛提醒读取/领取失败: %s", delivery["dedup_key"])
             return 0
 
-    return sum(await map_by_group(list_due_contest_start_deliveries(current, allowed), isolated))
+    candidates = _prefer_complete_platform_titles(list_due_contest_start_deliveries(current, allowed), comps)
+    return sum(await map_by_group(candidates, isolated))
 
 
 def _contest_offset_minutes(delivery: dict) -> int:
@@ -444,6 +468,7 @@ async def check_general_reminders(send_group, now: datetime | None = None,
             logger.exception("通用提醒读取/领取失败: %s", _delivery_key(item))
             return 0
 
+    items = _prefer_complete_platform_titles(items, {item["id"]: item for item in list_competitions(status="confirmed")})
     sent = sum(await map_by_group(items, isolated))
     if sent:
         logger.info("本次通用提醒成功发送 %d 条", sent)
