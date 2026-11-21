@@ -6,7 +6,7 @@ import json
 import sqlite3
 from datetime import datetime
 from urllib.parse import urlsplit
-from cdutetc import config
+from cdutetc import config, contest_identity
 
 from cdutetc.db import admin as _admin
 from cdutetc.db import connection as _conn
@@ -289,6 +289,31 @@ def create_competition(info: dict, status: str = "draft", operator: str = "", *,
         return _create_competition_on(conn, info, status, operator)
     with _conn._connect() as conn:
         return _create_competition_on(conn, info, status, operator)
+
+
+def create_crawled_competition(info: dict, status: str = "draft", operator: str = "", *,
+                               notify_groups=None) -> tuple[int, bool]:
+    """赛程查重、记录、范围及提醒同事务；命中既有平台身份不改人工资料。"""
+    cleaned = _clean_competition_info(info)
+    platform_key = contest_identity.platform_contest_key(cleaned["official_site"])
+    if status not in {"draft", "confirmed"}:
+        raise ValueError("状态必须是 draft 或 confirmed")
+    with _conn._connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if platform_key:
+            existing = _sources._find_platform_competition_on(conn, platform_key)
+        else:
+            row = conn.execute(f"SELECT {_COMPETITION_COLS} FROM competitions WHERE name=? AND official_time=? ORDER BY id LIMIT 1",
+                               (cleaned["name"], cleaned["official_time"])).fetchone()
+            existing = _row_to_competition(row) if row else None
+        if existing:
+            return existing["id"], False
+        cid = _create_competition_on(conn, cleaned, status, operator, notify_groups=notify_groups)
+        if platform_key:
+            identity = _admin._publication_identity(cleaned, cleaned["official_site"])
+            conn.execute("INSERT INTO publication_claims(identity_key,competition_id,created_at) VALUES(?,?,?)",
+                         (identity, cid, _conn.now_str()))
+        return cid, True
 
 
 def create_weekly_competition(week_start: str, info: dict) -> tuple[int, bool]:
@@ -591,7 +616,7 @@ def list_competition_versions(cid: int) -> list[dict]:
 def _create_confirmed_from_pending(info: dict, source_url: str, source_text: str,
                                    operator: str, *, conn: sqlite3.Connection | None = None,
                                    notify_groups=None) -> tuple[int, bool]:
-    """无链接发布及超管确认落库：按「名称+届次+时间」原子去重。
+    """无链接发布及超管确认落库：按平台编号或精确字段原子去重。
 
     不要求 source_url，因此群消息转发与官网发布的同场比赛仍可判重；
     免审发布缺少链接时也复用此路径，不注册空地址监控来源。
@@ -600,27 +625,24 @@ def _create_confirmed_from_pending(info: dict, source_url: str, source_text: str
         raise ValueError("比赛信息必须是对象")
     cleaned = _clean_competition_info(info)
     source_url = _conn._as_str(source_url)
+    if source_url:
+        cleaned["official_site"] = source_url
 
     def create_on(active_conn: sqlite3.Connection) -> tuple[int, bool]:
         # 事务内查重，避免并发同意同一条申请造成重复入库。
-        rows = active_conn.execute(
-            f"SELECT {_COMPETITION_COLS} FROM competitions WHERE status IN ('confirmed', 'draft')"
-        ).fetchall()
-        for row in rows:
-            record = _row_to_competition(row)
-            if (str(record.get("name") or "").strip().lower()
-                    == str(cleaned.get("name") or "").strip().lower()
-                    and str(record.get("edition") or "").strip().lower()
-                    == str(cleaned.get("edition") or "").strip().lower()
-                    and str(record.get("official_time") or "").strip().lower()
-                    == str(cleaned.get("official_time") or "").strip().lower()):
-                return record["id"], False
+        record = _sources._find_duplicate_competition_on(active_conn, cleaned)
+        if record:
+            return record["id"], False
         cid = _create_competition_on(active_conn, cleaned, "confirmed", operator,
                                      notify_groups=notify_groups)
         if source_url:
             sid = _sources.add_competition_source(cid, source_url, conn=active_conn)
             body_hash = hashlib.sha256((source_text or "").encode("utf-8")).hexdigest()
             _sources.update_source_fetch(sid, body_hash=body_hash, last_status="confirmed", conn=active_conn)
+        if contest_identity.platform_contest_key(cleaned["official_site"]):
+            identity = _admin._publication_identity(cleaned, cleaned["official_site"])
+            active_conn.execute("INSERT INTO publication_claims(identity_key,competition_id,created_at) VALUES(?,?,?)",
+                                (identity, cid, _conn.now_str()))
         return cid, True
 
     if conn is not None:
@@ -657,7 +679,14 @@ def create_published_competition_once(info: dict, source_url: str, source_text: 
         ).fetchone()
         if existing is not None:
             return existing[0], False
-        cid = _sources._find_legacy_publication(conn, identity, canonical_url)
+        platform_key = contest_identity.platform_contest_key(source_url)
+        if platform_key:
+            record = _sources._find_platform_competition_on(conn, platform_key)
+            if record:
+                conn.execute("INSERT OR IGNORE INTO publication_claims(identity_key,competition_id,created_at) VALUES(?,?,?)",
+                             (identity, record["id"], _conn.now_str()))
+                return record["id"], False
+        cid = None if platform_key else _sources._find_legacy_publication(conn, identity, canonical_url)
         if cid is not None:
             conn.execute(
                 "INSERT INTO publication_claims (identity_key, competition_id, created_at)"

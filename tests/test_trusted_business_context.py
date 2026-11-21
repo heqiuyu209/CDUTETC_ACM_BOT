@@ -18,6 +18,7 @@ NOW = datetime(2026, 11, 19, 14, tzinfo=TZ)
 def env(monkeypatch, tmp_path):
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "trusted_context.sqlite3"))
     monkeypatch.setattr(db, "_delivery_now", lambda value=None: value or NOW)
+    monkeypatch.setattr(db, "now_str", lambda: NOW.strftime("%Y-%m-%d %H:%M:%S"))
     monkeypatch.setattr(config, "ALLOWED_GROUPS", {"g1", "g2"})
     monkeypatch.setattr(config, "ENV_ALLOWED_GROUPS", {"g1", "g2"})
     monkeypatch.setattr(config, "SUPER_ADMIN", {"admin"})
