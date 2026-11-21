@@ -348,6 +348,26 @@ class EventsMixin:
             # 但它正是要收的对象；后台任务异步跑，绝不阻塞本条消息的响应。
             self._schedule_meme_collect(message, group_id, text)
             if not text:
+                if not addressed or (getattr(message, "raw", {}) or {}).get("attachments"):
+                    return
+                # 真实平台 @ 本身就是喊话，空正文也可本地回一句；纯图片仍交收图。
+                text = "雄姐"
+            from cdutetc import private_chat
+
+            local_social = private_chat.local_persona_reply(text)
+            if addressed and local_social:
+                member_id = self._extract_member_id(message)
+                allowed, gate_reply = self._qa_gate(member_id, text)
+                if not allowed:
+                    if gate_reply:
+                        await self._safe_reply(message, gate_reply)
+                    return
+                if (_main.config.QA_SOCIAL_CHAT_ENABLED
+                        and _main.db.group_switch_enabled(group_id, "qa_enabled")):
+                    await self._safe_reply(message, _main.content_filter.sanitize_output(
+                        local_social, max_length=_main.config.QA_OUTPUT_MAX_LENGTH,
+                        max_link_length=_main.config.QA_OUTPUT_MAX_LINK_LENGTH,
+                    ))
                 return
             # 显式地点补充在老师自动意图与聊天前处理；无@也仅放行有本群写权限的老师。
             from cdutetc import business_followup, roles

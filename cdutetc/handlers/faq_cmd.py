@@ -264,13 +264,67 @@ def _business_name_match(text: str, title: str) -> tuple[int, bool]:
     return (len(title) if re.search(pattern, text, re.I) else 0), True
 
 
+_TEAM_DEFINITION = re.compile(
+    r"(?:请问|想了解一下|想了解)?\s*(?:(?:ACM\s*)?集训队(?:是(?:什么|啥)|干什么|做什么)(?:的|用的)?"
+    r"|(?:什么|啥)是\s*(?:ACM\s*)?集训队)[呀啊呢吗?？。！!\s]*", re.I,
+)
+_DEFINITION_QUESTION = re.compile(r"(?:什么|啥)是|(?:是什么|是啥|的定义|什么意思)[呀啊呢吗?？。！!\s]*$", re.I)
+_ARRANGEMENT_TOPIC = re.compile(r"比赛|竞赛|校赛|周赛|选拔|课程|训练|集训|上课|课表|讲座|安排")
+
+
+def _business_query_fields(text: str) -> tuple[str, ...]:
+    """只提取用户实际所问字段，定义和闲聊不作为安排查询。"""
+    fields = []
+    if re.search(r"报名.*(?:时间|何时|什么时候|几点|几号)|截止", text):
+        fields.append("deadline")
+    if (re.search(r"开赛|开打|开始|比赛时间|课程时间|上课时间|周几", text)
+            or "deadline" not in fields and re.search(r"时间|什么时候|几点|几号|何时", text)):
+        fields.append("time")
+    if re.search(r"地点|位置|所在地|在哪|哪里|哪儿|何处|教室|机房", text):
+        fields.append("location")
+    if re.search(r"形式|线上|线下", text):
+        fields.append("mode")
+    if re.search(r"官网|网址|链接", text):
+        fields.append("link")
+    if re.search(r"要求|设备|电脑|软件|材料", text):
+        fields.append("requirement")
+    return tuple(fields)
+
+
+def _is_arrangement_query(text: str) -> bool:
+    if _TEAM_DEFINITION.fullmatch(text.strip()) or (
+        _DEFINITION_QUESTION.search(text) and not _business_query_fields(text)
+    ):
+        return False
+    if not content_filter.is_information_request(text) and not re.search(r"线上还是线下|线下还是线上|哪(?:间|里|儿|个)|所在地", text):
+        return False
+    return bool(_business_query_fields(text) or (
+        _ARRANGEMENT_TOPIC.search(text) and re.search(r"安排|课表|怎么排|有|讲|上|查|看", text)
+    ))
+
+
+def _business_field_value(item: dict, kind: str, field: str) -> str:
+    keys = {
+        "deadline": ("reg_deadline",), "location": ("location",),
+        "mode": ("mode",), "link": ("source_link",),
+        "requirement": ("device_req", "needs_laptop", "software"),
+        "time": (("contest_time",) if kind == "competition" else ("weekday", "start_time", "end_time")),
+    }
+    return "|".join(str(item.get(key) or "").strip() for key in keys[field])
+
+
 def _select_business_fact(text: str, competitions: list[dict], sessions: list[dict]
                           ) -> tuple[str, dict | None, str | None]:
-    """跨课程和比赛选唯一事实；最高同分且地点不同则只询问对象。"""
+    """明确安排查询才召回；同分记录在所问字段不同则询问对象。"""
     from cdutetc import qa_context
 
+    if not _is_arrangement_query(text):
+        return "", None, None
+    fields = _business_query_fields(text)
     weekday = re.search(r"(?:周|星期|礼拜)[一二三四五六日天]", text)
     requested_weekday = qa_context._training_weekday(weekday[0]) if weekday else None
+    contest_query = bool(re.search(r"比赛|竞赛|校赛|周赛", text))
+    course_query = bool(re.search(r"课程|训练|集训|上课|课表|讲座", text))
     ranked = []
     for kind, records, title_key, extra_key in (
         ("competition", competitions, "name", "contest_time"),
@@ -280,6 +334,11 @@ def _select_business_fact(text: str, competitions: list[dict], sessions: list[di
             title = item.get(title_key) or ""
             exact_length, compatible = _business_name_match(text, title)
             if not compatible:
+                continue
+            if not exact_length and not _ARRANGEMENT_TOPIC.search(text):
+                continue
+            if not exact_length and ((kind == "competition" and course_query and not contest_query)
+                                     or (kind == "training_session" and contest_query and not course_query)):
                 continue
             if requested_weekday is not None:
                 if kind == "training_session":
@@ -296,9 +355,15 @@ def _select_business_fact(text: str, competitions: list[dict], sessions: list[di
         return "", None, None
     best_rank = max((row[0], row[1]) for row in ranked)
     top = [row for row in ranked if (row[0], row[1]) == best_rank]
-    locations = {(row[3].get("location") or "").strip() for row in top}
-    if len(top) > 1 and len(locations) > 1:
-        lines = ["地点：匹配到多项地点不同的安排，请明确要查询哪一项。"]
+    different = tuple(field for field in fields if len({
+        _business_field_value(row[3], row[2], field) for row in top
+    }) > 1)
+    if len(top) > 1 and (different or not fields):
+        labels = {"deadline": "报名截止", "time": "时间", "location": "地点", "mode": "形式",
+                  "link": "官网", "requirement": "要求"}
+        subject = "、".join(labels[field] for field in different)
+        lines = ([f"{subject}：匹配到多项{subject}不同的安排，请明确要查询哪一项。"] if subject
+                 else ["匹配到多项安排，请明确要查询哪一项。"])
         for _length, _score, kind, item in top[:5]:
             label = "比赛" if kind == "competition" else "课程"
             title = item.get("name" if kind == "competition" else "title") or "未命名安排"
@@ -318,6 +383,8 @@ async def _answer_from_knowledge_base(text: str, group_id: str) -> str | None:
     设计要点：比赛名、时间、地点等全部原样取自数据库，不做任何推测补全，
     因此不会出现模型编造或“我没有数据库权限”这类管理端话术。
     """
+    if not _is_arrangement_query(text):
+        return None
     threshold = config.QA_KB_MATCH_MIN_SCORE
     kind, selected, clarification = _select_business_fact(
         text, db.list_question_contests(group_id, limit=50),
@@ -413,6 +480,11 @@ CAPABILITY_TEXT = """【我能做的事】
 
 有问题直接 @我 就行。"""
 
+TEAM_DEFINITION_TEXT = (
+    "ACM 集训队通常是一起练习算法和程序设计、准备 ICPC、CCPC 等竞赛的学生团队。"
+    "本群具体训练安排和加入方式以老师录入的资料为准；我可以帮你查询课程、比赛和报名信息。"
+)
+
 
 # 非问句、FAQ 未命中时的本地寒暄兜底。拟人聊天开启后由 persona_chat 接管改写，
 # 这里提成常量，既避免字面量散落，也让上层能识别「这只是兜底而非真答」。
@@ -451,6 +523,8 @@ async def handle_non_command_message(text: str, group_id: str, sender: str,
     faq = await match_faq(group_id, text, exact_only=not is_request)
     if faq is not None:
         return [{"group_id": group_id, "text": _faq_cite(faq)}]
+    if _TEAM_DEFINITION.fullmatch(text.strip()):
+        return [{"group_id": group_id, "text": TEAM_DEFINITION_TEXT}]
     if not is_request:
         return ([{"group_id": group_id, "text": SOCIAL_FALLBACK_TEXT}]
                 if config.QA_SOCIAL_CHAT_ENABLED else [])

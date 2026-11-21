@@ -131,8 +131,8 @@ async def test_same_message_in_new_and_legacy_events_only_replies_once(app, sdk,
     await sdk(adapter, scenario)
 
 
-async def test_same_msg_id_is_handled_once_across_both_events(app, sdk):
-    """同一条消息的两路投递（全量事件 + 旧 @ 事件）只处理一次。"""
+async def test_at_event_does_not_replay_already_processed_unmentioned_message(app, sdk):
+    """无 @ 的全量消息可能已产生 ambient 副作用，后来的事件不再重跑。"""
     adapter, _ = app
     async def scenario(client):
         await client.feed("group_message_create", body(addressed=False))
@@ -140,6 +140,48 @@ async def test_same_msg_id_is_handled_once_across_both_events(app, sdk):
         client.api.post_group_message.assert_not_awaited()
         assert adapter.group_msg_handler is not None
     await sdk(adapter, scenario)
+
+
+async def test_untrusted_full_mention_can_upgrade_to_real_at_once(app, sdk):
+    adapter, _ = app
+
+    async def scenario(client):
+        data = body("<@bot-openid> 你好", addressed=False)
+        await client.feed("group_message_create", data)
+        client.api.post_group_message.assert_not_awaited()
+        await client.feed("group_at_message_create", data)
+        await client.feed("group_at_message_create", data)
+        client.api.post_group_message.assert_awaited_once()
+        assert client.api.post_group_message.await_args.kwargs["msg_id"] == "incoming-id"
+
+    await sdk(adapter, scenario)
+
+
+async def test_parallel_true_at_upgrades_only_once(app, monkeypatch):
+    adapter, bot = app
+    reply = AsyncMock(return_value=True)
+    monkeypatch.setattr(bot, "_safe_reply", reply)
+    data = body("<@bot-openid> 你好", addressed=False)
+    await adapter._receive_group_message(qqbot.wrap_group_message(data))
+    reply.assert_not_awaited()
+    await asyncio.gather(*[
+        adapter._receive_group_message(qqbot.wrap_group_at_message(data)) for _ in range(8)
+    ])
+    reply.assert_awaited_once()
+
+
+async def test_unmentioned_ambient_effect_cannot_be_replayed_by_at_upgrade():
+    adapter = qqbot.QQBotClient("offline", "offline")
+    effects = []
+
+    async def handle(message):
+        effects.append(message.id)
+
+    adapter.group_msg_handler = handle
+    data = body("老师的新安排", addressed=False)
+    await adapter._receive_group_message(qqbot.wrap_group_message(data))
+    await adapter._receive_group_message(qqbot.wrap_group_at_message(data))
+    assert effects == ["incoming-id"]
 
 
 async def test_new_group_gets_copyable_openid_authorization_command(app, sdk):
