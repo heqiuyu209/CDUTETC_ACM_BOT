@@ -3,7 +3,7 @@
 设计要点（三层，越靠前越省）：
 
 1. **身份门禁 + 零 Token 预过滤**：只有该群登记的负责老师或老师白名单成员，
-   且消息命中「时间锚点」或「事件锚点」时才可能调用模型。今天这类判断全部是
+   且消息命中「明确钟点」或「事件/规则锚点」时才可能调用模型。这些判断全部是
    本地正则，闲聊、寒暄、短句在第一步就被丢掉，不会产生任何 API 费用。
 2. **模型结构化分类**：传入北京时间 + 本群课程 + 未来 7 天比赛的精简索引，
    要求输出严格 JSON（intent / confidence / 槽位），模型只做归类与抽槽，
@@ -21,14 +21,15 @@ import asyncio
 import json
 import logging
 import re
+import unicodedata
 from contextlib import closing
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
-from cdutetc import config, fetcher, llm
+from cdutetc import config, content_filter, fetcher, llm, publish_text
 from cdutetc import database as db
-from cdutetc.utils import can_manage_group
+from cdutetc.utils import can_manage_group, split_normalized_time
 
 logger = logging.getLogger(__name__)
 
@@ -65,16 +66,12 @@ MAX_COURSES_IN_CONTEXT = 10
 MAX_CONTESTS_IN_CONTEXT = 8
 MAX_RAW_TEXT_CHARS = 400
 
-# 锚点一：时间表达。命中任意一项才有必要进入模型。
-TIME_ANCHOR = re.compile(
-    r"今天|明天|后天|今晚|周[一二三四五六日天]|下周|\d+月|\d+日|\d+号|\d{1,2}[:：点]|截止|报名"
-)
-# 锚点二：事件/动作表达。
+# 事件/动作锚点；单独的日期词不触发，避免“今天好开心”支付分类费用。
 EVENT_ANCHOR = re.compile(
-    r"课|周报|集训|训练|机房|实验室|比赛|周赛|选拔|模拟|补题|讲座|调课|改到|取消|推迟|地点|链接|http",
+    r"课|周报|集训|训练|机房|实验室|比赛|周赛|报名|截止|选拔|模拟|补题|讲座|讲\s*(?:DP|图论|算法|数据结构)|调课|改到|取消|推迟|地点|链接|http",
     re.IGNORECASE,
 )
-# 锚点三：队规/制度/流程类表达。这类消息常常既无日期也无课程关键词
+# 队规/制度/流程锚点。这类消息常常既无日期也无课程关键词
 # （「请假要提前一天报备」「报销单据交给组长」），漏了它就会在预过滤阶段被静默丢弃。
 POLICY_ANCHOR = re.compile(
     r"制度|规定|规则|规范|纪律|要求|考勤|签到|打卡|请假|报备|报销|发票|物资|经费|"
@@ -82,7 +79,7 @@ POLICY_ANCHOR = re.compile(
 )
 
 # @ 段与用户粘贴的表情标记在计数前剔除。
-_MENTION_RE = re.compile(r"<@!?[^>\s]*>|\[CQ:[^\]]*\]|@\S+")
+_MENTION_RE = re.compile(r"<@!?[^>\s]*>|\[CQ:[^\]]*\]|@(?:全体成员|所有人|全体|everyone|all)(?![A-Za-z])|@[^\s，,。；;：:]+(?=\s)")
 _EMOJI_RE = re.compile(
     "[\U0001F000-\U0001FAFF\u2190-\u21FF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D]"
 )
@@ -127,13 +124,13 @@ def is_teacher_speaker(group_id: str, sender_id: str) -> bool:
 def should_call_llm(text: str) -> bool:
     """第一层：0 Token 预过滤。长度不足或无任何锚点 → 不调模型。"""
     plain = normalize_text(text)
+    if publish_text._QUERY.search(plain) or content_filter.is_social_chat(plain):
+        return False
     if len(plain) < MIN_TEXT_LENGTH:
         return False
-    return bool(
-        TIME_ANCHOR.search(plain)
-        or EVENT_ANCHOR.search(plain)
-        or POLICY_ANCHOR.search(plain)
-    )
+    # 只有“今天好开心”这类日期词不是通知；事件/规则或明确钟点才值得分类。
+    return bool(EVENT_ANCHOR.search(plain) or POLICY_ANCHOR.search(plain)
+                or publish_text._CLOCK.search(unicodedata.normalize("NFKC", plain)))
 
 
 def _weekday_of(moment: datetime) -> str:
@@ -320,7 +317,7 @@ def parse_result(content: str) -> dict | None:
         "url": str(data.get("url") or "").strip(),
         "target_id": target_id,
         "target_type": str(data.get("target_type") or "").strip(),
-        "cancel": bool(data.get("cancel")),
+        "cancel": data.get("cancel") is True,
         "missing": missing,
     }
 
@@ -361,6 +358,102 @@ async def classify(text: str, *, group_id: str, now: datetime | None = None) -> 
         logger.warning("老师意图分类调用失败: %s", type(error).__name__)
         return None
     return parse_result(raw)
+
+
+def _declared_schedule(text: str, slots: dict, now: datetime) -> dict:
+    """模型只分类；日程只能来自老师原文，本地解析失败则保留为空待补全。"""
+    result = dict(slots)
+    intent = result["intent"]
+    if intent not in {INTENT_RECURRING_COURSE, INTENT_ONE_OFF_SESSION,
+                      INTENT_CONTEST, INTENT_UPDATE_CANCEL}:
+        return result
+    source = unicodedata.normalize("NFKC", normalize_text(text))
+    source = re.sub(r"(?<![今明])晚(?=[零〇一二两三四五六七八九十\d])", "晚上", source)
+    # “19-21点”只有尾端单位，先补齐起点，再用既有时间区间规则。
+    source = re.sub(r"(?<![\d:])([零〇一二两三四五六七八九十\d]+)\s*([-~～—–到至])\s*"
+                    r"(?=[零〇一二两三四五六七八九十\d]+[点时])", r"\1点\2", source)
+    time_only_update = intent == INTENT_UPDATE_CANCEL and bool(re.search(r"时间\s*(?:改为|改到|改成|调整到)", source))
+    if intent == INTENT_UPDATE_CANCEL:
+        # 「周三的课改到周四」以改到后的日期为准，不取被改的旧时间。
+        move = re.search(r"改到|改为|换到|调整到|推迟到", source)
+        if move and not time_only_update:
+            source = source[move.end():]
+    rescheduling = intent == INTENT_UPDATE_CANCEL and not result.get("cancel") and bool(
+        re.search(r"改到|改为|调整到|推迟|延后|提前", normalize_text(text))
+        and (publish_text._CLOCK.search(source) or publish_text._RELATIVE.search(source)
+             or publish_text._DATE.search(source) or publish_text._MONTH_DAY.search(source)
+             or re.search(r"下周|本周|这周|周[一二三四五六日天]|半小时|小时|分钟|待定", source)))
+    recurring = bool(re.search(r"每\s*(?:周|星期|礼拜)[一二三四五六日天]", source))
+    if intent in {INTENT_RECURRING_COURSE, INTENT_ONE_OFF_SESSION}:
+        result["intent"] = INTENT_RECURRING_COURSE if recurring else INTENT_ONE_OFF_SESSION
+    for field in ("date", "weekday", "start_time", "end_time"):
+        result[field] = ""
+    dates = list(publish_text._DATE.finditer(source))
+    month_days = [match for match in publish_text._MONTH_DAY.finditer(source)
+                  if not any(day.start() <= match.start() < day.end() for day in dates)]
+    relatives = list(publish_text._RELATIVE.finditer(source))
+    weekdays = list(publish_text._WEEKDAY.finditer(source))
+    has_date = bool(dates or month_days or relatives or weekdays)
+    clocks = list(publish_text._CLOCK.finditer(source))
+    clock_source = source
+    start = ""
+    invalid_span = False
+    is_span = False
+    if len(clocks) == 2 and re.fullmatch(r"\s*[-~～—–到至]\s*", source[clocks[0].end():clocks[1].start()]):
+        is_span = True
+        span = source[clocks[0].start():clocks[1].end()]
+        if re.search(r"今晚|明晚", source[:clocks[0].start()]):
+            span = "晚上" + span
+        _, start, end = split_normalized_time(span)
+        invalid_span = not start or not end
+        result["end_time"] = end
+        clock_source = source[:clocks[0].end()] + source[clocks[1].end():]
+    try:
+        parsed = None if invalid_span else publish_text.parse_local_time(clock_source, now=now)
+    except ValueError:
+        parsed = None
+    # parse_local_time 为显式发布保留“今天”的默认；自动识别必须有原文日期。
+    if parsed is not None:
+        result["start_time"] = parsed[0][11:]
+        if is_span and (result["start_time"] != start or result["end_time"] <= result["start_time"]):
+            # 区间跨午夜/时段不一致时不套用另一套钟点含义，也不猜跨天结束。
+            result["start_time"] = result["end_time"] = ""
+    else:
+        result["end_time"] = ""
+    unambiguous_date = (len(dates) + len(month_days) + len(relatives) <= 1
+                        and len(weekdays) <= 1)
+    if has_date and unambiguous_date:
+        # 没有钟点也能解析明确日期，从而只向老师索要真正缺失的开始时间。
+        day_source = publish_text._CLOCK.sub("", clock_source)
+        day_source = re.sub(r"明晚|明早", "明天", day_source)
+        day_source = re.sub(r"今晚|今早", "今天", day_source) + " 00:00"
+        try:
+            day = publish_text.parse_local_time(day_source, now=now)
+        except ValueError:
+            day = None
+        if parsed is not None or day is not None:
+            result["date"] = (parsed or day)[0][:10]
+            result["weekday"] = _weekday_of(datetime.strptime(result["date"], "%Y-%m-%d"))
+            if weekdays and (dates or month_days or relatives) and (
+                    result["weekday"] != _parse_weekday(weekdays[0][0])):
+                result["date"] = result["weekday"] = ""
+    if recurring and len(weekdays) == 1:
+        result["weekday"] = _parse_weekday(weekdays[0][0])
+        result["date"] = ""
+    gaps = _missing_slots(result["intent"], result, now)
+    if recurring and (dates or month_days or relatives or re.search(
+            r"下周|下个月|下月|下学期|生效|从|截至|截止|到.*为止", source)):
+        # 课程模板暂不能直接表达起止限定；不能默认为本周就生效。
+        gaps.append("effective_start")
+    if rescheduling:
+        if not result["date"] and not result["weekday"] and not time_only_update:
+            gaps.append("date")
+        if not result["start_time"]:
+            gaps.append("start_time")
+    result["missing"] = gaps
+    if gaps:
+        result["confidence"] = CONFIDENCE_MEDIUM
+    return result
 
 
 # ---------------------------------------------------------------------
@@ -541,11 +634,17 @@ def _apply_update(group_id: str, slots: dict, now: datetime, operator: str) -> t
         return None
     if course is not None:
         updates: dict = {}
+        date = _parse_date(slots.get("date"), now)
         weekday = _parse_weekday(slots.get("weekday"))
         start = _parse_clock(slots.get("start_time"))
         end = _parse_clock(slots.get("end_time"))
         if weekday:
             updates["weekday"] = weekday
+        if date and course.get("effective_start") and course.get("effective_end"):
+            # 单次课程改日必须把生效窗口一起移动，周期模板仍保持长期生效。
+            updates["weekday"] = _weekday_of(datetime.strptime(date, "%Y-%m-%d"))
+            updates["effective_start"] = f"{date} 00:00"
+            updates["effective_end"] = f"{date} 23:59"
         if start:
             updates["start_time"] = start
         if end:
@@ -645,6 +744,7 @@ def _private_targets(group_id: str, sender_id: str) -> list[str]:
 
 def _pending_private_text(item: dict) -> str:
     gap_labels = {"date": "日期", "weekday": "周几", "start_time": "开始时间",
+                  "effective_start": "课程生效范围",
                   "end_time": "结束时间", "location": "地点", "target_id": "要改的对象"}
     missing = "、".join(gap_labels.get(item, item) for item in item["missing"]) or "关键信息"
     return (
@@ -693,6 +793,7 @@ async def handle_message(text: str, *, group_id: str, sender_id: str,
         return _result(INTENT_CHAT_IGNORE, "ignored")
     if slots is None:
         return _result(INTENT_CHAT_IGNORE, "ignored")
+    slots = _declared_schedule(text, slots, moment)
     intent = slots["intent"]
     if intent == INTENT_CHAT_IGNORE:
         return _result(intent, "ignored")

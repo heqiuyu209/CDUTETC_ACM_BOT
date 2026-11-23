@@ -78,7 +78,8 @@ class PersonaMixin:
         return info
 
     async def _handle_teacher_intent(self, message: _main.QQBotMessage, text: str,
-                                     group_id: str, member_id: str) -> bool:
+                                     group_id: str, member_id: str, *,
+                                     fallback_on_ignore: bool = False) -> bool:
         """老师在群里随口说安排时，识别意图并登记课程/比赛。
 
         Returns:
@@ -98,6 +99,11 @@ class PersonaMixin:
             return False
         if result is None:
             return False
+        if fallback_on_ignore and result.get("action") not in {"saved", "pending"}:
+            return False
+        if result.get("action") in {"saved", "pending"}:
+            # 写入已经完成；即使回执失败，后来的官方 AT 事件也不能重放副作用。
+            message.business_consumed = True
         reply = result.get("reply") or ""
         if reply and result.get("action") in {"saved", "pending"}:
             await self._safe_reply(message, reply)

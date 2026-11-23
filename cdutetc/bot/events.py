@@ -336,6 +336,19 @@ class EventsMixin:
                 return
             addressed = _main.is_addressed_to_bot(message)
             targets = {item["id"] for item in _main.message_mentions(message) if item["id"]}
+            text = _main.strip_at(message.content or "")
+            teacher_rate_checked = False
+            from cdutetc import business_followup
+
+            # 老师通知面向学生/全体也可记安排；他人的问句与命令仍在下面忽略。
+            if (targets and not addressed and not text.startswith("/")
+                    and _main.match_publish_command(text, _main.config.PUBLISH_CMD) is None
+                    and not business_followup.is_location_message(text)
+                    and _main.teacher_intent.should_call_llm(text)
+                    and await self._handle_teacher_intent(
+                        message, text, group_id, self._extract_member_id(message),
+                        fallback_on_ignore=True)):
+                return True
             # 带 @ 的消息只有指向本机器人时才受理，包括发给他人的命令。
             if targets and not addressed:
                 logger.info(
@@ -343,7 +356,6 @@ class EventsMixin:
                     ",".join(sorted(targets)),
                 )
                 return
-            text = _main.strip_at(message.content)
             # 收图与文本滑窗在「有没有正文」之前处理：纯图片消息没有文本，
             # 但它正是要收的对象；后台任务异步跑，绝不阻塞本条消息的响应。
             self._schedule_meme_collect(message, group_id, text)
@@ -414,12 +426,29 @@ class EventsMixin:
             # 群全量消息入口：老师没 @ 机器人、也没带 / 命令，只是在群里说安排
             # （「周三晚七点讲图论」）时，交给隐式意图管线判断要不要登记。
             # 队员的普通消息在这里一定返回 False，继续走原有逻辑直至放行。
-            if (not addressed
-                    and not text.startswith("/")
+            natural_publication = (addressed and _main.config.NL_INTENT_ENABLED
+                                   and _main.is_timed_contest_announcement(text))
+            if (addressed and not text.startswith("/")
+                    and not natural_publication
                     and _main.match_publish_command(text, _main.config.PUBLISH_CMD) is None
+                    and _main.config.TEACHER_AUTO_INTENT_ENABLED
+                    and _main.teacher_intent.is_teacher_speaker(group_id, self._extract_member_id(message))
+                    and _main.teacher_intent.should_call_llm(text)):
+                teacher_rate_checked = True
+                allowed, gate_reply = self._qa_gate(self._extract_member_id(message), text)
+                if not allowed:
+                    if gate_reply:
+                        await self._safe_reply(message, gate_reply)
+                    return
+            if (not text.startswith("/")
+                    and not natural_publication
+                    and _main.match_publish_command(text, _main.config.PUBLISH_CMD) is None
+                    and (not addressed or self._qa_gate(
+                        self._extract_member_id(message), text, check_rate_limit=False)[0])
                     and await self._handle_teacher_intent(
-                        message, text, group_id, self._extract_member_id(message))):
-                return
+                        message, text, group_id, self._extract_member_id(message),
+                        fallback_on_ignore=addressed)):
+                return True
             # 零 Token 群聊娱乐：跟风复读（+1）与高频词表情包，都只走被动回复，
             # 不调模型、不占主动配额；与上一步互斥，被意图管线消费的消息不会到这里。
             if (not addressed
@@ -465,7 +494,7 @@ class EventsMixin:
                 await self._weekly_contest_job()
             if replies is None:
                 # 先限流和检查输入，再考虑模型意图识别，避免被拒绝的问题仍产生费用。
-                allowed, gate_reply = self._qa_gate(member_id, text)
+                allowed, gate_reply = self._qa_gate(member_id, text, check_rate_limit=not teacher_rate_checked)
                 if not allowed:
                     if gate_reply:
                         await self._safe_reply(message, gate_reply)
