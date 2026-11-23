@@ -118,6 +118,8 @@ class ReplyMixin:
             self.client, group_id, content,
             reply_to=str(getattr(message, "id", "") or ""), reply_seq=seq,
         )
+        if result:
+            self._note_bot_spoke(group_id)
         return bool(result)
 
     async def _notice_unauthorized_group(self, message: _main.QQBotMessage,

@@ -301,7 +301,7 @@ class PersonaMixin:
             return True
         if not _main.config.QA_SOCIAL_CHAT_ENABLED:
             return True
-        reply = private_chat.local_call_reply(text)
+        reply = private_chat.local_persona_reply(text)
         if not reply and _main.content_filter.is_social_chat(text):
             reply = _main.llm._local_social_reply(text)
         if not reply:
@@ -409,6 +409,10 @@ class PersonaMixin:
             max_link_length=_main.config.QA_OUTPUT_MAX_LINK_LENGTH,
         )
         reply, category = _main.persona_chat.split_meme_tag(filtered_reply)
+        from cdutetc import private_chat
+
+        if reply and not private_chat.valid_persona_reply(reply):
+            return False
         if reply and (max_chars or max_sentences):
             # 主动插话走这条路径：句数先压到 1~2 句，再压字数，绝不整段小作文。
             reply = _main.persona_chat.clamp_reply(
@@ -442,12 +446,16 @@ class PersonaMixin:
         if not (_main.config.PERSONA_CHAT_ENABLED and _main.config.QA_SOCIAL_CHAT_ENABLED
                 and _main.db.group_switch_enabled(group_id, "qa_enabled")):
             return False
+        from cdutetc import private_chat
+
+        if not private_chat.can_interject(text):
+            return False
         member_id = self._extract_member_id(message)
         # 不合格的输入连上下文也不记录，避免借下一位群友的回复绕过过滤。
         if not self._qa_gate(member_id, text, check_rate_limit=False)[0]:
             return False
         try:
-            if not _main.persona_chat.get_gate().observe(group_id):
+            if not _main.persona_chat.get_gate().observe(group_id, reserve_only=True):
                 _main.persona_chat.get_memory().observe(
                     group_id, self._nickname_of(message, member_id), text)
                 return False

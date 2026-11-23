@@ -231,22 +231,32 @@ class QQBotClient(BaseBotClient):
         self._last_rx = time.monotonic()
         # 主动消息不复用 SDK 的默认序号1；随机起点也减少重启后的序号重合。
         self._active_msg_seq = secrets.randbelow(2**31 - 2) + 1
-        # 入站消息幂等表：(group_id, msg_id) -> 首次处理时刻；带 TTL 与容量上限。
-        self._recent_group_messages: OrderedDict[tuple[str, str], float] = OrderedDict()
+        # 入站消息幂等表：首次时刻与可升级标记，均受 TTL 与容量上限约束。
+        self._recent_group_messages: OrderedDict[tuple[str, str], tuple[float, bool]] = OrderedDict()
 
     def _seen_recently(self, wrapped: QQBotMessage, now: float) -> bool:
-        """同一条群消息 5 分钟内只处理一次；顺带惰性清理过期条目。"""
+        """缺定向信息而被忽略的 @ 消息可升级一次，已执行的消息仍保持幂等。"""
         # 官方协议一条 @ 消息可能同时触发群 @ 事件与群全量事件，必须按 msg_id 幂等。
         if not (wrapped.group_id and wrapped.id):
             return False
+        from cdutetc.utils import is_addressed_to_bot, message_mentions
+
+        addressed = is_addressed_to_bot(wrapped)
         key = (wrapped.group_id, wrapped.id)
         hit = self._recent_group_messages.get(key)
-        if hit is not None and now - hit < GROUP_MSG_DEDUP_TTL:
+        if hit is not None and now - hit[0] < GROUP_MSG_DEDUP_TTL:
+            if hit[1] and addressed:
+                # 在 await handler 前消耗标记，并发到达的真实 @ 事件只放行一次。
+                self._recent_group_messages[key] = (hit[0], False)
+                return False
             return True
-        self._recent_group_messages[key] = now
+        # 有 @ 目标却没有可信定向标记时，群入口会在 ambient 处理前直接忽略。
+        # 无 @ 的全量消息可能已经写入老师安排或参与聊天，不允许再升级重放。
+        can_upgrade = not addressed and any(item["id"] for item in message_mentions(wrapped))
+        self._recent_group_messages[key] = (now, can_upgrade)
         self._recent_group_messages.move_to_end(key)
         while self._recent_group_messages:
-            oldest_at = next(iter(self._recent_group_messages.values()))
+            oldest_at = next(iter(self._recent_group_messages.values()))[0]
             if len(self._recent_group_messages) > GROUP_MSG_DEDUP_LIMIT \
                     or now - oldest_at >= GROUP_MSG_DEDUP_TTL:
                 self._recent_group_messages.popitem(last=False)

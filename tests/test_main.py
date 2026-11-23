@@ -53,10 +53,10 @@ async def test_non_allowed_group_ignored(bot):
     assert replies == []
 
 
-async def test_empty_text_ignored(bot):
+async def test_real_at_without_extra_text_gets_local_name_reply(bot):
     b, replies = bot
     await b.on_group_at_message_create(_msg("<@30001>"))
-    assert replies == []
+    assert replies == ["在呢，雄姐听着～"]
 
 
 async def test_command_without_at_is_ignored(bot):
