@@ -23,6 +23,7 @@ import re
 from collections.abc import Mapping
 from datetime import datetime, timedelta
 from html import unescape
+from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
 from cdutetc import config, fetcher, llm
@@ -426,21 +427,52 @@ def _nowcoder_time(value) -> datetime | None:
     return None
 
 
-def _nowcoder_items(payload) -> list:
+def _nowcoder_items_or_none(payload) -> list | None:
     """从牛客 JSON 的常见包装里取出比赛数组。"""
     if isinstance(payload, list):
         return payload
     if not isinstance(payload, Mapping):
-        return []
+        return None
     for key in ("contests", "list", "data", "result"):
         value = payload.get(key)
         if isinstance(value, list):
             return value
         if isinstance(value, Mapping):
-            nested = _nowcoder_items(value)
-            if nested:
+            nested = _nowcoder_items_or_none(value)
+            if nested is not None:
                 return nested
-    return []
+    return None
+
+
+def _nowcoder_items(payload) -> list:
+    return _nowcoder_items_or_none(payload) or []
+
+
+def _nowcoder_calendar_items(payload) -> list:
+    """HTTP 200 的错误 JSON 不能伪装成「暂无比赛」。"""
+    if isinstance(payload, Mapping) and "code" in payload and str(payload["code"]) != "0":
+        raise fetcher.FetchError(f"牛客日历接口返回错误 code={payload['code']}")
+    items = _nowcoder_items_or_none(payload)
+    if items is None:
+        raise fetcher.FetchError("牛客日历接口缺少赛程数组")
+    if items and not any(_nowcoder_has_schedule(item) for item in items):
+        raise fetcher.FetchError("牛客日历接口赛程字段无效")
+    return items
+
+
+def _nowcoder_has_schedule(raw) -> bool:
+    if not isinstance(raw, Mapping):
+        return False
+    try:
+        title = _clean_name(raw.get("name") or raw.get("title")
+                            or raw.get("contestName") or raw.get("contestTitle")
+                            or raw.get("contest_name"))
+        start = _nowcoder_time(raw.get("startTime") or raw.get("start_time") or raw.get("start"))
+        link = _nowcoder_clean_link(raw.get("link") or raw.get("url") or raw.get("contestUrl"))
+        located = link is not None or int(raw.get("contestId") or raw.get("id") or 0) > 0
+        return bool(title and start is not None and located)
+    except (ValueError, TypeError, OverflowError):
+        return False
 
 
 def _nowcoder_from_json(text: str, now: datetime, window_days: int) -> list[dict]:
@@ -512,7 +544,41 @@ def _nowcoder_blocks(text: str) -> list[tuple[int, int]]:
     return blocks
 
 
+class _NowcoderPageItems(HTMLParser):
+    """读取官方赛程卡片的结构化 data-json，避免把报名时间当开赛时间。"""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.items: list[dict] = []
+
+    def handle_starttag(self, tag, attrs):
+        fields = dict(attrs)
+        raw = fields.get("data-json")
+        if raw is None:
+            return
+        try:
+            payload = json.loads(unescape(raw))
+        except (TypeError, ValueError):
+            return
+        if not isinstance(payload, Mapping) or not payload.get("contestStartTime"):
+            return
+        self.items.append({
+            "contestId": payload.get("contestId") or fields.get("data-id"),
+            "contestName": payload.get("contestName"),
+            "startTime": payload.get("contestStartTime"),
+            "endTime": payload.get("contestEndTime"),
+        })
+
+
 def _nowcoder_from_html(text: str, now: datetime, window_days: int) -> list[dict]:
+    cards = _NowcoderPageItems()
+    try:
+        cards.feed(text)
+        cards.close()
+    except (ValueError, AssertionError):
+        pass
+    if cards.items:
+        return _nowcoder_items_to_contests(cards.items, now, window_days)
     out: list[dict] = []
     blocks = _nowcoder_blocks(text)
     block_starts = [start for start, _ in blocks]
@@ -603,34 +669,45 @@ def dedupe_contest_items(items) -> list[dict]:
     return out
 
 
-async def _fetch_nowcoder_contests(current: datetime, window: int, nc_fetcher) -> list[dict]:
+async def _fetch_nowcoder_contests(current: datetime, window: int, nc_fetcher,
+                                  errors: list | None = None) -> list[dict]:
     """牛客赛程：日历 JSON 接口优先（跨月合并去重），异常再降级赛程页 HTML。"""
     items: list[dict] = []
-    json_ok = False
+    calendar_errors: list[str] = []
+    successful_months = 0
     for url in _nowcoder_calendar_urls(current, window):
         try:
             text = await nc_fetcher(url)
+            payload = json.loads(text) if isinstance(text, str) else text
+            raw_items = _nowcoder_calendar_items(payload)
+            items.extend(_nowcoder_items_to_contests(raw_items, current, window))
+            successful_months += 1
         except Exception as error:
-            logger.warning("牛客日历接口请求失败（%s）：%s", url, error)
+            calendar_errors.append(f"{url}: {error}")
+            logger.warning("牛客日历接口不可用（%s），准备降级赛程页：%s", url, error)
             continue
-        if not isinstance(text, str):
-            text = json.dumps(text, ensure_ascii=False)
-        try:
-            payload = json.loads(text)
-        except (TypeError, ValueError):
-            logger.warning("牛客日历接口返回非 JSON（%s），准备降级赛程页", url)
-            continue
-        json_ok = True
-        items.extend(_nowcoder_items_to_contests(
-            _nowcoder_items(payload), current, window))
-    if json_ok:
+    if not calendar_errors:
         # 跨月请求常出现同一场比赛（月末/月初边界），已知平台按赛事 ID 去重。
         return dedupe_contest_items(items)
     logger.warning("牛客日历接口不可用，降级抓取赛程页：%s", NOWCODER_CONTEST_PAGE)
-    page = await nc_fetcher(NOWCODER_CONTEST_PAGE)
-    if not isinstance(page, str):
-        page = json.dumps(page, ensure_ascii=False)
-    return dedupe_contest_items(parse_nowcoder(page, current, window))
+    try:
+        page = await nc_fetcher(NOWCODER_CONTEST_PAGE)
+        if not isinstance(page, str):
+            page = json.dumps(page, ensure_ascii=False)
+        page_items = parse_nowcoder(page, current, window)
+        if not page_items and not _NOWCODER_ANCHOR.search(page):
+            raise fetcher.FetchError("牛客赛程页未找到可解析的比赛链接")
+        items.extend(page_items)
+        if successful_months and errors is not None:
+            # 官网不保证覆盖失败月份的所有赛事，不能把部分月份缺失伪装成全量成功。
+            errors.append({"platform": "牛客", "error": "部分月份日历失败，已尝试官网补充："
+                           + "; ".join(calendar_errors)})
+    except Exception as error:
+        problem = {"platform": "牛客", "error": "; ".join(calendar_errors + [str(error)])}
+        if errors is None:
+            raise fetcher.FetchError(problem["error"]) from error
+        errors.append(problem)
+    return dedupe_contest_items(items)
 
 
 async def fetch_contests(now: datetime | None = None, *,
@@ -646,13 +723,17 @@ async def fetch_contests(now: datetime | None = None, *,
         payload = await cf_fetcher(CF_CONTEST_API)
         if isinstance(payload, str):
             payload = json.loads(payload)
+        if not isinstance(payload, Mapping) or payload.get("status") != "OK":
+            raise fetcher.FetchError("Codeforces 接口未返回 OK 状态")
+        if not isinstance(payload.get("result"), list):
+            raise fetcher.FetchError("Codeforces 接口缺少赛程数组")
         result["codeforces"] = parse_codeforces(payload, current, window)
     except Exception as error:
         logger.warning("Codeforces 赛程抓取失败：%s", error)
         result["errors"].append({"platform": "Codeforces", "error": str(error)})
 
     try:
-        result["nowcoder"] = await _fetch_nowcoder_contests(current, window, nc_fetcher)
+        result["nowcoder"] = await _fetch_nowcoder_contests(current, window, nc_fetcher, result["errors"])
     except Exception as error:
         logger.warning("牛客赛程抓取失败：%s", error)
         result["errors"].append({"platform": "牛客", "error": str(error)})
@@ -666,6 +747,8 @@ async def _http_get_text(url: str) -> str:
 
 async def _nowcoder_http_get_text(url: str) -> str:
     """牛客请求带上来源页 Referer：日历接口对裸请求偶发返回空/阻断。"""
+    if url == NOWCODER_CONTEST_PAGE:
+        return await fetcher.fetch_document(url, {"Referer": NOWCODER_REFERER})
     return await fetcher.fetch_text_with_extra_headers(
         url, {"Referer": NOWCODER_REFERER})
 
