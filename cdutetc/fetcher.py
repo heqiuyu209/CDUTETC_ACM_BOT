@@ -48,6 +48,7 @@ _sem = asyncio.Semaphore(config.FETCH_CONCURRENCY)
 _request_deadline = ContextVar("fetch_request_deadline", default=None)
 # 附加请求头（如 Referer）：按 asyncio 上下文传递，重定向逐跳沿用。
 _extra_headers = ContextVar("fetch_extra_headers", default=())
+_preserve_document = ContextVar("fetch_preserve_document", default=False)
 _HEADER_NAME_OK = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 
 
@@ -505,7 +506,10 @@ class _VisibleTextParser(HTMLParser):
 
     def feed_bounded(self, data):
         try:
-            super().feed(data)
+            # 本模块已按小块喂入并限制未完成 token。直接解析当前块，避免
+            # 新版 HTMLParser.feed 的延迟队列把字符藏在 rawdata 上限之外。
+            self.rawdata += data
+            self.goahead(0)
         except (ValueError, AssertionError):
             raise FetchError("HTML 标签非法") from None
         if self.cdata_elem and self.rawdata:
@@ -563,7 +567,12 @@ async def _fetch_hop(url: str) -> tuple[int, dict[str, str], str]:
             status, headers, body = await _request_once(url)
             text = ""
             if status not in (301, 302, 303, 307, 308) and status < 400:
-                text = await _extract_text_async(body, headers.get("content-type", ""), url, deadline)
+                if _preserve_document.get():
+                    text, _ = _decode_body(body, headers.get("content-type", ""))
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise TimeoutError
+                else:
+                    text = await _extract_text_async(body, headers.get("content-type", ""), url, deadline)
             return status, headers, text
         finally:
             _request_deadline.reset(token)
@@ -618,6 +627,18 @@ async def fetch_text_with_extra_headers(url: str, headers=None) -> str:
         return await fetch_text(url)
     finally:
         _extra_headers.reset(token)
+
+
+async def fetch_document(url: str, headers=None) -> str:
+    """保留 HTML 链接结构的受限抓取；用于赛程列表解析，校验与正文抓取相同。"""
+    pairs = _sanitize_extra_headers(headers)
+    header_token = _extra_headers.set(pairs)
+    document_token = _preserve_document.set(True)
+    try:
+        return await fetch_text(url)
+    finally:
+        _preserve_document.reset(document_token)
+        _extra_headers.reset(header_token)
 
 
 async def fetch_text_with_headers(url: str) -> tuple[str, dict[str, str]]:

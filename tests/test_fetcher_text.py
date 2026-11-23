@@ -130,6 +130,28 @@ async def test_unfinished_html_tokens_are_bounded(page, suffix):
         await fetcher.fetch_text(URL)
 
 
+@pytest.mark.parametrize("size", [1, 7, 2048])
+@pytest.mark.parametrize("opening", ['<div title="', "<!--"])
+def test_incomplete_token_limit_is_enforced_before_parser_finish(size, opening):
+    parser = fetcher._VisibleTextParser()
+    text = opening + "x" * (fetcher._MAX_HTML_TOKEN_CHARS + 1)
+    with pytest.raises(FetchError, match="HTML.*大小上限"):
+        for offset in range(0, len(text), size):
+            parser.feed_bounded(text[offset:offset + size])
+
+
+@pytest.mark.parametrize("size", [1, 7, 2048])
+@pytest.mark.parametrize("token", [
+    '<div title="' + "x" * 12_000 + '">inside</div>',
+    "<!--" + "x" * 12_000 + "-->",
+])
+async def test_complete_tokens_under_limit_preserve_surrounding_text(page, monkeypatch, size, token):
+    monkeypatch.setattr(fetcher, "_PARSE_BLOCK_CHARS", size)
+    page["body"] = ("<p>before</p>" + token + "<p>after</p>").encode()
+    expected = "before\ninside\nafter" if token.startswith("<div") else "before\nafter"
+    assert await fetcher.fetch_text(URL) == expected
+
+
 async def test_hidden_nesting_is_bounded(page):
     page["body"] = b"<noscript>" * 129
     with pytest.raises(FetchError, match="嵌套"):

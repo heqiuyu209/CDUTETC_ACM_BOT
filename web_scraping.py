@@ -180,6 +180,8 @@ def search(query: str) -> list[dict[str, str]]:
 def parse_html(html: str, base_url: str):
     """解析层，解析 HTML 获取所有链接"""
     tree = etree.HTML(html)
+    if tree is None:
+        return []
     raw_links = tree.xpath('//a[@href]')   # 找到具有 href 属性的 a 标签
 
     links = []
@@ -207,19 +209,20 @@ def get_all_links_playwright(url: str):
     html = ""
     # 浏览器可能跟随重定向，相对链接必须以跳转后的地址为基准解析
     final_url = url
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        try:
-            page = browser.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            page.wait_for_timeout(2000)
-            final_url = page.url or url
-            html = page.content()
-        except Exception as e:
-            logger.error(f"网页加载失败: {e}")
-            return []
-        finally:
-            browser.close()
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                page.wait_for_timeout(2000)
+                final_url = page.url or url
+                html = page.content()
+            finally:
+                browser.close()
+    except Exception as e:
+        logger.error(f"网页加载失败，继续抓取搜索候选: {e}")
+        return []
 
     all_links = parse_html(html, final_url)
     if not all_links:

@@ -124,3 +124,27 @@ def test_empty_page_url_falls_back_to_requested_url(monkeypatch):
 
 def test_missing_url_returns_empty():
     assert ws.get_all_links_playwright("") == []
+
+
+def test_empty_html_has_no_links():
+    assert ws.parse_html("", "https://example.com/") == []
+
+
+def test_browser_launch_failure_keeps_search_candidates(monkeypatch):
+    class UnavailablePlaywright(FakePlaywright):
+        def launch(self, **kwargs):
+            raise RuntimeError("offline Chromium unavailable")
+
+    monkeypatch.setattr(ws, "sync_playwright", lambda: UnavailablePlaywright(None))
+    monkeypatch.setattr(ws, "rewrite_layer", lambda query: query)
+    candidates = [{"title": "离线校赛", "url": "https://example.com/notice"}]
+    monkeypatch.setattr(ws, "search", lambda query: candidates)
+    received = []
+
+    def analyze(targets):
+        received.extend(targets)
+        return {"比赛名称": "离线校赛"}
+
+    monkeypatch.setattr(ws, "analysis_layer", analyze)
+    assert ws.input_layer("离线校赛") == {"比赛名称": "离线校赛"}
+    assert received == candidates
