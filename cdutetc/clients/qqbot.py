@@ -70,7 +70,7 @@ class QQBotMessage:
     """官方群消息与私聊事件的统一封装。"""
 
     __slots__ = ("raw", "source", "id", "message_type", "group_id", "user_id",
-                 "content", "always_addressed", "mentions", "reference_id")
+                 "content", "always_addressed", "mentions", "reference_id", "business_consumed")
 
     def __init__(self, data, *, message_type: str, group_id: str = "",
                  user_id: str = "", content: str = "", msg_id: str = "",
@@ -78,6 +78,7 @@ class QQBotMessage:
         # raw 保持字典形态，供业务层读取附件和昵称。
         # 原始 botpy 对象另存到 source，便于排查问题。
         self.raw = {}
+        self.business_consumed = False
         # 官方协议的图片只出现在 attachments 里（正文 content 为空串），
         # 必须同步进 raw，否则 memes.extract_image_refs 拿不到任何图片地址。
         attachments = _normalize_attachments(data)
@@ -233,6 +234,7 @@ class QQBotClient(BaseBotClient):
         self._active_msg_seq = secrets.randbelow(2**31 - 2) + 1
         # 入站消息幂等表：首次时刻与可升级标记，均受 TTL 与容量上限约束。
         self._recent_group_messages: OrderedDict[tuple[str, str], tuple[float, bool]] = OrderedDict()
+        self._pending_group_messages: dict[tuple[str, str], asyncio.Future] = {}
 
     def _seen_recently(self, wrapped: QQBotMessage, now: float) -> bool:
         """缺定向信息而被忽略的 @ 消息可升级一次，已执行的消息仍保持幂等。"""
@@ -250,7 +252,7 @@ class QQBotClient(BaseBotClient):
                 self._recent_group_messages[key] = (hit[0], False)
                 return False
             return True
-        # 有 @ 目标却没有可信定向标记时，群入口会在 ambient 处理前直接忽略。
+        # 缺可信定向的 @ 可等待后续真实 AT；老师通知若已被消费，会关闭升级。
         # 无 @ 的全量消息可能已经写入老师安排或参与聊天，不允许再升级重放。
         can_upgrade = not addressed and any(item["id"] for item in message_mentions(wrapped))
         self._recent_group_messages[key] = (now, can_upgrade)
@@ -268,13 +270,33 @@ class QQBotClient(BaseBotClient):
         self._last_rx = time.monotonic()
         if self.group_msg_handler is None:
             return
-        if self._seen_recently(wrapped, time.monotonic()):
-            logger.debug("重复群消息已忽略（msg_id=%s）", wrapped.id)
-            return
+        key = (wrapped.group_id, wrapped.id) if wrapped.group_id and wrapped.id else None
+        if key is not None:
+            # 同 ID 的升级事件等待首次业务处理结束，避免分类 await 期间重复入库。
+            while True:
+                if key in self._pending_group_messages:
+                    await asyncio.shield(self._pending_group_messages[key])
+                    continue
+                if len(self._pending_group_messages) >= GROUP_MSG_DEDUP_LIMIT:
+                    await asyncio.wait(tuple(self._pending_group_messages.values()),
+                                       return_when=asyncio.FIRST_COMPLETED)
+                    continue
+                break
+            if self._seen_recently(wrapped, time.monotonic()):
+                logger.debug("重复群消息已忽略（msg_id=%s）", wrapped.id)
+                return
+            self._pending_group_messages[key] = asyncio.get_running_loop().create_future()
         try:
             await self.group_msg_handler(wrapped)
         except Exception:
             logger.exception("群消息处理失败")
+        finally:
+            if key is not None:
+                hit = self._recent_group_messages.get(key)
+                if wrapped.business_consumed and hit is not None:
+                    self._recent_group_messages[key] = (hit[0], False)
+                completed = self._pending_group_messages.pop(key)
+                completed.set_result(None)
 
     # ---------- 生命周期 ----------
 

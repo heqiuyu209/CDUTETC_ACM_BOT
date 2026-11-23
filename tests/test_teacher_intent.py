@@ -115,10 +115,11 @@ async def test_recurring_course_is_saved_with_receipt_and_reminder_nodes(env, mo
     assert result["action"] == "saved"
     assert result["intent"] == teacher_intent.INTENT_RECURRING_COURSE
     assert result["reply"].startswith("📌 已自动登记课程【图论基础】")
-    assert "周三 19:00-21:00" in result["reply"] and "B302" in result["reply"]
+    assert "周三 19:00" in result["reply"] and "B302" in result["reply"]
 
     course = db.list_training_sessions(GID)[0]
-    assert (course["weekday"], course["start_time"], course["end_time"]) == ("周三", "19:00", "21:00")
+    # 原文没给结束时间，不能将模型补出来的21点存成事实。
+    assert (course["weekday"], course["start_time"], course["end_time"]) == ("周三", "19:00", "")
     assert course["location"] == "B302" and course["status"] == "confirmed"
     # 周期课不写死生效期，否则下个月自动失效。
     assert not course.get("effective_start")
