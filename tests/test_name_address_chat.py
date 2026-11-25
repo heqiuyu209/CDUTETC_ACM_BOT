@@ -81,30 +81,111 @@ async def test_plain_name_off_stays_silent(app):
 
 
 async def test_plain_name_on_replies_locally(app):
-    """开关开启：纯文本喊名本地回复，且不调用模型。"""
+    """开关/key 齐备：纯文本喊名走 LLM 生成带人设回复。"""
     app.monkeypatch.setattr(config, "NAME_ADDRESS_ENABLED", True)
     await app.client._receive_group_message(_plain("雄姐"))
     params = app.api.post_group_message.await_args.kwargs
     assert "雄姐" in params["content"]
-    app.model.assert_not_awaited()
+    assert "听着呢" in params["content"]  # LLM mock 返回值，而非固定句
+    app.model.assert_awaited_once()
 
 
 @pytest.mark.parametrize("text", ["雄姐你好", "小雄在吗"])
 async def test_plain_alias_on_replies(app, text):
-    """开关开启：主名/别名开头均触发本地回复。"""
+    """开关开启：主名/别名开头均触发 LLM 人设回复。"""
     app.monkeypatch.setattr(config, "NAME_ADDRESS_ENABLED", True)
     await app.client._receive_group_message(_plain(text))
     assert app.api.post_group_message.await_count == 1
+    app.model.assert_awaited_once()
+
+
+async def test_plain_name_no_key_falls_back_to_fixed_line(app):
+    """无 LLM API Key：一字不改回退本地固定句，不调用模型。"""
+    app.monkeypatch.setattr(config, "NAME_ADDRESS_ENABLED", True)
+    app.monkeypatch.setattr(config, "LLM_API_KEY", "")
+    await app.client._receive_group_message(_plain("雄姐"))
+    params = app.api.post_group_message.await_args.kwargs
+    assert "雄姐" in params["content"]
+    assert "听着" in params["content"]
     app.model.assert_not_awaited()
+
+
+async def test_plain_name_llm_exception_falls_back_to_fixed_line(app):
+    """LLM 抛异常：回退本地固定句，链路不中断。"""
+    app.monkeypatch.setattr(config, "NAME_ADDRESS_ENABLED", True)
+    app.model.side_effect = RuntimeError("boom")
+    await app.client._receive_group_message(_plain("雄姐"))
+    params = app.api.post_group_message.await_args.kwargs
+    assert "雄姐" in params["content"]
+    app.model.assert_awaited_once()
+
+
+async def test_plain_name_llm_empty_output_falls_back_to_fixed_line(app):
+    """LLM 输出被过滤为空：回退本地固定句。"""
+    app.monkeypatch.setattr(config, "NAME_ADDRESS_ENABLED", True)
+    app.model.return_value = ""
+    await app.client._receive_group_message(_plain("雄姐"))
+    params = app.api.post_group_message.await_args.kwargs
+    assert "雄姐" in params["content"]
+    app.model.assert_awaited_once()
+
+
+async def test_plain_name_uses_balanced_token_params(app, monkeypatch):
+    """均衡模式：预算 600 / 上下文 <=4 / max_tokens 100，人设 system 不裁剪。"""
+    import cdutetc.persona_chat as pc
+    app.monkeypatch.setattr(config, "NAME_ADDRESS_ENABLED", True)
+    captured = {}
+    real_build, real_chat = pc.build_conversation, pc.chat
+
+    def spy_build(**kwargs):
+        captured["budget"] = kwargs.get("budget")
+        captured["context"] = list(kwargs.get("context") or [])
+        return real_build(**kwargs)
+
+    async def spy_chat(system, user, **kwargs):
+        captured["max_tokens"] = kwargs.get("max_tokens")
+        captured["system"] = system
+        return "雄姐听着呢。"
+
+    monkeypatch.setattr(pc, "build_conversation", spy_build)
+    monkeypatch.setattr(pc, "chat", spy_chat)
+    await app.client._receive_group_message(_plain("雄姐"))
+    assert captured["budget"] == 600
+    assert len(captured["context"]) <= 4
+    assert captured["max_tokens"] == 100
+    assert captured["system"]
 
 
 @pytest.mark.parametrize("enabled", [False, True])
 async def test_real_at_replies_regardless_of_switch(app, enabled):
-    """真实 @ 消息无论开关状态都正常回复。"""
+    """真实 @ 无论开关都回复；开关开时先走 LLM，关时回固定句。"""
     app.monkeypatch.setattr(config, "NAME_ADDRESS_ENABLED", enabled)
     await app.client._receive_group_message(_at(app))
     params = app.api.post_group_message.await_args.kwargs
     assert "雄姐" in params["content"]
+    if enabled:
+        app.model.assert_awaited_once()  # 真 @ 命中本地固定句也先走 LLM
+    else:
+        app.model.assert_not_awaited()   # 开关关：回退固定句
+
+
+@pytest.mark.parametrize("text", ["雄姐", "雄姐？", "雄姐你好"])
+async def test_real_at_name_goes_llm(app, text):
+    """真 @ 命中本地固定短句（含问号/别名）时先走均衡 LLM，回复取模型生成。"""
+    app.monkeypatch.setattr(config, "NAME_ADDRESS_ENABLED", True)
+    await app.client._receive_group_message(_at(app, text=text))
+    params = app.api.post_group_message.await_args.kwargs
+    assert "听着呢" in params["content"]  # LLM mock 返回值，而非固定句「在呢，…听着～」
+    app.model.assert_awaited_once()
+
+
+async def test_real_at_name_no_key_falls_back_to_fixed_line(app):
+    """真 @ 喊名但无 LLM Key：一字不改回退本地固定句，不调用模型。"""
+    app.monkeypatch.setattr(config, "NAME_ADDRESS_ENABLED", True)
+    app.monkeypatch.setattr(config, "LLM_API_KEY", "")
+    await app.client._receive_group_message(_at(app))
+    params = app.api.post_group_message.await_args.kwargs
+    assert "在呢" in params["content"] and "雄姐" in params["content"]  # 固定句
     app.model.assert_not_awaited()
 
 

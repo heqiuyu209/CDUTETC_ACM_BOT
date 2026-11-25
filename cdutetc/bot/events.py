@@ -388,10 +388,27 @@ class EventsMixin:
                     return
                 if (_main.config.QA_SOCIAL_CHAT_ENABLED
                         and _main.db.group_switch_enabled(group_id, "qa_enabled")):
-                    await self._safe_reply(message, _main.content_filter.sanitize_output(
-                        local_social, max_length=_main.config.QA_OUTPUT_MAX_LENGTH,
-                        max_link_length=_main.config.QA_OUTPUT_MAX_LINK_LENGTH,
-                    ))
+                    llm_replied = False
+                    # 喊名（纯文本喊名或真 @ 后正文为喊名）命中固定短句时，先尝试一次
+                    # 均衡省 Token 的人设 LLM 回复；仅当人设聊天开关与 API Key 齐备才尝试。
+                    # 任何失败、无 Key、异常或空输出都一字不改回退下面的本地固定句。
+                    # 限流已在上游 _qa_gate 扣过，_handle_persona_chat 内部重查不重复扣。
+                    if (name_addressed
+                            and _main.config.PERSONA_CHAT_ENABLED
+                            and _main.config.LLM_API_KEY):
+                        try:
+                            llm_replied = await self._handle_persona_chat(
+                                message, text, group_id, member_id,
+                                lightweight=True, max_sentences=2)
+                        except Exception:
+                            logger.warning("纯文本喊名接 LLM 失败，回退本地固定句",
+                                           exc_info=True)
+                            llm_replied = False
+                    if not llm_replied:
+                        await self._safe_reply(message, _main.content_filter.sanitize_output(
+                            local_social, max_length=_main.config.QA_OUTPUT_MAX_LENGTH,
+                            max_link_length=_main.config.QA_OUTPUT_MAX_LINK_LENGTH,
+                        ))
                 return
             # 显式地点补充在老师自动意图与聊天前处理；无@也仅放行有本群写权限的老师。
             from cdutetc import business_followup, roles

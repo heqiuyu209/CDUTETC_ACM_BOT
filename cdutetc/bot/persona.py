@@ -349,8 +349,13 @@ class PersonaMixin:
                                    group_id: str, member_id: str,
                                    *, remember: bool = True,
                                    max_chars: int = 0,
-                                   max_sentences: int = 0) -> bool:
+                                   max_sentences: int = 0,
+                                   lightweight: bool = False) -> bool:
         """@机器人 的日常闲聊/接梗：低 Token 拟人回复 + 记忆积累 + 表情包顺风车。
+
+        lightweight（纯文本喊名接 LLM 的均衡省 Token 模式）：人设 system 完整保留，
+        仅把群聊上下文压到 4 条、Prompt 预算压到 600、回复上限压到 100 Token。
+        失败/无 Key/空输出一律返回 False，由调用方回退本地固定句。
 
         Returns:
             True  → 已回应（纯文本、或仅一张表情包），调用方直接返回；
@@ -370,6 +375,14 @@ class PersonaMixin:
         nickname = self._nickname_of(message, member_id)
         # 上下文要在记录本条之前取，否则「要回的那句话」会在上下文里出现两次。
         context = memory.recent(group_id)
+        if lightweight:
+            # 均衡省 Token：上下文只留最近 4 条；人设 system 完整保留不裁剪。
+            context = context[-4:]
+            prompt_budget = 600
+            reply_max_tokens = 100
+        else:
+            prompt_budget = _main.persona_chat.PROMPT_TOKEN_BUDGET
+            reply_max_tokens = _main.persona_chat.REPLY_MAX_TOKENS
         if remember:
             memory.observe(group_id, nickname, body)
         # 0 Token 个人记忆：命中口语模板就用确定性规则截一句标签，绝不额外调模型。
@@ -401,9 +414,11 @@ class PersonaMixin:
         system, user = _main.persona_chat.build_conversation(
             nickname=nickname, text=body, status_text=status_text,
             facts=facts, context=context, business_facts=business_facts, now=current,
+            budget=prompt_budget,
         )
         try:
-            raw_reply = await _main.persona_chat.chat(system, user)
+            raw_reply = await _main.persona_chat.chat(
+                system, user, **({"max_tokens": reply_max_tokens} if lightweight else {}))
         except Exception:
             # 闲聊失败一律回退原有回复链路：不能因为模型抖一下就整条消息无人应。
             logger.exception("拟人聊天调用失败，回退原有回复链路")
