@@ -295,10 +295,11 @@ def cmd_claim_group(group_id: str, sender: str, args: str) -> list[dict]:
 
 
 def cmd_claim_teacher(group_id: str, sender: str, args: str) -> list[dict]:
-    """群内认领老师身份：/认领老师 <QQ号> <姓名>。
+    """群内老师报号：/认领老师 <QQ号> <姓名>。
 
-    绑定的是「发送者本人的 member_openid」，因此不需要（也无法）输入 openid；
-    同时写入动态老师名单，认领后立即获得本群管理权限。
+    绑定的是「发送者本人的 member_openid」，因此不需要（也无法）输入 openid。
+    官方协议事件里没有 QQ 号，这条命令是 QQ→openid 映射的唯一数据来源：
+    报号只建立映射，不自动授予老师权限，授权统一由超管 /加老师 <QQ号> 完成。
     """
     from cdutetc.alias_helper import format_user_name
     if not group_id:
@@ -308,11 +309,8 @@ def cmd_claim_teacher(group_id: str, sender: str, args: str) -> list[dict]:
     if is_super_admin(sender):
         return [{"group_id": group_id, "text": (
             "⚠️ 当前账号为超级管理员，请让老师本人用自己的 QQ 在群内发送 "
-            "/认领老师 <QQ号> <姓名> 完成绑定，避免覆盖超管身份"
+            "/认领老师 <QQ号> <姓名> 完成报号，避免覆盖超管身份"
         )}]
-    if sender not in config.TEACHER_WHITELIST:
-        return [{"group_id": group_id,
-                 "text": "仅超管或已授权老师可认领身份；新老师请让超管先 /加老师。"}]
     parts = (args or "").strip().split(None, 1)
     if len(parts) < 2:
         return [{"group_id": group_id,
@@ -326,11 +324,11 @@ def cmd_claim_teacher(group_id: str, sender: str, args: str) -> list[dict]:
         db.set_entity_alias("user", sender, name, numeric, operator=sender)
     except ValueError as e:
         return [{"group_id": group_id, "text": str(e)}]
-    added, detail = roles.add_teacher(sender, operator=sender, note=name)
-    tail = "已加入老师名单。" if added else f"{detail}"
+    # 报号只建立 QQ→openid 映射，不自动授权；授权权独占于超管 /加老师，
+    # 防止任意成员报号即冒充老师获得管理权限。
     return [{"group_id": group_id, "text": (
-        f"✅ 已认领老师身份：{format_user_name(sender)}\n{tail}\n"
-        "如该群尚未登记负责老师，请超管用 /群老师 登记后再按名单收窄权限。"
+        f"✅ 已登记老师报号：{format_user_name(sender)}（QQ: {numeric}）\n"
+        f"身份暂未生效，请让超管发送 /加老师 {numeric} [备注] 完成授权。"
     )}]
 
 
