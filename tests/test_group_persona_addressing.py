@@ -77,7 +77,7 @@ def _assert_current_reply(app, message="current-message"):
     return params["content"]
 
 
-@pytest.mark.parametrize("text", ["雄姐", "雄姐你好", "雄姐是谁", "雄姐在吗", "学姐"])
+@pytest.mark.parametrize("text", ["雄姐", "雄姐你好", "雄姐是谁", "雄姐在吗", "小雄"])
 @pytest.mark.parametrize("user", ["member", "teacher", "admin"])
 async def test_real_group_at_alias_replies_locally_without_business_question(app, text, user):
     message = _at_message(app, text, user=user)

@@ -446,6 +446,12 @@ MEME_CATEGORY_CAP = _positive_int("ACM_MEME_CATEGORY_CAP", 100)
 # 纯本地寒暄回复，且不再调度状态机与插话。
 PERSONA_CHAT_ENABLED = os.getenv("ACM_PERSONA_CHAT_ENABLED", "1") != "0"
 
+# 正文喊名识别：群里直接写机器人名字（不 @）时是否也当作喊话并回应。
+# 默认关闭——群聊默认要求 @ 才响应，正文喊名容易误伤（比如聊到名字本身）。
+# 打开后，正文以任一识别名开头（名字清单见 assets/persona.txt 的 @bot-name/@bot-alias，
+# 回退 ["雄姐","小雄"]）即视为定向到本机器人，走与 @ 相同的回应链路。
+NAME_ADDRESS_ENABLED = os.getenv("ACM_NAME_ADDRESS_ENABLED", "0") == "1"
+
 # ================= 自动周赛（v2） =================
 # 在提前提醒窗口前按模板生成周赛，启动时补最近未来场次；默认不通知全员，
 # 超管确认后才通知全员或 /修正 调整/删除。地点不纳入管理。

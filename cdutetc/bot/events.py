@@ -363,7 +363,8 @@ class EventsMixin:
                 if not addressed or (getattr(message, "raw", {}) or {}).get("attachments"):
                     return
                 # 真实平台 @ 本身就是喊话，空正文也可本地回一句；纯图片仍交收图。
-                text = "雄姐"
+                # 称呼取人设单一事实源，改名字只改 assets/persona.txt。
+                text = _main.persona_chat.bot_names()[0]
             from cdutetc import private_chat
 
             local_social = private_chat.local_persona_reply(text)
@@ -528,13 +529,19 @@ class EventsMixin:
                 )
                 # 拟人化闲聊兜底：非问句、FAQ 未命中时 commands 只会回一句「我在呢」，
                 # 这类接梗更适合走 persona（更省 token 也更像人）。模型不可用时
-                # _handle_persona_chat 返回 False，原兜底回复照常发出，功能不退化。
+                # _handle_persona_chat 返回 False，再由零 Token 本地兜底应一句，功能不退化。
                 if (_main.config.PERSONA_CHAT_ENABLED and _main.config.QA_SOCIAL_CHAT_ENABLED
                         and _main.commands.is_social_fallback(replies)
-                        and not _main.content_filter.is_information_request(text)
-                        and await self._handle_persona_chat(
-                            message, text, group_id, member_id)):
-                    return
+                        and not _main.content_filter.is_information_request(text)):
+                    if await self._handle_persona_chat(
+                            message, text, group_id, member_id):
+                        return
+                    # @机器人 的闲聊必须应一句：模型没配/失败时用确定性本地话术兜底。
+                    # local_generic_reply 自带业务/决策/敏感过滤，不会抢答队务。
+                    if addressed:
+                        generic = private_chat.local_generic_reply(text)
+                        if generic:
+                            replies = [{"group_id": group_id, "text": generic}]
                 # 五层防护-5：输出过滤（FAQ/模型回答统一二次敏感检查、长度截断、禁超长链接）
                 if replies:
                     replies = [

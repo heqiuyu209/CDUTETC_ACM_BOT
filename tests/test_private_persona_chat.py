@@ -85,7 +85,7 @@ def _no_business_reads(app):
 
 
 @pytest.mark.parametrize("user", ["admin", "teacher", "member"])
-@pytest.mark.parametrize("text", ["雄姐", "雄姐在吗", "学姐"])
+@pytest.mark.parametrize("text", ["雄姐", "雄姐在吗", "小雄"])
 async def test_name_calls_all_roles_reply_without_model_or_business_reads(app, user, text):
     guard = _no_business_reads(app)
     replies = await _send(app, text, user)

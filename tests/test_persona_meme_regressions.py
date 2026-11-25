@@ -215,7 +215,7 @@ async def test_persona_delivery_result_matches_actual_text_or_image(monkeypatch,
     reply.return_value = text_ok
     monkeypatch.setattr(bot, "_send_meme", AsyncMock(return_value=image_ok))
     assert await bot._handle_persona_chat(message(), "在吗", "10001", "u1") == (text_ok or image_ok)
-    assert ("[学姐]: 接住" in persona_chat.get_memory().recent("10001")) == text_ok
+    assert (f"[{persona_chat.bot_names()[0]}]: 接住" in persona_chat.get_memory().recent("10001")) == text_ok
 
 
 async def test_output_filter_checks_full_reply_before_truncation_and_meme(monkeypatch):

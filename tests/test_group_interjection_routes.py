@@ -109,7 +109,7 @@ async def test_valid_casual_interjection_still_sends_one_reply(app, reply):
     app.api.post_group_message.assert_awaited_once()
     assert app.api.post_group_message.await_args.kwargs["content"] == reply
     assert app.gate._spoke_at.get("g1") == 1000
-    assert f"[学姐]: {reply}" in persona_chat.get_memory().recent("g1")
+    assert f"[{persona_chat.bot_names()[0]}]: {reply}" in persona_chat.get_memory().recent("g1")
 
 
 @pytest.mark.parametrize("reply", [
@@ -122,7 +122,7 @@ async def test_forbidden_model_reply_is_not_sent_or_remembered_as_bot_spoke(app,
     app.model.assert_awaited_once()
     app.api.post_group_message.assert_not_awaited()
     assert not app.gate._spoke_at
-    assert not any(line.startswith("[学姐]") for line in persona_chat.get_memory().recent("g1"))
+    assert not any(line.startswith(f"[{persona_chat.bot_names()[0]}]") for line in persona_chat.get_memory().recent("g1"))
     assert app.gate._last_at.get("g1") == 1000
 
 

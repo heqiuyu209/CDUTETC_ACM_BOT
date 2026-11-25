@@ -337,7 +337,7 @@ class PersonaMixin:
                 except Exception:
                     logger.exception("私聊接话失败，使用本地回应")
                 memory.observe(user_id, nickname, text)
-                memory.observe(user_id, "雄姐", reply)
+                memory.observe(user_id, _main.persona_chat.bot_names()[0], reply)
         reply = _main.content_filter.sanitize_output(
             reply, max_length=_main.config.QA_OUTPUT_MAX_LENGTH,
             max_link_length=_main.config.QA_OUTPUT_MAX_LINK_LENGTH,
@@ -430,7 +430,7 @@ class PersonaMixin:
             text_sent = await self._safe_reply(message, reply)
             # 机器人自己那句也进滑窗，后续几轮才不会答非所问。
             if text_sent:
-                memory.observe(group_id, "学姐", reply)
+                memory.observe(group_id, _main.persona_chat.bot_names()[0], reply)
         # 表情包顺风车：分类由本条回复明确指定，直接复用阶段二链路，
         # 不走关键词判定（因此天然跳过关键词冷却），任一前置条件缺失即安静不发。
         # 模型也可能只给一个 [MEME:xx]、不写字，这时只发图、不发空文本。

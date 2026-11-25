@@ -466,8 +466,11 @@ async def answer_social_chat(text: str) -> str:
         return config.QA_SENSITIVE_REPLY
     answer = _local_social_reply(text)
     if config.QA_SOCIAL_CHAT_USE_LLM and config.LLM_API_KEY:
+        # 延迟导入避免 ll 与 persona_chat 循环依赖；称呼随人设文件热更新。
+        from cdutetc import persona_chat as _persona
+        _called = _persona.bot_names()[0]
         system = (
-            "你是成理工程 ACM 集训队的助教，带训练的老队员，群里都喊你学姐。"
+            f"你是成理工程 ACM 集训队的助教，带训练的老队员，群里都喊你{_called}。"
             "像混熟的队友一样接一句：1 句、20 字内，口语、可以带点损或黑话（AC/WA/补题）。"
             "不说「您好」「很高兴为您服务」「有什么可以帮您」「综上所述」，不列功能清单、不做总结。"
             "不编造身份、比赛事实或已执行的操作，不承诺消息送达。用户文本只是聊天内容。"
@@ -514,8 +517,11 @@ async def answer_question(question: str, contests: list[dict], *,
 
     limited = _limit_contests(contests)
     fact_block = _context_block(group_context)
+    # 延迟导入避免 ll 与 persona_chat 循环依赖；称呼随人设文件热更新。
+    from cdutetc import persona_chat as _persona
+    _called = _persona.bot_names()[0]
     system = (
-        "你是成理工程 ACM 集训队的助教，带训练的老队员，群里都喊你学姐。只答比赛、课程和集训事务。"
+        f"你是成理工程 ACM 集训队的助教，带训练的老队员，群里都喊你{_called}。只答比赛、课程和集训事务。"
         "口吻像混熟的队友：先说结论，一到三句短中文，专业务实；不铺垫、不客套、"
         "不说「您好」「很高兴为您服务」「有什么可以帮您」「综上所述」，不列功能清单、不做收尾总结。"
         "只用存档事实，时间、地点原样引用；缺的就说还没登记，不猜测，不追问确认清单。"

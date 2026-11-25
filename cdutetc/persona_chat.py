@@ -40,7 +40,11 @@ PERSONA_FILE = Path(__file__).resolve().parent.parent / "assets" / "persona.txt"
 
 # 文件顶部说明：{status} 是当前生活状态的占位符。
 _PERSONA_FILE_HEADER = (
-    "# 学姐人设提示词（热更新：改完保存即生效，无需重启服务）\n"
+    "# 黎雄机人设提示词（热更新：改完保存即生效，无需重启服务）\n"
+    "# @bot-name: 雄姐\n"
+    "# @bot-alias: 小雄\n"
+    "# 上面两行是机器人身份元信息：@bot-name 主称呼、@bot-alias 附加识别别名。\n"
+    "# 机器人识别自己名字、群里喊名时读这里，改完保存即生效，无需重启。\n"
     "# 占位符 {status} 会被替换成当前生活状态；整份文件不写这个占位符时，\n"
     "# 状态行会自动追加到人设末尾。以 # 开头的行只是注释，不会进 Prompt。\n"
     "\n"
@@ -69,6 +73,76 @@ SYSTEM_TOKEN_LIMIT = 400
 # 人设文件读取缓存：key 是绝对路径，value 是（(mtime_ns, size), 文本）。
 # 只有文件真的变了才重新读盘，避免每句话都做一次 IO。
 _persona_cache: dict[str, tuple[tuple[int, int], str]] = {}
+
+# ---------------- 机器人身份（单一事实源） ----------------
+# 识别名写在 assets/persona.txt 顶部的 @bot-name / @bot-alias 注释里，
+# 与人设同一份文件、同样按 mtime/size 热读取（改完保存即生效）。
+# 代码里不再散落硬编码名字；所有「机器人叫什么」都问这里。
+DEFAULT_BOT_NAMES = ("雄姐", "小雄")
+_bot_identity_cache: dict[str, tuple[tuple[int, int], tuple[str, ...]]] = {}
+
+# 匹配 "# @bot-name: 雄姐" / "# @bot-alias: 小雄"（中文冒号/空格都认）。
+_BOT_NAME_LINE = re.compile(r"^\s*#\s*@bot-(name|alias)\s*[:：]\s*(.+?)\s*$")
+
+
+def _parse_bot_names(text: str) -> tuple[str, ...]:
+    """从人设原文解析 @bot-name/@bot-alias；主名在前、别名随后，去重保序。"""
+    primary = ""
+    aliases: list[str] = []
+    for line in str(text or "").splitlines():
+        match = _BOT_NAME_LINE.match(line)
+        if not match:
+            continue
+        kind, raw = match.group(1), match.group(2).strip()
+        # 一行写多个名字用逗号/顿号/空格分隔均可。
+        parts = [part for part in re.split(r"[,，、\s]+", raw) if part]
+        if kind == "name" and parts and not primary:
+            primary = parts[0]
+        elif kind == "alias":
+            aliases.extend(parts)
+    names: list[str] = []
+    for candidate in (primary, *aliases):
+        if candidate and candidate not in names:
+            names.append(candidate)
+    return tuple(names)
+
+
+def load_bot_identity(path: Path | str | None = None) -> tuple[str, ...]:
+    """热读取机器人全部识别名（主称呼 + 别名），改人设文件即生效。
+
+    文件读不到、或没写 @bot-name/@bot-alias 元信息时，回退 DEFAULT_BOT_NAMES。
+    第一个元素是当前主称呼，各处文案注入都取 ``bot_names()[0]``。
+    """
+    target = persona_path(path)
+    key = str(target)
+    try:
+        stamp = target.stat()
+        signature: tuple[int, int] | None = (stamp.st_mtime_ns, stamp.st_size)
+    except OSError:
+        signature = None
+    cached = _bot_identity_cache.get(key)
+    if signature is not None and cached and cached[0] == signature:
+        return cached[1]
+    text = ""
+    if signature is not None:
+        try:
+            text = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning("读取机器人身份失败，使用默认识别名：%s", exc)
+    names = _parse_bot_names(text) or DEFAULT_BOT_NAMES
+    _bot_identity_cache[key] = (signature or (0, 0), names)
+    return names
+
+
+def bot_names(path: Path | str | None = None) -> list[str]:
+    """机器人全部识别名列表（主名在前），供喊名匹配与文案注入复用。"""
+    return list(load_bot_identity(path))
+
+
+def bot_name_regex(path: Path | str | None = None) -> str:
+    """把识别名拼成正则非捕获组；长名在前，避免短名抢先截断长名。"""
+    names = sorted(bot_names(path), key=len, reverse=True)
+    return "(?:" + "|".join(re.escape(name) for name in names) + ")"
 
 
 # ---------------- 每日生活状态机 ----------------
@@ -289,6 +363,7 @@ def write_default_persona(path: Path | str | None = None) -> bool:
 def reset_persona_cache() -> None:
     """清空人设读取缓存（测试用；正常运行靠 mtime 自动失效）。"""
     _persona_cache.clear()
+    _bot_identity_cache.clear()
 
 
 def load_persona(path: Path | str | None = None) -> str:
@@ -470,6 +545,7 @@ async def chat(system: str, user: str, *, temperature: float = 0.8,
                max_tokens: int = REPLY_MAX_TOKENS, timeout: float = 30.0) -> str:
     """调一次模型；未配置 API Key 时直接返回空串（调用方按「不说话」处理）。"""
     if not config.LLM_API_KEY:
+        logger.warning("拟人聊天未配置 LLM_API_KEY，本次不回应（群里 @ 将走本地兜底）")
         return ""
     return await llm._chat_once(system, user, temperature=temperature,
                                 max_tokens=max_tokens, timeout=timeout)
