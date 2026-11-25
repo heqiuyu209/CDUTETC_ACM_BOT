@@ -367,8 +367,19 @@ class EventsMixin:
                 text = _main.persona_chat.bot_names()[0]
             from cdutetc import private_chat
 
+            # 正文喊名触发人设聊天：NAME_ADDRESS_ENABLED 开启时，正文（已 strip_at）
+            # 以任一识别名开头即视为喊话，仅放开 local_persona_reply 这一处入口。
+            # 局部 import 避开循环依赖；不触碰 is_addressed_to_bot，故地点问句 /
+            # 定时播报 / 问答主流程 / 发布命令等依赖 addressed 的门禁保持原样。
+            from cdutetc import persona_chat
+            import re
+
+            name_addressed = (
+                _main.config.NAME_ADDRESS_ENABLED
+                and bool(re.match(persona_chat.bot_name_regex(), (text or "").strip()))
+            )
             local_social = private_chat.local_persona_reply(text)
-            if addressed and local_social:
+            if (addressed or name_addressed) and local_social:
                 member_id = self._extract_member_id(message)
                 allowed, gate_reply = self._qa_gate(member_id, text)
                 if not allowed:
