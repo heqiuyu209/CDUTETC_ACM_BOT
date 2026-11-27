@@ -3,7 +3,7 @@
 覆盖三件事：
 1. 别名表读写（重复绑定覆盖、类型校验、删除）；
 2. 未认领时降级成短哈希，禁止裸露长 openid；
-3. /认领此群、/认领老师 的落库 + 白名单/老师表联动，以及群列表与配置提示渲染。
+3. /认领此群 的落库 + 白名单联动，以及群列表与配置提示渲染。
 """
 
 import asyncio
@@ -201,28 +201,6 @@ async def test_unauthorized_official_claim_checks_mention(memory_db, monkeypatch
     message = official_message(message_type="group", content=f"<@{target}> /认领此群 123456789 集训队群", group_id=GROUP, user_id="admin", msg_id=123)
     await bot.on_group_at_message_create(message)
     assert (GROUP in config.ALLOWED_GROUPS) is expected
-
-
-def test_claim_teacher_binds_sender_without_auto_authorize(memory_db, monkeypatch):
-    # 新语义：任何非超管成员都能报号建立 QQ→openid 映射，但报号不等于授权。
-    monkeypatch.setattr(config, "TEACHER_WHITELIST", set())
-    result = asyncio.run(commands.handle_command("/认领老师 10001 张老师", GROUP, "teacher1"))
-    text = result[0]["text"]
-    assert "已登记老师报号" in text
-    assert "QQ: 10001" in text
-    assert database.get_entity_alias("user", "teacher1")["display_name"] == "张老师"
-    assert database.get_entity_alias("user", "teacher1")["numeric_id"] == "10001"
-    # 防冒充核心：报号后仍未进入白名单，授权必须由超管 /加老师 完成。
-    assert "teacher1" not in config.TEACHER_WHITELIST
-
-
-def test_claim_teacher_super_admin_is_blocked(memory_db, monkeypatch):
-    # 超管仍不允许报号，避免覆盖超管身份造成发布人串号。
-    monkeypatch.setattr(config, "SUPER_ADMIN", {"boss"})
-    monkeypatch.setattr(config, "TEACHER_WHITELIST", set())
-    text = asyncio.run(commands.handle_command("/认领老师 10001 张老师", GROUP, "boss"))[0]["text"]
-    assert "超级管理员" in text
-    assert database.get_entity_alias("user", "boss") is None
 
 
 # -------------------------------------------------------- 群列表与配置提示

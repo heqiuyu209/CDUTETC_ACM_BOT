@@ -241,7 +241,7 @@ def _teacher_id(selector: str) -> str:
         if not found:
             raise ValueError(f"QQ {selector} 尚未认领为老师身份。请使用 /老师列表 中的真实老师标识："
                              " /绑老师 <老师标识> <姓名>；"
-                             "已授权老师可在群内 @我 /认领老师 <QQ号> <姓名> 后再按 QQ 绑定。")
+                             "或请超管用 /加老师 <openid> <QQ号> <姓名> 登记 QQ 映射后再按 QQ 绑定。")
         uid = next(iter(found))
         if uid not in allowed:
             raise ValueError("该 QQ 对应的老师尚未授权，请先用真实老师标识 /加老师，再登记负责群。")

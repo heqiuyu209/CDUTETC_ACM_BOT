@@ -1,9 +1,8 @@
-"""覆盖 /加老师 按 QQ 号反查 openid 授权、openid 兼容路径与防冒充。
+"""覆盖 /加老师 三段式（openid QQ号 姓名）授权、备注落库与防冒充。
 
-背景：官方协议事件只带 member_openid，QQ 号不出现在事件里，无法从
-“发言记录”解析 openid。QQ→openid 的唯一来源是老师本人 /认领老师 报号
-写入的 entity_aliases。本文件验证超管 /加老师 <QQ号> 走映射反查授权，
-且不会把 QQ 号原样写入白名单造成身份失配。
+三段式中 openid 进白名单授权，QQ号写入 entity_aliases.numeric_id、姓名作为
+display_name 与备注落库，QQ号绝不进白名单。仅给 openid 的兼容路径保留。
+认领老师命令删除后，纯 QQ 号反查已移除，第一段为纯数字时应被拒绝。
 """
 
 import asyncio
@@ -35,40 +34,48 @@ def _add(text, sender="admin"):
     return asyncio.run(commands.handle_command(f"/加老师 {text}", GROUP, sender))[0]
 
 
-# ------------------------------------------------ 按 QQ 号反查 openid 授权
-def test_add_teacher_by_qq_resolves_openid_not_qq(memory_db):
-    database.set_entity_alias("user", OPENID, "张老师", "10001")
-    result = _add("10001 负责训练")
-    assert "解析到老师" in result["text"] and OPENID in result["text"]
+# ------------------------------------------------ 三段式：openid QQ号 姓名
+def test_add_teacher_three_part_writes_alias_and_whitelist(memory_db):
+    _add(f"{OPENID} 10001 谢")
     assert OPENID in config.TEACHER_WHITELIST
     assert "10001" not in config.TEACHER_WHITELIST, "QQ 号原样入白名单会造成身份失配"
+    alias = database.get_entity_alias("user", OPENID)
+    assert alias["numeric_id"] == "10001"
+    assert alias["display_name"] == "谢"
     rows = database.list_runtime_teachers()
     assert [r["user_id"] for r in rows] == [OPENID]
+    # 姓名作为备注落库
+    assert rows[0]["note"] == "谢"
 
 
-def test_add_teacher_by_qq_uses_claim_name_as_note_when_note_omitted(memory_db):
-    database.set_entity_alias("user", OPENID, "张老师", "10001")
-    _add("10001")
-    rows = database.list_runtime_teachers()
-    assert rows[0]["user_id"] == OPENID
-    assert rows[0]["note"] == "张老师"
+def test_add_teacher_three_part_note_uses_name(memory_db):
+    _add(f"{OPENID} 10001 张老师")
+    alias = database.get_entity_alias("user", OPENID)
+    assert alias["display_name"] == "张老师"
+    assert database.list_runtime_teachers()[0]["note"] == "张老师"
 
 
-def test_add_teacher_by_qq_without_claim_is_rejected(memory_db):
+def test_add_teacher_three_part_updates_existing_alias(memory_db):
+    database.set_entity_alias("user", OPENID, "旧名", "99999")
+    _add(f"{OPENID} 10001 王老师")
+    alias = database.get_entity_alias("user", OPENID)
+    assert alias["numeric_id"] == "10001"
+    assert alias["display_name"] == "王老师"
+
+
+# ------------------------------------------------ 纯 QQ 号反查已移除
+def test_add_teacher_bare_qq_is_rejected(memory_db):
     result = _add("10001 负责训练")
-    assert "尚无老师报号" in result["text"]
-    assert "/认领老师" in result["text"]
+    assert "不能用" in result["text"] or "QQ 号不能直接" in result["text"]
+    assert "/加老师 <openid> <QQ号> <姓名>" in result["text"]
     assert result.get("notify_super_admin") is False
     assert not database.list_runtime_teachers()
     assert "10001" not in config.TEACHER_WHITELIST
 
 
-def test_add_teacher_by_qq_with_ambiguous_mapping_is_rejected(memory_db):
-    database.set_entity_alias("user", OPENID, "张老师", "10001")
-    database.set_entity_alias("user", "ANOTHER0PENID", "另一位老师", "10001")
-    result = _add("10001 负责训练")
-    assert "同时关联了 2 个" in result["text"]
-    assert result.get("notify_super_admin") is False
+def test_add_teacher_three_part_requires_name(memory_db):
+    result = _add(f"{OPENID} 10001")
+    assert "姓名不能为空" in result["text"]
     assert not database.list_runtime_teachers()
 
 
@@ -80,23 +87,15 @@ def test_add_teacher_by_openid_keeps_legacy_path(memory_db):
     assert [r["user_id"] for r in database.list_runtime_teachers()] == [OPENID]
 
 
+def test_add_teacher_by_openid_only(memory_db):
+    result = _add(OPENID)
+    assert "已添加老师" in result["text"]
+    assert OPENID in config.TEACHER_WHITELIST
+    assert [r["user_id"] for r in database.list_runtime_teachers()] == [OPENID]
+
+
 # ------------------------------------------------ 权限与防冒充
 def test_add_teacher_requires_super_admin(memory_db):
-    result = _add("10001 负责训练", sender="member")
+    result = _add(f"{OPENID} 10001 张老师", sender="member")
     assert "仅超管" in result["text"]
     assert not database.list_runtime_teachers()
-
-
-def test_full_flow_claim_then_add_by_qq(memory_db):
-    # 1) 老师本人在群里报号：只建立映射，不自动授权。
-    claim = asyncio.run(commands.handle_command(
-        "/认领老师 10001 张老师", GROUP, OPENID))[0]["text"]
-    assert "已登记老师报号" in claim
-    assert OPENID not in config.TEACHER_WHITELIST
-    assert not database.list_runtime_teachers()
-    # 2) 超管按 QQ 号授权：反查到老师本人 openid。
-    add = _add("10001 负责训练")
-    assert OPENID in add["text"]
-    assert OPENID in config.TEACHER_WHITELIST
-    assert "10001" not in config.TEACHER_WHITELIST
-    assert [r["user_id"] for r in database.list_runtime_teachers()] == [OPENID]

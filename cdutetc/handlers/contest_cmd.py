@@ -294,43 +294,6 @@ def cmd_claim_group(group_id: str, sender: str, args: str) -> list[dict]:
     )}]
 
 
-def cmd_claim_teacher(group_id: str, sender: str, args: str) -> list[dict]:
-    """群内老师报号：/认领老师 <QQ号> <姓名>。
-
-    绑定的是「发送者本人的 member_openid」，因此不需要（也无法）输入 openid。
-    官方协议事件里没有 QQ 号，这条命令是 QQ→openid 映射的唯一数据来源：
-    报号只建立映射，不自动授予老师权限，授权统一由超管 /加老师 <QQ号> 完成。
-    """
-    from cdutetc.alias_helper import format_user_name
-    if not group_id:
-        return [{"group_id": group_id, "text": "请在群里 @我 发送该指令"}]
-    # 超管身份由配置决定，认领老师会把超管 openid 写进老师表，
-    # 让后续发布人解析把超管当老师展示（身份串号），因此直接在入口拦下。
-    if is_super_admin(sender):
-        return [{"group_id": group_id, "text": (
-            "⚠️ 当前账号为超级管理员，请让老师本人用自己的 QQ 在群内发送 "
-            "/认领老师 <QQ号> <姓名> 完成报号，避免覆盖超管身份"
-        )}]
-    parts = (args or "").strip().split(None, 1)
-    if len(parts) < 2:
-        return [{"group_id": group_id,
-                 "text": "用法：/认领老师 <QQ号> <姓名>\n例：/认领老师 10001 李老师"}]
-    numeric, name = parts[0].strip(), parts[1].strip()
-    if not numeric.isdigit():
-        return [{"group_id": group_id, "text": "QQ 号应为纯数字"}]
-    if not sender:
-        return [{"group_id": group_id, "text": "取不到你的账号标识，认领失败"}]
-    try:
-        db.set_entity_alias("user", sender, name, numeric, operator=sender)
-    except ValueError as e:
-        return [{"group_id": group_id, "text": str(e)}]
-    # 报号只建立 QQ→openid 映射，不自动授权；授权权独占于超管 /加老师，
-    # 防止任意成员报号即冒充老师获得管理权限。
-    return [{"group_id": group_id, "text": (
-        f"✅ 已登记老师报号：{format_user_name(sender)}（QQ: {numeric}）\n"
-        f"身份暂未生效，请让超管发送 /加老师 {numeric} [备注] 完成授权。"
-    )}]
-
 
 def cmd_fetch_status(group_id: str, sender: str, args: str) -> list[dict]:
     if not can_manage_group(sender):

@@ -6,7 +6,9 @@ from cdutetc import commands, config
 
 # 超管改版后的短命令与旧长命令/占位符，帮助文案必须只留前者
 _SHORT_COMMANDS = ("/管理", "/切换", "/绑老师", "/改", "/待确认")
-_LEGACY_HINTS = ("group_openid", "openid", "<群标识>", "/群配置 <", "/选群 [")
+# 裸 openid 现为 /加老师 三段式的合法第一段参数，帮助文案须如实展示，不再视为旧占位符；
+# 仍禁止暴露 group_openid 这类内部群标识与旧的长命令占位符。
+_LEGACY_HINTS = ("group_openid", "<群标识>", "/群配置 <", "/选群 [")
 
 
 @pytest.mark.parametrize("member", ["teacher", "admin", "student", None])

@@ -101,53 +101,40 @@ def cmd_group_list(group_id: str, sender: str, args: str) -> list[dict]:
     return [{"group_id": group_id, "text": roles.describe()}]
 
 
-def _resolve_teacher_openid(selector: str) -> tuple[str, str]:
-    """把管理员输入解析成用于授权的 openid，返回 (openid, 错误说明)。
-
-    官方协议事件里只带 member_openid，QQ 号不会出现在事件中，因此无法从
-    “发言记录”里解析 openid。唯一可用的 QQ→openid 来源是老师本人在群内
-    /认领老师 时写入的 entity_aliases.numeric_id。
-
-    - 非纯数字：视为 openid，原样返回（保留直接用 openid 授权的兼容路径）；
-    - 纯数字（QQ 号）：按 numeric_id 反查映射，唯一命中返回其 openid；
-      无命中或多处命中返回空值 + 明确的错误说明，绝不把 QQ 号当成 openid 授权。
-    """
-    value = (selector or "").strip()
-    if not value.isdigit():
-        return value, ""
-    matches = [item["openid"] for item in db.list_entity_aliases("user")
-               if item.get("numeric_id") == value]
-    unique = list(dict.fromkeys(matches))
-    if not unique:
-        return "", (f"QQ 号 {value} 尚无老师报号记录，无法解析身份。"
-                    "请老师先在群内 @我 发送 /认领老师 <QQ号> <姓名> 报号，"
-                    "或改用老师的 openid 直接授权。")
-    if len(unique) > 1:
-        return "", (f"QQ 号 {value} 同时关联了 {len(unique)} 个账号标识，"
-                    "无法判断授权哪一个，请改用老师的 openid 直接授权。")
-    return unique[0], ""
-
-
 def cmd_teacher_add(group_id: str, sender: str, args: str) -> list[dict]:
-    """超管添加老师：/加老师 <QQ号或openid> [备注]。
+    """超管添加老师：/加老师 <openid> [QQ号 姓名] 或 /加老师 <openid> [备注]。
 
-    输入 QQ 号时按认领映射反查真实 openid 再授权，从根源上避免把 QQ 号
-    原样写进白名单导致身份失配；输入 openid 时走原兼容路径。
+    三段式 openid QQ号 姓名：openid 进白名单授权，QQ号写入 entity_aliases.numeric_id，
+    姓名写入 display_name 作为备注；QQ号绝不进白名单。仅给 openid（可带文字备注）时
+    走原兼容路径。认领老师命令已移除，纯 QQ 号不再支持反查授权。
     """
     if not is_super_admin(sender):
         return [{"group_id": group_id, "text": "仅超管可添加老师"}]
-    uid, note = _split_id_note(args)
-    openid, err = _resolve_teacher_openid(uid)
-    if err:
-        return [{"group_id": group_id, "text": err, "notify_super_admin": False}]
-    if not openid:
+    parts = (args or "").strip().split()
+    if not parts:
         return [{"group_id": group_id, "text": "老师标识不能为空"}]
-    if not note:
-        alias = db.get_entity_alias("user", openid) or {}
-        note = alias.get("display_name", "") or ""
+    openid, rest = parts[0], parts[1:]
+    # 认领老师删除后纯 QQ 号反查已无数据源，明确拒绝，避免 QQ 号进白名单。
+    if openid.isdigit():
+        return [{"group_id": group_id, "text": (
+            "QQ 号不能直接作为老师标识。请用三段式：/加老师 <openid> <QQ号> <姓名>，"
+            "openid 从 /老师列表 获取；QQ号与姓名只作备注，不进白名单。"
+        ), "notify_super_admin": False}]
+    if rest and rest[0].isdigit():
+        if len(rest) < 2:
+            return [{"group_id": group_id, "text": "用法：/加老师 <openid> <QQ号> <姓名>，姓名不能为空"}]
+        numeric, name = rest[0], " ".join(rest[1:])
+        try:
+            db.set_entity_alias("user", openid, name, numeric, operator=sender)
+        except ValueError as e:
+            return [{"group_id": group_id, "text": str(e), "notify_super_admin": False}]
+        note = name
+    else:
+        note = " ".join(rest)
+        if not note:
+            alias = db.get_entity_alias("user", openid) or {}
+            note = alias.get("display_name", "") or ""
     ok, msg = roles.add_teacher(openid, operator=sender, note=note)
-    if ok and openid != uid:
-        msg = f"已按 QQ 号 {uid} 解析到老师 {openid} 并添加，立即生效"
     return [{"group_id": group_id, "text": msg, "notify_super_admin": ok}]
 
 

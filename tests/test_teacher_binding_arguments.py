@@ -83,7 +83,7 @@ def test_unclaimed_qq_gives_real_identity_guidance_and_changes_nothing(env):
     db.set_group_teachers("team", {OTHER}, operator="admin")
     text = _bind("999888777 王老师")
     assert "QQ 999888777 尚未认领" in text and "/老师列表" in text and "/绑老师 <老师标识> <姓名>" in text
-    assert "/认领老师" in text and "没有匹配到唯一" not in text
+    assert "/加老师 <openid> <QQ号> <姓名>" in text and "没有匹配到唯一" not in text
     assert db.get_group_teachers("team") == [OTHER]
     assert "999888777" not in config.TEACHER_WHITELIST
     assert not db.list_runtime_teachers()

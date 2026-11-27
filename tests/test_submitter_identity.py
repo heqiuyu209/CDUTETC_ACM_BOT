@@ -3,8 +3,7 @@
 覆盖验收点：
 1) 超管发布 → 展示超管身份，即使老师表里存在同一 openid 也不被覆盖；
 2) 已绑定老师发布 → 展示老师身份（含 QQ）；
-3) 超管误发 /认领老师 → 直接被拦截，不写别名/备注/老师表；
-4) 私聊 /发布 → 作用域绑定当前工作区群、提交人记为该超管、只回私聊不发群。
+3) 私聊 /发布 → 作用域绑定工作区群、提交人记为该超管、只回私聊不发群。
 """
 
 import asyncio
@@ -109,17 +108,6 @@ def test_pending_list_uses_realtime_identity(memory_db):
     )
     text = asyncio.run(commands.handle_command("/待确认列表", GROUP, ADMIN))[0]["text"]
     assert "提交人 超级管理员（ID: admin...）" in text
-
-
-# ------------------------------------------------- 超管误发 /认领老师 必须被拦截
-def test_super_admin_claim_teacher_is_rejected(memory_db):
-    text = asyncio.run(commands.handle_command("/认领老师 10001 张老师", GROUP, ADMIN))[0]["text"]
-    assert "当前账号为超级管理员" in text
-    assert db.get_entity_alias("user", ADMIN) is None
-    assert db.get_account_label("user", ADMIN) in (None, "")
-    assert all(str(item.get("user_id")) != ADMIN for item in db.list_runtime_teachers())
-    # 身份隔离后，超管展示仍是超管
-    assert main._format_submitter(ADMIN) == "超级管理员（ID: admin...）"
 
 
 # ------------------------------------- 私聊 /发布：绑定工作区群、只回私聊不发群
