@@ -370,3 +370,145 @@ def test_url_sanitizer_rejects_credentials_and_non_http():
     assert teacher_intent._sanitize_url("https://user:pass@example.com/a") == ""
     assert teacher_intent._sanitize_url("file:///etc/passwd") == ""
     assert teacher_intent._sanitize_url("javascript:alert(1)") == ""
+
+
+# ---------------------------------------------------------------------
+# 长哲理夹安排：分句定位 / 放宽截断 / 多意图拆分 / 哲理过滤
+# ---------------------------------------------------------------------
+
+def test_candidate_windows_locates_arrangement_with_context():
+    """候选句连同前后相邻句一起送模，抽槽原文只取含安排的那句。"""
+    text = "人生如逆水行舟不进则退。每周三晚上7点在B302讲图论。有些路要自己走。"
+    windows = teacher_intent._candidate_windows(text)
+    assert len(windows) == 1
+    focus, source = windows[0]
+    assert source.startswith("每周三") and "讲图论" in source
+    # 相邻哲理句进入送模正文，给足语境。
+    assert "人生如逆水行舟" in focus and "有些路要自己走" in focus
+    # 全无锚点时回退整段，行为与旧版一致。
+    plain = "人生如逆水行舟不进则退。"
+    assert teacher_intent._candidate_windows(plain) == [(plain, plain)]
+
+
+async def test_arrangement_embedded_mid_philosophy_is_saved(env, model):
+    """长哲理中段夹一句安排：只送候选窗口、落库课程，哲理句不误入库。"""
+    model.reply = _course_payload()
+    text = (
+        "人生如逆水行舟不进则退，有些路注定要一个人走。"
+        "每周三晚上7点在B302讲图论，大家务必坚持。"
+        "成长往往发生在不经意之间，愿各位珍惜这段时光。"
+    )
+    result = await teacher_intent.handle_message(
+        text, group_id=GID, sender_id=TEACHER, msg_id="ph1", now=NOW)
+
+    assert result["action"] == "saved"
+    assert "图论基础" in result["reply"]
+    assert len(db.list_training_sessions(GID)) == 1
+    # 单个候选窗口 → 一次送模；送模正文含安排句而非被哲理淹没。
+    assert len(model.calls) == 1
+    assert "讲图论" in json.loads(model.calls[0][1])["message"]
+
+
+async def test_arrangement_after_400_chars_is_not_truncated(env, model):
+    """安排在 400 字之后：放宽截断 + 分句定位后仍能识别并落库。"""
+    prelude = "人生如逆水行舟不进则退，有些路注定要一个人走。" * 20
+    assert len(prelude) > 400
+    model.reply = _course_payload()
+    text = prelude + "每周三晚上7点在B302讲图论。"
+
+    result = await teacher_intent.handle_message(
+        text, group_id=GID, sender_id=TEACHER, msg_id="ph2", now=NOW)
+
+    assert result["action"] == "saved"
+    assert len(db.list_training_sessions(GID)) == 1
+    sent = json.loads(model.calls[0][1])["message"]
+    assert "讲图论" in sent and len(sent) < len(text)  # 分句定位，未把整段哲理塞进模型
+
+
+async def test_no_event_anchor_arrangement_with_time_is_recognized(env, model):
+    """无事件锚点但有明确时间的安排：靠时间信号定位并落库。"""
+    model.reply = {
+        "intent": "ONE_OFF_SESSION", "confidence": "high", "title": "操场集合",
+        "date": "2026-11-19", "start_time": "20:00",
+    }
+    result = await teacher_intent.handle_message(
+        "明天晚上8点在操场集合。", group_id=GID, sender_id=TEACHER,
+        msg_id="ph3", now=NOW)
+
+    assert result["action"] == "saved"
+    sessions = db.list_training_sessions(GID, active_only=False)
+    assert len(sessions) == 1 and sessions[0]["start_time"] == "20:00"
+
+
+def test_parse_result_accepts_json_array():
+    """模型输出多意图 JSON 数组时解析为列表，非法项被过滤。"""
+    raw = json.dumps([
+        {"intent": "RECURRING_COURSE", "confidence": "high", "title": "图论"},
+        {"intent": "CHAT_IGNORE", "confidence": "high"},
+        {"title": "缺 intent"},
+    ], ensure_ascii=False)
+    parsed = teacher_intent.parse_result(raw)
+    assert isinstance(parsed, list) and len(parsed) == 2
+    assert parsed[0]["title"] == "图论" and parsed[1]["intent"] == "CHAT_IGNORE"
+
+
+async def test_json_array_multiple_intents_are_applied_and_merged(env, model):
+    """单条消息多意图数组：逐条落 pending 并合并回执与私聊。"""
+    model.reply = [
+        {"intent": "ONE_OFF_SESSION", "confidence": "medium", "title": "DP 专题",
+         "missing": ["date", "start_time"]},
+        {"intent": "ONE_OFF_SESSION", "confidence": "medium", "title": "图论 专题",
+         "missing": ["date", "start_time"]},
+    ]
+    result = await teacher_intent.handle_message(
+        "下周找时间讲DP和图论", group_id=GID, sender_id=TEACHER,
+        msg_id="ph4", now=NOW)
+
+    assert result["action"] == "pending"
+    assert result["reply"].count("已记下") == 2  # 两条回执都带上了
+    assert len(db.list_teacher_intent_pending(GID)) == 2
+    assert {uid for uid, _ in result["notify_private"]} == {TEACHER, "root"}
+    assert len(model.calls) == 1  # 单窗口只送一次模，数组里两条意图都被处理
+
+
+async def test_multiple_arrangements_in_long_talk_each_saved_and_merged(env, monkeypatch):
+    """长讲话夹多条安排：按窗口逐条落库，回执合并成一条返回。"""
+    replies = [
+        {"intent": "RECURRING_COURSE", "confidence": "high", "title": "图论",
+         "weekday": "周三", "start_time": "19:00", "location": "B302"},
+        {"intent": "RECURRING_COURSE", "confidence": "high", "title": "数论",
+         "weekday": "周五", "start_time": "19:00", "location": "B303"},
+    ]
+    counter = {"n": 0}
+
+    async def fake_chat_once(*args, **kwargs):
+        payload = replies[min(counter["n"], len(replies) - 1)]
+        counter["n"] += 1
+        return json.dumps(payload, ensure_ascii=False)
+
+    monkeypatch.setattr(llm, "_chat_once", fake_chat_once)
+    text = (
+        "人生如逆水行舟不进则退。每周三晚上7点在B302讲图论，大家要坚持。"
+        "有些路要自己走。每周五晚上7点在B303讲数论，别迟到。"
+    )
+    result = await teacher_intent.handle_message(
+        text, group_id=GID, sender_id=TEACHER, msg_id="ph5", now=NOW)
+
+    assert result["action"] == "saved"
+    sessions = db.list_training_sessions(GID)
+    assert len(sessions) == 2
+    assert {(s["title"], s["weekday"]) for s in sessions} == {("图论", "周三"), ("数论", "周五")}
+    assert "图论" in result["reply"] and "数论" in result["reply"]  # 两条回执合并
+    assert counter["n"] == 2  # 两个候选窗口各送一次模
+
+
+async def test_pure_philosophy_without_anchor_is_filtered(env, model):
+    """纯哲理无任何时间/事件锚点：第一层直接过滤，不花 token、不落库。"""
+    result = await teacher_intent.handle_message(
+        "人生如逆水行舟不进则退，有些路注定要一个人走，时间会给出所有答案。",
+        group_id=GID, sender_id=TEACHER, msg_id="ph6", now=NOW)
+
+    assert result["action"] == "ignored"
+    assert model.calls == []
+    assert db.list_training_sessions(GID) == []
+    assert db.list_teacher_intent_pending(GID) == []

@@ -64,7 +64,9 @@ FETCH_TIMEOUT = 6.0
 # 上下文规模上限：课程/比赛各只喂最近几条，控制 token。
 MAX_COURSES_IN_CONTEXT = 10
 MAX_CONTESTS_IN_CONTEXT = 8
-MAX_RAW_TEXT_CHARS = 400
+# 送模正文上限：老师长段哲理常把具体安排夹在中段，放宽到 1600 字保留足够上下文
+# （准确率优先，本管线本就不靠 token 省成本；分句定位后单次送模通常远小于此值）。
+MAX_RAW_TEXT_CHARS = 1600
 
 # 事件/动作锚点；单独的日期词不触发，避免“今天好开心”支付分类费用。
 EVENT_ANCHOR = re.compile(
@@ -131,6 +133,49 @@ def should_call_llm(text: str) -> bool:
     # 只有“今天好开心”这类日期词不是通知；事件/规则或明确钟点才值得分类。
     return bool(EVENT_ANCHOR.search(plain) or POLICY_ANCHOR.search(plain)
                 or publish_text._CLOCK.search(unicodedata.normalize("NFKC", plain)))
+
+
+# 句末边界：长讲话按句切分，把夹在哲理里的具体安排单独定位出来。
+_SENTENCE_BOUNDARY = re.compile(r"[\n\r]+|(?<=[。！？!?；;])")
+
+
+def _split_sentences(text: str) -> list[str]:
+    """按句末标点/换行切句（保序、去空段、去两端空白）。"""
+    parts = _SENTENCE_BOUNDARY.split(text or "")
+    return [part.strip() for part in parts if part and part.strip()]
+
+
+def _sentence_has_arrangement(sentence: str) -> bool:
+    """单句是否含「可执行安排」信号：事件/队规锚点或明确时间。"""
+    plain = normalize_text(sentence)
+    if not plain:
+        return False
+    nfkc = unicodedata.normalize("NFKC", plain)
+    return bool(EVENT_ANCHOR.search(plain) or POLICY_ANCHOR.search(plain)
+                or publish_text._CLOCK.search(nfkc)
+                or publish_text._DATE.search(nfkc)
+                or publish_text._MONTH_DAY.search(nfkc)
+                or publish_text._RELATIVE.search(nfkc)
+                or publish_text._WEEKDAY.search(nfkc))
+
+
+def _candidate_windows(text: str) -> list[tuple[str, str]]:
+    """定位长讲话里的候选安排句，返回 (送模正文, 抽槽原文) 列表。
+
+    - 单句或整段没有候选句：回退为整段，行为与旧版一致；
+    - 命中候选句：送模正文带上前后相邻句给足语境；抽槽只用候选句本身，
+      避免哲理段落里的其它时间词把课程时间带偏。
+    """
+    sentences = _split_sentences(text)
+    if len(sentences) <= 1:
+        return [(text, text)]
+    windows: list[tuple[str, str]] = []
+    for index, sentence in enumerate(sentences):
+        if not _sentence_has_arrangement(sentence):
+            continue
+        lo, hi = max(0, index - 1), min(len(sentences), index + 2)
+        windows.append((" ".join(sentences[lo:hi]), sentence))
+    return windows or [(text, text)]
 
 
 def _weekday_of(moment: datetime) -> str:
@@ -273,7 +318,15 @@ def _system_prompt(now: datetime) -> str:
         "按日程处理，归 RECURRING_COURSE / ONE_OFF_SESSION，不要归 POLICY_FAQ。\n"
         "- confidence：时间与事项都能直接执行才 high；出现「找个晚上」「下周再说」「待定」"
         "这类模糊表达必须 medium，并在 missing 里写明缺什么。\n"
-        "- 日期只输出 YYYY-MM-DD，时间只输出 HH:MM，不要自己推算相对日期。"
+        "- 日期只输出 YYYY-MM-DD，时间只输出 HH:MM，不要自己推算相对日期。\n"
+        "- 长讲话常把人生哲理、鼓励、训话与具体安排混在一起。哲理/感想本身忽略，"
+        "但其中夹带的可执行安排（课程、集训、比赛、改期、队规）必须照常输出对应意图，"
+        "不得因为整段像训话就把整条消息判成 CHAT_IGNORE。\n"
+        "- 只根据当前 message 里真正给出的安排输出，context 中的课程/比赛索引仅作参考，"
+        "不要把索引里已有的课程当成老师新安排。\n"
+        "- 若一条消息里含多条互相独立的安排，输出 JSON 数组，每个元素一个意图对象；"
+        "只有一条时输出单个对象。\n"
+        "    输出格式固定为单个 JSON 对象或对象数组，不要输出多余文字。"
     )
 
 
@@ -286,9 +339,23 @@ def _user_prompt(text: str, courses: list[dict], contests: list[dict]) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
-def parse_result(content: str) -> dict | None:
-    """解析并校验模型输出；任何不合法都返回 None（调用方静默放弃）。"""
-    data = llm._load_json_object(content)
+def _load_json_any(content: str) -> dict | list | None:
+    """从模型输出取 JSON 对象或数组；容忍 ```json 包裹，失败返回 None。"""
+    if not isinstance(content, str) or not content.strip():
+        return None
+    s = content.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    try:
+        data = json.loads(s)
+    except (ValueError, RecursionError):
+        return None
+    return data if isinstance(data, (dict, list)) else None
+
+
+def _normalize_one(data: dict) -> dict | None:
+    """把单个意图对象规范化；intent 非法时返回 None（调用方静默放弃）。"""
     if not isinstance(data, dict):
         return None
     intent = str(data.get("intent") or "").strip().upper()
@@ -322,6 +389,17 @@ def parse_result(content: str) -> dict | None:
     }
 
 
+def parse_result(content: str) -> dict | list[dict] | None:
+    """解析模型输出：单对象→dict（兼容旧契约），JSON 数组→list[dict]，均非法→None。"""
+    data = _load_json_any(content)
+    if isinstance(data, list):
+        parsed = [_normalize_one(item) for item in data]
+        return [item for item in parsed if item is not None] or None
+    if isinstance(data, dict):
+        return _normalize_one(data)
+    return None
+
+
 async def _fetch_url_summary(url: str) -> str:
     """比赛通知带链接时补抓正文（6 秒超时）；失败一律返回空串，不影响主流程。"""
     if not url:
@@ -340,8 +418,11 @@ def _location_from_summary(summary: str) -> str:
     return match.group(1).strip() if match else ""
 
 
-async def classify(text: str, *, group_id: str, now: datetime | None = None) -> dict | None:
-    """调用模型做结构化分类；超时/异常返回 None。"""
+async def classify(text: str, *, group_id: str, now: datetime | None = None) -> dict | list[dict] | None:
+    """调用模型做结构化分类；超时/异常返回 None。
+
+    返回单个意图对象或（多意图时）对象列表；两者都由 parse_result 统一校验。
+    """
     moment = _now(now)
     courses, contests = build_context(group_id, moment)
     try:
@@ -772,6 +853,66 @@ def _result(intent: str, action: str, *, reply: str = "",
             "notify_private": notify or [], "object_id": object_id}
 
 
+def _grounded_in_source(slots: dict, source: str, moment: datetime) -> bool:
+    """high 落库前的二次校验：候选句须自带可核对的时间/动作信号，防跨句误检。"""
+    intent = slots["intent"]
+    plain = normalize_text(source)
+    if intent == INTENT_UPDATE_CANCEL:
+        # 改期/取消靠 context 里的 target_id 定位，候选句须含明确的改动/取消动作词。
+        return bool(re.search(r"取消|改到|改为|换到|调整到|推迟|延后|提前|时间", plain))
+    if intent in {INTENT_RECURRING_COURSE, INTENT_ONE_OFF_SESSION, INTENT_CONTEST}:
+        nfkc = unicodedata.normalize("NFKC", plain)
+        has_time = bool(publish_text._CLOCK.search(nfkc) or publish_text._DATE.search(nfkc)
+                        or publish_text._MONTH_DAY.search(nfkc)
+                        or publish_text._RELATIVE.search(nfkc)
+                        or publish_text._WEEKDAY.search(nfkc))
+        return has_time and bool(EVENT_ANCHOR.search(plain) or publish_text._CLOCK.search(nfkc))
+    return True
+
+
+def _merge_results(results: list[dict]) -> dict:
+    """把一条消息里多条意图的落库结果合并成单个回执（调用方只认一个结果）。"""
+    if not results:
+        return _result(INTENT_CHAT_IGNORE, "ignored")
+    if len(results) == 1:
+        return results[0]
+    rank = {"ignored": 0, "pending": 1, "saved": 2}
+    action = max((r.get("action") for r in results), key=lambda a: rank.get(a, 0))
+    reply = "\n".join(r.get("reply") for r in results if r.get("reply"))
+    notify = [pair for r in results for pair in (r.get("notify_private") or [])]
+    intent = next((r.get("intent") for r in results
+                   if r.get("intent") != INTENT_CHAT_IGNORE), INTENT_CHAT_IGNORE)
+    object_id = next((r.get("object_id") for r in results
+                      if r.get("object_id") is not None), None)
+    return _result(intent, action, reply=reply, notify=notify, object_id=object_id)
+
+
+async def _apply_one(source_text: str, slots: dict, *, group_id: str, sender_id: str,
+                     moment: datetime, msg_id: str) -> dict | None:
+    """单条意图：候选句抽槽 → 二次校验 → 分级落库；闲聊返回 None。"""
+    slots = _declared_schedule(source_text, slots, moment)
+    intent = slots["intent"]
+    if intent == INTENT_CHAT_IGNORE:
+        return None
+    # 队规/制度类不进日程落库链：先提炼成问答草稿，等老师私聊点头才生效。
+    if intent == INTENT_POLICY_FAQ:
+        return await _apply_policy_faq(source_text, slots, group_id, sender_id)
+    # 比赛链接补充：正文里的「地点：xxx」能补上模型漏掉的场地，
+    # 抓取失败只是少一点补充信息，不影响落库。
+    if intent == INTENT_CONTEST:
+        url = _sanitize_url(slots.get("url"))
+        if url:
+            slots["url"] = url
+            summary = await _fetch_url_summary(url)
+            if summary and not slots.get("location"):
+                slots["location"] = _location_from_summary(summary)
+    confidence = slots["confidence"]
+    if (confidence == CONFIDENCE_HIGH and _is_high_ready(intent, slots, moment)
+            and _grounded_in_source(slots, source_text, moment)):
+        return await _apply_high(source_text, slots, group_id, sender_id, moment, msg_id)
+    return _apply_medium(source_text, slots, group_id, sender_id, moment, msg_id)
+
+
 async def handle_message(text: str, *, group_id: str, sender_id: str,
                          msg_id: str = "", now: datetime | None = None) -> dict | None:
     """老师非命令群消息的唯一入口。
@@ -788,31 +929,37 @@ async def handle_message(text: str, *, group_id: str, sender_id: str,
     if not should_call_llm(text):
         # 第一层拦下的都是闲聊：不花 token，也不在群里留下任何痕迹。
         return _result(INTENT_CHAT_IGNORE, "ignored")
-    slots = await classify(text, group_id=group_id, now=moment)
-    if not is_teacher_speaker(group_id, sender_id):
-        return _result(INTENT_CHAT_IGNORE, "ignored")
-    if slots is None:
-        return _result(INTENT_CHAT_IGNORE, "ignored")
-    slots = _declared_schedule(text, slots, moment)
-    intent = slots["intent"]
-    if intent == INTENT_CHAT_IGNORE:
-        return _result(intent, "ignored")
-    # 队规/制度类不进日程落库链：先提炼成问答草稿，等老师私聊点头才生效。
-    if intent == INTENT_POLICY_FAQ:
-        return await _apply_policy_faq(text, slots, group_id, sender_id)
-    # 比赛链接补充：正文里的「地点：xxx」能补上模型漏掉的场地，
-    # 抓取失败只是少一点补充信息，不影响落库。
-    if intent == INTENT_CONTEST:
-        url = _sanitize_url(slots.get("url"))
-        if url:
-            slots["url"] = url
-            summary = await _fetch_url_summary(url)
-            if summary and not slots.get("location"):
-                slots["location"] = _location_from_summary(summary)
-    confidence = slots["confidence"]
-    if confidence == CONFIDENCE_HIGH and _is_high_ready(intent, slots, moment):
-        return await _apply_high(text, slots, group_id, sender_id, moment, msg_id)
-    return _apply_medium(text, slots, group_id, sender_id, moment, msg_id)
+
+    # 分句定位：长哲理里含安排的候选句连同前后相邻句一起送模；
+    # 单句或无候选句时回退整段，行为与改造前完全一致。
+    windows = _candidate_windows(text)
+    collected: list[tuple[str, dict]] = []
+    for focus_text, source_text in windows:
+        batch = await classify(focus_text, group_id=group_id, now=moment)
+        if not is_teacher_speaker(group_id, sender_id):
+            return _result(INTENT_CHAT_IGNORE, "ignored")
+        if batch is None:
+            continue
+        items = batch if isinstance(batch, list) else [batch]
+        for item in items:
+            if item.get("intent") == INTENT_CHAT_IGNORE:
+                continue
+            collected.append((source_text, item))
+
+    # pending 表对 (群, msg_id) 唯一去重（防平台重推堆积）；一条消息拆出多条
+    # 意图时必须各给一个稳定子键，否则后写意图会 ON CONFLICT 覆盖前一条。
+    # 单意图沿用原 msg_id，既有回执/去重行为完全不变。
+    multi = len(collected) > 1
+    results: list[dict] = []
+    for index, (source_text, item) in enumerate(collected):
+        child_msg_id = f"{msg_id}#{index}" if multi else msg_id
+        outcome = await _apply_one(
+            source_text, item, group_id=group_id, sender_id=sender_id,
+            moment=moment, msg_id=child_msg_id,
+        )
+        if outcome is not None:
+            results.append(outcome)
+    return _merge_results(results)
 
 
 async def _apply_high(text: str, slots: dict, group_id: str, sender_id: str,
